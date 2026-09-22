@@ -1,0 +1,7 @@
+{
+  "version": "2.2.0",
+  "releaseDate": "2026-09-22",
+  "minEngineVersion": "2.1.0",
+  "downloadUrl": "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
+  "changelog": "Integridade verificavel do backup (SHA-256 do ZIP e de cada copia gravada, com bloqueio do expurgo quando a copia reprova); Monitor de Backup Ausente horario e independente da rotina, com prazo configuravel; correcao do alerta de 24h que nunca disparava sob Windows PowerShell 5.1; fim do disparo duplicado de backup; reenvio de e-mail com retentativas e cooldown so apos entrega confirmada; auditoria diaria em prioridade baixa; credenciais SMTP removidas do executavel e criptografadas no config."
+}

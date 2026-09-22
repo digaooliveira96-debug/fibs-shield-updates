@@ -1,0 +1,16 @@
+# Nunca versionar: contem credenciais ou dados de cliente
+config.json
+configurar_discos.ps1
+network_tracker.json
+backup_state.json
+fibs_state.json
+last_run.json
+backup_sequence.json
+backup_execution.lock
+logs/
+*.log
+temp/
+temp_backup/
+*.bak
+*.fbk
+*.fdb
