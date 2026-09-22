@@ -1235,9 +1235,12 @@ function Send-NetworkFailureAlert {
     param (
         [string]$Destination,
         [int]$DelayHours,
-        [string]$TaskName,
+        [string]$TaskName,          # nome real da tarefa (ex.: BKP_EXTERNO) - usado no caminho do log
+        [string]$TerminalName = "", # NetworkTerminalName configurado junto das credenciais
         [string]$FailureReason = ""
     )
+    # Rotulo curto para assunto: prefere o nome do terminal, cai para o da tarefa
+    $rotulo = if (-not [string]::IsNullOrWhiteSpace($TerminalName)) { $TerminalName } else { $TaskName }
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
             if (Test-Path $configFile) {
@@ -1330,6 +1333,10 @@ function Send-NetworkFailureAlert {
                       <tr>
                         <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Tarefa Afetada:</td>
                         <td bgcolor="#1e293b" style="padding:7px 0; font-weight:700; color:#f1f5f9; font-size:15px;">$TaskName</td>
+                      </tr>
+                      <tr>
+                        <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Terminal Configurado:</td>
+                        <td bgcolor="#1e293b" style="padding:7px 0; font-weight:700; color:#fbbf24; font-size:14.5px;">$(if ([string]::IsNullOrWhiteSpace($TerminalName)) { "(nao definido nas credenciais)" } else { $TerminalName })</td>
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Caminho do Destino:</td>
@@ -1509,7 +1516,7 @@ function Send-NetworkFailureAlert {
             }
         }
         if ($mail.To.Count -eq 0) { Log-Message "ERRO: nenhum destinatario valido em '$recipient'. E-mail nao enviado."; return }
-        $mail.Subject = "[MEC ALERTA] Backup Externo Sem Sincronizar ha ${daysStr} - $clientName ($hostName)"
+        $mail.Subject = "[MEC ALERTA] $rotulo / $TaskName sem backup ha ${daysStr} - $clientName ($hostName)"
         $mail.SubjectEncoding = [System.Text.Encoding]::UTF8
         $mail.BodyEncoding = [System.Text.Encoding]::UTF8
         $mail.HeadersEncoding = [System.Text.Encoding]::UTF8
@@ -1587,7 +1594,8 @@ function Test-ExternalDestinationsHealth {
     catch { Log-Message "Aviso: falha ao ler o rastreador de destinos: $_" }
         }
 
-        $netTerm = if (-not [string]::IsNullOrWhiteSpace($tConf.NetworkTerminalName)) { $tConf.NetworkTerminalName } else { $TaskName }
+        $netTerm = if (-not [string]::IsNullOrWhiteSpace($tConf.NetworkTerminalName)) { $tConf.NetworkTerminalName } else { "" }
+        $nomeTarefaReal = if (-not [string]::IsNullOrWhiteSpace($tConf.TaskName)) { $tConf.TaskName } else { $TaskName }
 
         foreach ($dest in $destsToCheck) {
             $destTrim = $dest.TrimEnd('\', '/')
@@ -1668,7 +1676,7 @@ function Test-ExternalDestinationsHealth {
                 if (((Get-Date) - $lastAlert).TotalHours -ge $alertHours) {
                     Log-Message "ALERTA CRITICO DISPARADO (prazo ${alertHours}h): Destino '$destTrim' sem backup valido ha $([Math]::Round($hoursSince, 1)) horas (limite ${alertHours}h). Motivo: $detectedReason"
                     $global:mailSent = $false
-                    Send-NetworkFailureAlert -Destination $destTrim -DelayHours ([Math]::Round($hoursSince)) -TaskName $netTerm -FailureReason $detectedReason
+                    Send-NetworkFailureAlert -Destination $destTrim -DelayHours ([Math]::Round($hoursSince)) -TaskName $nomeTarefaReal -TerminalName $netTerm -FailureReason $detectedReason
                     if ($global:mailSent) {
                         $netTracker[$destTrim].LastAlert = (Get-Date).ToString("o")
                     } else {
@@ -2309,6 +2317,14 @@ if ($CheckExternalHealth) {
         }
         if ($null -eq $t.Destinations -or $t.Destinations.Count -eq 0) { continue }
 
+        # Respeita o liga/desliga por tarefa (checkbox na tela de Editar Tarefa).
+        # Ausente no config = ligado, para nao mudar o comportamento de quem ja esta instalado.
+        $alertarEsta = if ($null -ne $t.AlertOnMissingBackup) { [bool]$t.AlertOnMissingBackup } else { $true }
+        if (-not $alertarEsta) {
+            Log-Message "Tarefa '$($t.TaskName)': aviso de backup ausente DESLIGADO nas configuracoes da tarefa. Ignorada pelo monitor."
+            continue
+        }
+
         # Resolve unidade mapeada (Z:\) para UNC, pois sob a conta SYSTEM ela nao existe
         $dests = @()
         foreach ($d in $t.Destinations) {
@@ -2367,6 +2383,13 @@ function Invoke-MecLiveUpdate {
         if ($null -eq $fibsState) {
             $fibsState = [PSCustomObject]@{ WelcomeEmailSent = $false; LastUpdateCheck = "" }
         }
+        # Garante as propriedades esperadas mesmo em arquivos gravados por versoes antigas
+        foreach ($prop in @("WelcomeEmailSent", "LastUpdateCheck")) {
+            if ($null -eq $fibsState.PSObject.Properties[$prop]) {
+                $valor = if ($prop -eq "WelcomeEmailSent") { $false } else { "" }
+                $fibsState | Add-Member -NotePropertyName $prop -NotePropertyValue $valor -Force
+            }
+        }
         
         if (-not $Force -and ($fibsState.LastUpdateCheck -eq $todayStr)) {
             return
@@ -2386,8 +2409,12 @@ function Invoke-MecLiveUpdate {
         $manifestJson = $webClient.DownloadString($updateUrl)
         $manifest = $manifestJson | ConvertFrom-Json
         
-        $fibsState.LastUpdateCheck = $todayStr
-        try { $fibsState | ConvertTo-Json -Depth 5 | Set-Content $fibsStateFile -Encoding UTF8 } catch {}
+        try {
+            $fibsState.LastUpdateCheck = $todayStr
+            $fibsState | ConvertTo-Json -Depth 5 | Set-Content $fibsStateFile -Encoding UTF8
+        } catch {
+            Log-Message "[LIVEUPDATE AVISO] Nao foi possivel gravar a data da verificacao: $_. A atualizacao continua."
+        }
         
         if ($null -eq $manifest -or [string]::IsNullOrWhiteSpace($manifest.version)) {
             Log-Message "[LIVEUPDATE AVISO] Manifesto de versao invalido recebido do servidor."
@@ -2570,7 +2597,7 @@ if (Test-Path $fibsStateFile) {
     try { $fibsState = Get-Content $fibsStateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
 }
 if ($null -eq $fibsState) {
-    $fibsState = [PSCustomObject]@{ WelcomeEmailSent = $false }
+    $fibsState = [PSCustomObject]@{ WelcomeEmailSent = $false; LastUpdateCheck = "" }
 }
 if (-not $fibsState.WelcomeEmailSent -and $null -ne $global:configData.Preferences) {
     $p = $global:configData.Preferences
