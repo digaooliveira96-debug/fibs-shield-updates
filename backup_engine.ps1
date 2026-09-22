@@ -2837,41 +2837,13 @@ foreach ($candDest in $resolvedDestList) {
     }
 }
 
-# Nenhum destino local serviu (ex.: tarefa externa que so grava em UNC). Em vez de cair
-# na pasta do programa - quase sempre no mesmo disco do banco - procura o disco fixo com
-# mais espaco livre que NAO seja o do banco, preservando o isolamento de I/O.
-if ($null -eq $tempDir) {
-    try {
-        $precisaMB = [math]::Round($dbSizeMB * 1.5, 0)
-        $candidatos = Get-WmiObject -Class Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction Stop |
-            Where-Object {
-                $_.DeviceID -and
-                ("$($_.DeviceID)\" -ne $dbDrive) -and
-                ($_.FreeSpace / 1MB) -gt $precisaMB
-            } | Sort-Object FreeSpace -Descending
-
-        foreach ($disco in $candidatos) {
-            $tentativa = Join-Path "$($disco.DeviceID)\" "MEC_Shield_Temp"
-            try {
-                if (-not (Test-Path $tentativa)) { New-Item -ItemType Directory -Path $tentativa -Force -ErrorAction Stop | Out-Null }
-                $provaEscrita = Join-Path $tentativa ".escrita_ok"
-                [System.IO.File]::WriteAllText($provaEscrita, "ok")
-                Remove-Item $provaEscrita -Force -ErrorAction SilentlyContinue
-                $tempDir = $tentativa
-                Log-Message "Nenhum destino local disponivel para area temporaria. Usando disco alternativo '$($disco.DeviceID)' ($([math]::Round($disco.FreeSpace/1GB,1)) GB livres) para nao disputar I/O com o banco."
-                break
-            } catch { }
-        }
-    } catch {
-        Log-Message "Aviso ao procurar disco alternativo para area temporaria: $_"
-    }
-}
-
-# Ultimo recurso: pasta do proprio programa
+# Nenhum destino local serviu (ex.: tarefa externa que so grava em UNC).
+# Usa a propria pasta do FIBS (C:\Microtecs\FIBS	emp_backup). Nao cria pasta em
+# outros discos de proposito: evita diretorio solto na raiz de drives do cliente.
+# Fica no mesmo disco do banco, entao pode haver alguma disputa de I/O - aceitavel.
 if ($null -eq $tempDir) {
     $tempDir = Join-Path $scriptDir "temp_backup"
     if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
-    Log-Message "Aviso: area temporaria na pasta do programa ($tempDir). Mesmo disco do banco - pode haver disputa de I/O."
 }
 Log-Message "Diretorio temporario de processamento I/O: $tempDir"
 
