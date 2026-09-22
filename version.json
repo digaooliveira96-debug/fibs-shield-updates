@@ -1,7 +1,7 @@
 {
-  "version": "2.2.1",
+  "version": "2.2.2",
   "releaseDate": "2026-09-22",
   "minEngineVersion": "2.1.0",
   "downloadUrl": "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
-  "changelog": "CORRECAO CRITICA: o auto-update morria em toda instalacao nova. O e-mail de boas-vindas gravava o estado sem o campo LastUpdateCheck e o LiveUpdate lancava excecao antes de comparar as versoes. Tambem: area temporaria passa a escolher disco fora do banco quando a tarefa so tem destino de rede; assunto do alerta identifica tarefa, terminal e pasta; liga/desliga do aviso por tarefa."
+  "changelog": "Corrige alarme falso no Monitor de Backup Ausente: ele usava a senha de rede ainda criptografada ao autenticar no compartilhamento UNC, nao enxergava a pasta e poderia avisar que faltava backup quando o backup estava la. Mensagem do net use tambem ficou mais clara."
 }
