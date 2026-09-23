@@ -1,4 +1,4 @@
-﻿# ==============================================================================
+# ==============================================================================
 # FIBS Resiliente - Motor de Execucao de Backup (backup_engine.ps1)
 # Executa 24/7 de forma consistente, online e com auto-recuperacao no boot
 # Compativel com Windows 7, 8, 10, 11 e Windows Server (2008 R2 a 2025)
@@ -2176,6 +2176,7 @@ function Invoke-DatabaseHealthAudit {
     $pageErrors = 0
     $gfixLog = ""
     $auditSuccess = $false
+    $auditException = $false
     
     try {
         # Extrai FBK do ZIP
@@ -2248,7 +2249,9 @@ function Invoke-DatabaseHealthAudit {
         
     } catch {
         Log-Message "[AUDITORIA ERRO] Excecao durante auditoria em sandbox: $_"
-        $recordErrors = 999
+        $auditException = $true
+        $recordErrors = 0
+        $pageErrors = 0
         $gfixLog = "Excecao no processo de auditoria: $_"
     } finally {
         # 6. LIMPEZA COMPLETA E GARANTIDA DO AMBIENTE SANDBOX
@@ -2269,7 +2272,9 @@ function Invoke-DatabaseHealthAudit {
     # 7. REGISTRO E DISPARO DE NOTIFICACAO (POLITICA ZERO SPAM)
     Update-ConfigAuditDate -NewDate (Get-Date -Format "yyyy-MM-dd")
     
-    if ($auditSuccess) {
+    if ($auditException) {
+        Log-Message "[AUDITORIA AVISO] O processo falhou e nao pode ser concluido. Notificacao de corrupcao ignorada para nao gerar alarme falso."
+    } elseif ($auditSuccess) {
         if ($isGapAlert) {
             Log-Message "[AUDITORIA 100% SUCESSO] Banco de dados Sismotel FISICAMENTE INTEGRO! 0 erros de registro, 0 erros de paginas. Transaction Gap em $transGap (notificacao de e-mail silenciada)."
         } else {
@@ -3405,6 +3410,7 @@ try {
         
         if ($enableAudit -and ($currentHour -eq $auditHour) -and ($p.LastAuditDate -ne $todayStr)) {
             Log-Message "Horario agendado da Auditoria Diaria alcancado ($auditHour:30h). Iniciando auditoria preventiva em sandbox..."
+            Update-ConfigAuditDate -NewDate $todayStr
             Invoke-DatabaseHealthAudit -TaskName $TaskName
         }
     }
