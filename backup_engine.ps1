@@ -2360,7 +2360,7 @@ function Invoke-MecLiveUpdate {
         [switch]$Force = $false
     )
     
-    $engineVersion = "2.2.4"
+    $engineVersion = "2.2.5"
     $webClient = $null
     
     try {
@@ -3101,11 +3101,6 @@ try {
     
     $compressionSuccess = $false
     try {
-        Compress-Archive -Path $tempFbk -DestinationPath $tempZip -CompressionLevel Optimal -Force -ErrorAction Stop
-        $compressionSuccess = $true
-    } catch {
-        Log-Message "Aviso: Compress-Archive nativo falhou. Usando fallback .NET ZipFile..."
-        if (Test-Path $tempZip) { Remove-Item $tempZip -Force -ErrorAction SilentlyContinue }
         try {
             Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
             Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
@@ -3118,6 +3113,11 @@ try {
         $entryName = Split-Path $tempFbk -Leaf
         [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $tempFbk, $entryName, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
         $zip.Dispose()
+        $compressionSuccess = $true
+    } catch {
+        Log-Message "Aviso: API de compactacao nativa falhou. Usando fallback Compress-Archive..."
+        if (Test-Path $tempZip) { Remove-Item $tempZip -Force -ErrorAction SilentlyContinue }
+        Compress-Archive -Path $tempFbk -DestinationPath $tempZip -CompressionLevel Optimal -Force -ErrorAction Stop
         $compressionSuccess = $true
     }
 
