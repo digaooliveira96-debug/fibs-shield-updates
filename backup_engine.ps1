@@ -276,9 +276,9 @@ function Get-NextBackupSequenceNumber {
             $resolved = Resolve-MappedDrivePath $dest
             if (Test-Path $resolved) {
                 try {
-                    $files = Get-ChildItem -Path $resolved -Filter "$Prefix-*.zip" -File -ErrorAction SilentlyContinue
+                    $files = Get-ChildItem -Path $resolved -Filter "$Prefix-*.*" -File -ErrorAction SilentlyContinue
                     foreach ($f in $files) {
-                        if ($f.Name -match "^$([regex]::Escape($Prefix))-(\d+)\.zip$") {
+                        if ($f.Name -match "^$([regex]::Escape($Prefix))-(\d+)\.(zip|gz|rar|fbk)$") {
                             $num = [int]$matches[1]
                             if ($num -gt $maxFound) { $maxFound = $num }
                         }
@@ -2360,7 +2360,7 @@ function Invoke-MecLiveUpdate {
         [switch]$Force = $false
     )
     
-    $engineVersion = "2.2.6"
+    $engineVersion = "2.2.7"
     $webClient = $null
     
     try {
