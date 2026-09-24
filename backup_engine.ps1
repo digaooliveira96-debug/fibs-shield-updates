@@ -1652,7 +1652,7 @@ function Test-ExternalDestinationsHealth {
             try {
                 if (Test-Path $destTrim) {
                     $destAccessible = $true
-                    $existingGzs = Get-ChildItem -Path $destTrim -Filter "*.GZ" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+                    $existingGzs = Get-ChildItem -Path "$destTrim\*" -Include "*.GZ", "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
                     if ($existingGzs -and $existingGzs.Count -gt 0) {
                         $realLastBackupTime = $existingGzs[0].LastWriteTime
                     }
@@ -2388,7 +2388,7 @@ function Invoke-MecLiveUpdate {
         [switch]$Force = $false
     )
     
-    $engineVersion = "2.2.10"
+    $engineVersion = "2.2.11"
     $webClient = $null
     
     try {
@@ -3288,7 +3288,7 @@ foreach ($destTrimmed in $resolvedDestList) {
                     Log-Message "Aplicando politica de retencao em $destTrimmed (Manter ultimos $keepBackupsCount backups do prefixo '$basePrefix')..."
                     $escapedPrefix = [regex]::Escape($basePrefix)
                     $backupFiles = Get-ChildItem -Path $destTrimmed -File -ErrorAction SilentlyContinue | Where-Object {
-                        $_.Name -match "^${escapedPrefix}[-_]\d{4,}\.GZ$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.GZ$"
+                        $_.Name -match "^${escapedPrefix}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.(GZ|zip)$"
                     } | Sort-Object LastWriteTime -Descending
                     
                     if ($backupFiles.Count -gt $keepBackupsCount) {
