@@ -1,7 +1,7 @@
 {
-  "version": "2.2.3",
+  "version": "2.2.4",
   "releaseDate": "2026-09-23",
   "minEngineVersion": "2.1.0",
   "downloadUrl": "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
-  "changelog": "Alinhamento de versao entre o manifesto e o motor (o manifesto anunciava uma versao a frente do arquivo publicado, o que faria o cliente rebaixar e rebaixar a atualizacao todo dia). Inclui a correcao do alarme falso do Monitor de Backup Ausente com senha de rede criptografada."
+  "changelog": "1. Resolve crash (ObjectDisposedException) no painel C# ao fechar a janela durante a espera do Lock.\n2. Mecanismo Inteligente de Processamento: Se a unidade secundária alvo (ex: G:) não tiver espaço, o script agora procura automaticamente espaço na unidade primária (C:) ou em outras partições para evitar abortar a rotina precocemente."
 }

@@ -1,4 +1,4 @@
-﻿# ==============================================================================
+# ==============================================================================
 # FIBS Resiliente - Motor de Execucao de Backup (backup_engine.ps1)
 # Executa 24/7 de forma consistente, online e com auto-recuperacao no boot
 # Compativel com Windows 7, 8, 10, 11 e Windows Server (2008 R2 a 2025)
@@ -2360,7 +2360,7 @@ function Invoke-MecLiveUpdate {
         [switch]$Force = $false
     )
     
-    $engineVersion = "2.2.3"
+    $engineVersion = "2.2.4"
     $webClient = $null
     
     try {
@@ -2829,46 +2829,78 @@ foreach ($d in $resolvedDestList) {
 $tempDir = $null
 $dbDrive = [System.IO.Path]::GetPathRoot($dbPath)
 
-# Procura um destino local em particao diferente do banco para isolamento fisico de gravacao
+# Exige espaco para o FBK + ZIP + margem de seguranca (ao menos 1.5x o tamanho do banco ativo)
+$minRequiredMB = [math]::Round($dbSizeMB * 1.5, 2)
+
+function Get-DriveFreeMB {
+    param([string]$Path)
+    try {
+        $r = [System.IO.Path]::GetPathRoot($Path)
+        $d = New-Object System.IO.DriveInfo($r)
+        return [math]::Round($d.AvailableFreeSpace / 1MB, 2)
+    } catch { return 0 }
+}
+
+# 1) Procura um destino local em particao diferente do banco para isolamento fisico de gravacao
 foreach ($candDest in $resolvedDestList) {
-    if ($candDest.StartsWith("\\")) { continue } # NUNCA usar rede para temporario
+    if ($candDest.StartsWith("\")) { continue } # NUNCA usar rede para temporario
     $candDrive = [System.IO.Path]::GetPathRoot($candDest)
     if ((Test-Path $candDrive) -and ($candDrive -ne $dbDrive)) {
-        $candidateTemp = Join-Path $candDest "temp_backup"
+        if ((Get-DriveFreeMB -Path $candDrive) -ge $minRequiredMB) {
+            $candidateTemp = Join-Path $candDest "temp_backup"
+            try {
+                if (-not (Test-Path $candidateTemp)) { New-Item -ItemType Directory -Path $candidateTemp -Force | Out-Null }
+                $tempDir = $candidateTemp
+                break
+            } catch {}
+        }
+    }
+}
+
+# 2) Nenhum destino isolado com espaco. Tenta qualquer outro destino local disponivel.
+if ($null -eq $tempDir) {
+    foreach ($candDest in $resolvedDestList) {
+        if ($candDest.StartsWith("\")) { continue }
+        $candDrive = [System.IO.Path]::GetPathRoot($candDest)
+        if (Test-Path $candDrive) {
+            if ((Get-DriveFreeMB -Path $candDrive) -ge $minRequiredMB) {
+                $candidateTemp = Join-Path $candDest "temp_backup"
+                try {
+                    if (-not (Test-Path $candidateTemp)) { New-Item -ItemType Directory -Path $candidateTemp -Force | Out-Null }
+                    $tempDir = $candidateTemp
+                    break
+                } catch {}
+            }
+        }
+    }
+}
+
+# 3) Fallback final: a propria pasta do script FIBS
+if ($null -eq $tempDir) {
+    $fallbackTemp = Join-Path $scriptDir "temp_backup"
+    if ((Get-DriveFreeMB -Path $fallbackTemp) -ge $minRequiredMB) {
         try {
-            if (-not (Test-Path $candidateTemp)) { New-Item -ItemType Directory -Path $candidateTemp -Force | Out-Null }
-            $tempDir = $candidateTemp
-            break
+            if (-not (Test-Path $fallbackTemp)) { New-Item -ItemType Directory -Path $fallbackTemp -Force | Out-Null }
+            $tempDir = $fallbackTemp
         } catch {}
     }
 }
 
-# Nenhum destino local serviu (ex.: tarefa externa que so grava em UNC).
-# Usa a propria pasta do FIBS (C:\Microtecs\FIBS	emp_backup). Nao cria pasta em
-# outros discos de proposito: evita diretorio solto na raiz de drives do cliente.
-# Fica no mesmo disco do banco, entao pode haver alguma disputa de I/O - aceitavel.
 if ($null -eq $tempDir) {
-    $tempDir = Join-Path $scriptDir "temp_backup"
-    if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
+    # Nenhuma unidade possui espaco suficiente!
+    $errMsg = "ALERTA PREVENTIVO DE SEGURANCA: Nenhuma unidade possui os $minRequiredMB MB livres necessarios. Para proteger o banco Firebird e o sistema contra corrupcao por falta de espaco em disco, a rotina foi interrompida preventivamente com 100% de seguranca."
+    Log-Message $errMsg
+    Send-BackupNotification -Status "FALHA" -SubjectInfo "Espaco em Disco Critico ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
+    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
+    exit 1
 }
+
 Log-Message "Diretorio temporario de processamento I/O: $tempDir"
 
-# 4. SHIELD DE ESPACO EM DISCO: Garante espaco livre suficiente e impede que o disco zere (protegendo o Firebird e o Sismotel)
 try {
     $tempRoot = [System.IO.Path]::GetPathRoot($tempDir)
-    $drive = New-Object System.IO.DriveInfo($tempRoot)
-    $freeSpaceMB = [math]::Round($drive.AvailableFreeSpace / 1MB, 2)
-    # Exige espaco para o FBK + ZIP + margem de seguranca (ao menos 1.5x o tamanho do banco ativo)
-    $minRequiredMB = [math]::Round($dbSizeMB * 1.5, 2)
-
+    $freeSpaceMB = Get-DriveFreeMB -Path $tempRoot
     Log-Message "Espaco livre na unidade de processamento ($tempRoot): $freeSpaceMB MB (Minimo seguro exigido: $minRequiredMB MB)"
-    if ($freeSpaceMB -lt $minRequiredMB) {
-        $errMsg = "ALERTA PREVENTIVO DE SEGURANCA: A unidade '$tempRoot' possui apenas $freeSpaceMB MB livres (necessario ao menos $minRequiredMB MB). Para proteger o banco Firebird e o sistema contra corrupcao por falta de espaco em disco, a rotina foi interrompida preventivamente com 100% de seguranca."
-        Log-Message $errMsg
-        Send-BackupNotification -Status "FALHA" -SubjectInfo "Espaco em Disco Critico ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
-        if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
-        exit 1
-    }
 } catch {
     Log-Message "Aviso ao verificar espaco em disco: $_"
 }
