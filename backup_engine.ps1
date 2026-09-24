@@ -2385,7 +2385,7 @@ function Invoke-MecLiveUpdate {
         [switch]$Force = $false
     )
     
-    $engineVersion = "2.2.8"
+    $engineVersion = "2.2.9"
     $webClient = $null
     
     try {
@@ -3164,7 +3164,7 @@ try {
         # PORTAO DE INTEGRIDADE: le o GZ de volta e confere o conteudo contra o .fbk.
         # So passando daqui o .fbk original pode ser descartado.
         Log-Message "Verificando integridade do GZ gerado (releitura + SHA-256)..."
-        $verif = Test-BackupGzIntegrity -ZipPath $tempGz -ExpectedEntryName $fbkEntryName -ExpectedSize $fbkSizeBytes -ExpectedSha256 $fbkSha
+        $verif = Test-BackupGzIntegrity -GzPath $tempGz -ExpectedEntryName $fbkEntryName -ExpectedSize $fbkSizeBytes -ExpectedSha256 $fbkSha
         if (-not $verif.Ok) {
             throw "GZ GERADO ESTA CORROMPIDO. $($verif.Reason)"
         }
