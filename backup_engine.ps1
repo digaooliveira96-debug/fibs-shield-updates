@@ -2360,7 +2360,7 @@ function Invoke-MecLiveUpdate {
         [switch]$Force = $false
     )
     
-    $engineVersion = "2.2.5"
+    $engineVersion = "2.2.6"
     $webClient = $null
     
     try {
@@ -2847,9 +2847,15 @@ foreach ($candDest in $resolvedDestList) {
     $candDrive = [System.IO.Path]::GetPathRoot($candDest)
     if ((Test-Path $candDrive) -and ($candDrive -ne $dbDrive)) {
         if ((Get-DriveFreeMB -Path $candDrive) -ge $minRequiredMB) {
-            $candidateTemp = Join-Path $candDest "temp_backup"
+            $candidateTemp = Join-Path $candDrive "FIBS_TEMP"
             try {
                 if (-not (Test-Path $candidateTemp)) { New-Item -ItemType Directory -Path $candidateTemp -Force | Out-Null }
+                try {
+                    $attr = [System.IO.File]::GetAttributes($candidateTemp)
+                    if (($attr -band [System.IO.FileAttributes]::Hidden) -ne [System.IO.FileAttributes]::Hidden) {
+                        [System.IO.File]::SetAttributes($candidateTemp, $attr -bor [System.IO.FileAttributes]::Hidden)
+                    }
+                } catch {}
                 $tempDir = $candidateTemp
                 break
             } catch {}
@@ -2864,9 +2870,15 @@ if ($null -eq $tempDir) {
         $candDrive = [System.IO.Path]::GetPathRoot($candDest)
         if (Test-Path $candDrive) {
             if ((Get-DriveFreeMB -Path $candDrive) -ge $minRequiredMB) {
-                $candidateTemp = Join-Path $candDest "temp_backup"
+                $candidateTemp = Join-Path $candDrive "FIBS_TEMP"
                 try {
                     if (-not (Test-Path $candidateTemp)) { New-Item -ItemType Directory -Path $candidateTemp -Force | Out-Null }
+                    try {
+                        $attr = [System.IO.File]::GetAttributes($candidateTemp)
+                        if (($attr -band [System.IO.FileAttributes]::Hidden) -ne [System.IO.FileAttributes]::Hidden) {
+                            [System.IO.File]::SetAttributes($candidateTemp, $attr -bor [System.IO.FileAttributes]::Hidden)
+                        }
+                    } catch {}
                     $tempDir = $candidateTemp
                     break
                 } catch {}
