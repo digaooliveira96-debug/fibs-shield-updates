@@ -15,6 +15,31 @@ param (
 )
 
 Add-Type -AssemblyName System.Security
+
+function Compress-GzFile {
+    param([string]$InFile, [string]$OutFile)
+    try { [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression") | Out-Null } catch {}
+    $inFileStream = [System.IO.File]::OpenRead($InFile)
+    $outFileStream = [System.IO.File]::Create($OutFile)
+    $gzStream = New-Object System.IO.Compression.GZipStream($outFileStream, [System.IO.Compression.CompressionMode]::Compress)
+    $inFileStream.CopyTo($gzStream)
+    $gzStream.Dispose()
+    $outFileStream.Dispose()
+    $inFileStream.Dispose()
+}
+
+function Expand-GzFile {
+    param([string]$InFile, [string]$OutFile)
+    try { [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression") | Out-Null } catch {}
+    $inFileStream = [System.IO.File]::OpenRead($InFile)
+    $gzStream = New-Object System.IO.Compression.GZipStream($inFileStream, [System.IO.Compression.CompressionMode]::Decompress)
+    $outFileStream = [System.IO.File]::Create($OutFile)
+    $gzStream.CopyTo($outFileStream)
+    $outFileStream.Dispose()
+    $gzStream.Dispose()
+    $inFileStream.Dispose()
+}
+
 function Unprotect-String {
     param([string]$cipherText)
     if ([string]::IsNullOrWhiteSpace($cipherText)) { return $cipherText }
@@ -193,11 +218,11 @@ function Resolve-MappedDrivePath {
 # MODULO DE VERIFICACAO DE INTEGRIDADE DO BACKUP
 # ==============================================================================
 # Um backup que chega corrompido no destino e pior que backup nenhum, porque passa
-# a falsa sensacao de protecao. Aqui o ZIP e aberto e LIDO de volta antes de o .fbk
+# a falsa sensacao de protecao. Aqui o GZ e aberto e LIDO de volta antes de o .fbk
 # de origem ser descartado, e cada copia gravada e conferida byte a byte contra a
 # origem antes de a politica de retencao apagar os backups antigos.
 #
-# NOTA TECNICA: no .NET Framework, ler o stream de uma entrada de ZIP ate o fim NAO
+# NOTA TECNICA: no .NET Framework, ler o stream de uma entrada de GZ ate o fim NAO
 # valida o CRC32 (isso so acontece no .NET moderno), e a propriedade Crc32 da entrada
 # nao existe nesta versao. Por isso a conferencia e feita com SHA-256 do conteudo
 # descompactado contra o hash do .fbk original: detecta corrupcao silenciosa, e a
@@ -209,9 +234,9 @@ function Get-Sha256OfFile {
     catch { return $null }
 }
 
-function Test-BackupZipIntegrity {
+function Test-BackupGzIntegrity {
     param(
-        [string]$ZipPath,
+        [string]$GzPath,
         [string]$ExpectedEntryName,
         [long]$ExpectedSize,
         [string]$ExpectedSha256
@@ -220,15 +245,15 @@ function Test-BackupZipIntegrity {
     try {
         try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue } catch {}
 
-        # Truncamento / ZIP invalido estoura logo aqui (fim do diretorio central ausente)
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+        # Truncamento / GZ invalido estoura logo aqui (fim do diretorio central ausente)
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($GzPath)
 
         $entry = $zip.Entries | Where-Object { $_.Name -eq $ExpectedEntryName } | Select-Object -First 1
         if ($null -eq $entry) {
-            return @{ Ok = $false; Reason = "A entrada '$ExpectedEntryName' nao existe dentro do ZIP." }
+            return @{ Ok = $false; Reason = "A entrada '$ExpectedEntryName' nao existe dentro do GZ." }
         }
         if ($entry.Length -ne $ExpectedSize) {
-            return @{ Ok = $false; Reason = "Tamanho descompactado divergente: ZIP diz $($entry.Length) bytes, o .fbk tinha $ExpectedSize bytes." }
+            return @{ Ok = $false; Reason = "Tamanho descompactado divergente: GZ diz $($entry.Length) bytes, o .fbk tinha $ExpectedSize bytes." }
         }
 
         $stream = $entry.Open()
@@ -240,13 +265,13 @@ function Test-BackupZipIntegrity {
         }
         return @{ Ok = $true; Reason = "Conteudo conferido por SHA-256." }
     } catch {
-        return @{ Ok = $false; Reason = "Nao foi possivel abrir/ler o ZIP: $_" }
+        return @{ Ok = $false; Reason = "Nao foi possivel abrir/ler o GZ: $_" }
     } finally {
         if ($null -ne $zip) { try { $zip.Dispose() } catch {} }
     }
 }
 
-# Funcao de Gestao da Numeracao Sequencial Limpa (ex: BKP_SISMOTEL-0000.zip)
+# Funcao de Gestao da Numeracao Sequencial Limpa (ex: BKP_SISMOTEL-0000.GZ)
 function Get-NextBackupSequenceNumber {
     param (
         [string]$Prefix,
@@ -745,7 +770,7 @@ function Send-BackupNotification {
                       })
                       $(if ($ZipSize) {
                       "<tr>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Arquivo Final (.ZIP):</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Arquivo Final (.GZ):</td>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-weight:800; color:#34d399; font-size:15px;'>$ZipSize MB $(if ($CompressionRatio) { "<span style='margin-left:6px; font-size:12.5px; color:#a7f3d0; font-weight:700; background-color:#064e3b; padding:3px 8px; border-radius:4px; border:1px solid #059669;'>$CompressionRatio</span>" })</td>
                       </tr>"
                       })
@@ -1621,15 +1646,15 @@ function Test-ExternalDestinationsHealth {
                 }
             }
 
-            # Checagem Fisica Real de Arquivos .ZIP no destino
+            # Checagem Fisica Real de Arquivos .GZ no destino
             $realLastBackupTime = $null
             $destAccessible = $false
             try {
                 if (Test-Path $destTrim) {
                     $destAccessible = $true
-                    $existingZips = Get-ChildItem -Path $destTrim -Filter "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
-                    if ($existingZips -and $existingZips.Count -gt 0) {
-                        $realLastBackupTime = $existingZips[0].LastWriteTime
+                    $existingGzs = Get-ChildItem -Path $destTrim -Filter "*.GZ" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+                    if ($existingGzs -and $existingGzs.Count -gt 0) {
+                        $realLastBackupTime = $existingGzs[0].LastWriteTime
                     }
                 }
             } catch {}
@@ -1653,7 +1678,7 @@ function Test-ExternalDestinationsHealth {
                         }
                     }
                 } else {
-                    # Pasta acessivel mas 0 arquivos .zip encontrados (pasta limpa, formatada ou recem criada)
+                    # Pasta acessivel mas 0 arquivos .GZ encontrados (pasta limpa, formatada ou recem criada)
                     if (-not $netTracker[$destTrim].FirstFailure) {
                         $netTracker[$destTrim].FirstFailure = if ($netTracker[$destTrim].LastSuccess) { $netTracker[$destTrim].LastSuccess } else { (Get-Date).ToString("o") }
                     }
@@ -2126,30 +2151,30 @@ function Invoke-DatabaseHealthAudit {
     if (Test-Path "C:\BKP_SISMOTEL") { $searchDirs += "C:\BKP_SISMOTEL" }
     $searchDirs = $searchDirs | Select-Object -Unique
     
-    $latestZip = $null
+    $latestGz = $null
     foreach ($sd in $searchDirs) {
-        $zips = Get-ChildItem -Path $sd -Filter "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+        $zips = Get-ChildItem -Path $sd -Filter "*.GZ" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
         if ($zips.Count -gt 0) {
-            $latestZip = $zips[0]
+            $latestGz = $zips[0]
             break
         }
     }
     
-    if ($null -eq $latestZip) {
-        Log-Message "[AUDITORIA AVISO] Nenhum arquivo .ZIP de backup localizado para teste fisico. Validacao fisica ignorada."
+    if ($null -eq $latestGz) {
+        Log-Message "[AUDITORIA AVISO] Nenhum arquivo .GZ de backup localizado para teste fisico. Validacao fisica ignorada."
         Update-ConfigAuditDate -NewDate (Get-Date -Format "yyyy-MM-dd")
         return
     }
     
-    Log-Message "[AUDITORIA] Arquivo de backup selecionado: $($latestZip.FullName) ($([math]::Round($latestZip.Length / 1MB, 2)) MB)"
+    Log-Message "[AUDITORIA] Arquivo de backup selecionado: $($latestGz.FullName) ($([math]::Round($latestGz.Length / 1MB, 2)) MB)"
     
     # 4. ETAPA 3: SELECAO INTELIGENTE DO DISCO SANDBOX (C:, D: ou E:)
     $dbSizeMB = 0
     try {
         $dbSizeMB = [math]::Round(((Get-Item $liveDb -ErrorAction Stop).Length / 1MB), 2)
     } catch {
-        Log-Message "[AUDITORIA AVISO] Nao foi possivel obter tamanho do banco ($liveDb): $_. Usando estimativa do ZIP."
-        $dbSizeMB = [math]::Round(($latestZip.Length / 1MB) * 1.3, 2)
+        Log-Message "[AUDITORIA AVISO] Nao foi possivel obter tamanho do banco ($liveDb): $_. Usando estimativa do GZ."
+        $dbSizeMB = [math]::Round(($latestGz.Length / 1MB) * 1.3, 2)
     }
     $sandboxInfo = Get-OptimalSandboxDir -DbPath $liveDb -DbSizeMB $dbSizeMB -ConfiguredDestinations $task.Destinations
     
@@ -2179,14 +2204,14 @@ function Invoke-DatabaseHealthAudit {
     $auditException = $false
     
     try {
-        # Extrai FBK do ZIP
+        # Extrai FBK do GZ
         Log-Message "[AUDITORIA] Extraindo .FBK do backup para o sandbox..."
         try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue } catch {}
         
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($latestZip.FullName)
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($latestGz.FullName)
         $fbkEntry = $zip.Entries | Where-Object { $_.Name.EndsWith(".fbk", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
         if ($null -eq $fbkEntry) {
-            throw "Arquivo .FBK nao encontrado dentro de $($latestZip.Name)"
+            throw "Arquivo .FBK nao encontrado dentro de $($latestGz.Name)"
         }
         
         $extractedFbkPath = Join-Path $sandboxDir $fbkEntry.Name
@@ -2360,7 +2385,7 @@ function Invoke-MecLiveUpdate {
         [switch]$Force = $false
     )
     
-    $engineVersion = "2.2.7"
+    $engineVersion = "2.2.8"
     $webClient = $null
     
     try {
@@ -2554,7 +2579,7 @@ trap {
     # variaveis ainda nao existem, e um Test-Path $null lancava excecao aqui dentro
     # do proprio trap, impedindo o "exit 1" de ser alcancado e mascarando o codigo
     # de saida que o startup_guard.ps1 registra.
-    foreach ($tmp in @($lockFile, $tempFbk, $tempZip, $gbakLog)) {
+    foreach ($tmp in @($lockFile, $tempFbk, $tempGz, $gbakLog)) {
         if (-not [string]::IsNullOrWhiteSpace($tmp)) {
             try { if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue } } catch {}
         }
@@ -2576,7 +2601,7 @@ $global:routineTimer = [System.Diagnostics.Stopwatch]::StartNew()
 $global:gbakTimer    = New-Object System.Diagnostics.Stopwatch
 $global:zipTimer     = New-Object System.Diagnostics.Stopwatch
 $fbkSizeMB           = 0
-$zipSizeMB           = 0
+$gzSizeMB           = 0
 
 if (-not (Test-Path $configFile)) {
     Log-Message "ERRO: Arquivo config.json nao encontrado em: $configFile"
@@ -2829,7 +2854,7 @@ foreach ($d in $resolvedDestList) {
 $tempDir = $null
 $dbDrive = [System.IO.Path]::GetPathRoot($dbPath)
 
-# Exige espaco para o FBK + ZIP + margem de seguranca (ao menos 1.5x o tamanho do banco ativo)
+# Exige espaco para o FBK + GZ + margem de seguranca (ao menos 1.5x o tamanho do banco ativo)
 $minRequiredMB = [math]::Round($dbSizeMB * 1.5, 2)
 
 function Get-DriveFreeMB {
@@ -3003,7 +3028,7 @@ $seqNumber = Get-NextBackupSequenceNumber -Prefix $basePrefix -DestinationPaths 
 $seqStr = "{0:D4}" -f $seqNumber
 
 $tempFbk    = Join-Path $tempDir "$basePrefix-$seqStr.fbk"
-$tempZip    = Join-Path $tempDir "$basePrefix-$seqStr.zip"
+$tempGz    = Join-Path $tempDir "$basePrefix-$seqStr.GZ"
 $gbakLog    = Join-Path $tempDir "gbak_$($TaskName)_log.txt"
 
 # Argumentos GBAK: -b (backup online), -t (transportavel), -g (SEM coleta de lixo / nao trava tabelas ativas)
@@ -3086,10 +3111,10 @@ if (-not $gbakSuccess) {
     exit 1
 }
 
-# --- FASE 4: COMPACTACAO DIRETA FBK -> ZIP (PRIORIDADE BAIXA) ---
+# --- FASE 4: COMPACTACAO DIRETA FBK -> GZ (PRIORIDADE BAIXA) ---
 $global:zipTimer.Restart()
 
-# Impressao digital do .fbk ANTES de compactar. E contra ela que o ZIP sera conferido,
+# Impressao digital do .fbk ANTES de compactar. E contra ela que o GZ sera conferido,
 # e por isso o .fbk so pode ser apagado depois que a conferencia passar.
 $fbkEntryName = Split-Path $tempFbk -Leaf
 $fbkSizeBytes = (Get-Item $tempFbk).Length
@@ -3105,11 +3130,11 @@ if ([string]::IsNullOrWhiteSpace($fbkSha)) {
 }
 Log-Message "Origem: $fbkEntryName | $([math]::Round($fbkSizeBytes/1MB,2)) MB | SHA-256 $($fbkSha.Substring(0,16))..."
 
-Log-Message "Compactando backup para arquivo .ZIP (Compressao Maxima em Prioridade Baixa)..."
-$zipSizeMB = 0
+Log-Message "Compactando backup para arquivo .GZ (Compressao Maxima em Prioridade Baixa)..."
+$gzSizeMB = 0
 $zipSha = $null
 try {
-    if (Test-Path $tempZip) { Remove-Item $tempZip -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
     
     $compressionSuccess = $false
     try {
@@ -3121,45 +3146,45 @@ try {
             [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem") | Out-Null
         }
         
-        $zip = [System.IO.Compression.ZipFile]::Open($tempZip, [System.IO.Compression.ZipArchiveMode]::Create)
+        $zip = [System.IO.Compression.ZipFile]::Open($tempGz, [System.IO.Compression.ZipArchiveMode]::Create)
         $entryName = Split-Path $tempFbk -Leaf
         [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $tempFbk, $entryName, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
         $zip.Dispose()
         $compressionSuccess = $true
     } catch {
         Log-Message "Aviso: API de compactacao nativa falhou. Usando fallback Compress-Archive..."
-        if (Test-Path $tempZip) { Remove-Item $tempZip -Force -ErrorAction SilentlyContinue }
-        Compress-Archive -Path $tempFbk -DestinationPath $tempZip -CompressionLevel Optimal -Force -ErrorAction Stop
+        if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
+        Compress-Archive -Path $tempFbk -DestinationPath $tempGz -CompressionLevel Optimal -Force -ErrorAction Stop
         $compressionSuccess = $true
     }
 
-    if ($compressionSuccess -and (Test-Path $tempZip) -and ((Get-Item $tempZip).Length -gt 0)) {
-        $zipSizeMB = [math]::Round(((Get-Item $tempZip).Length / 1MB), 2)
+    if ($compressionSuccess -and (Test-Path $tempGz) -and ((Get-Item $tempGz).Length -gt 0)) {
+        $gzSizeMB = [math]::Round(((Get-Item $tempGz).Length / 1MB), 2)
 
-        # PORTAO DE INTEGRIDADE: le o ZIP de volta e confere o conteudo contra o .fbk.
+        # PORTAO DE INTEGRIDADE: le o GZ de volta e confere o conteudo contra o .fbk.
         # So passando daqui o .fbk original pode ser descartado.
-        Log-Message "Verificando integridade do ZIP gerado (releitura + SHA-256)..."
-        $verif = Test-BackupZipIntegrity -ZipPath $tempZip -ExpectedEntryName $fbkEntryName -ExpectedSize $fbkSizeBytes -ExpectedSha256 $fbkSha
+        Log-Message "Verificando integridade do GZ gerado (releitura + SHA-256)..."
+        $verif = Test-BackupGzIntegrity -ZipPath $tempGz -ExpectedEntryName $fbkEntryName -ExpectedSize $fbkSizeBytes -ExpectedSha256 $fbkSha
         if (-not $verif.Ok) {
-            throw "ZIP GERADO ESTA CORROMPIDO. $($verif.Reason)"
+            throw "GZ GERADO ESTA CORROMPIDO. $($verif.Reason)"
         }
-        Log-Message "Integridade do ZIP CONFIRMADA: $($verif.Reason)"
+        Log-Message "Integridade do GZ CONFIRMADA: $($verif.Reason)"
 
-        # Impressao digital do proprio ZIP, usada para conferir cada copia nos destinos
-        $zipSha = Get-Sha256OfFile -Path $tempZip
-        if ([string]::IsNullOrWhiteSpace($zipSha)) { throw "Nao foi possivel calcular o SHA-256 do ZIP verificado." }
+        # Impressao digital do proprio GZ, usada para conferir cada copia nos destinos
+        $zipSha = Get-Sha256OfFile -Path $tempGz
+        if ([string]::IsNullOrWhiteSpace($zipSha)) { throw "Nao foi possivel calcular o SHA-256 do GZ verificado." }
 
         $global:zipTimer.Stop()
         $zipElapsedStr = Format-DurationText $global:zipTimer.Elapsed
-        Log-Message "Arquivo ZIP gerado e verificado: $tempZip ($zipSizeMB MB) em $zipElapsedStr | SHA-256 $($zipSha.Substring(0,16))..."
+        Log-Message "Arquivo GZ gerado e verificado: $tempGz ($gzSizeMB MB) em $zipElapsedStr | SHA-256 $($zipSha.Substring(0,16))..."
 
         # Agora sim e seguro remover o FBK bruto para poupar espaco em disco
         Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue
     } else {
-        throw "Arquivo ZIP nao foi gerado corretamente ou esta vazio."
+        throw "Arquivo GZ nao foi gerado corretamente ou esta vazio."
     }
 } catch {
-    $errMsg = "ERRO na compactacao do ZIP: $_"
+    $errMsg = "ERRO na compactacao do GZ: $_"
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha na Compactacao ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
     if (Test-Path $tempFbk) { Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue }
@@ -3168,7 +3193,7 @@ try {
 }
 
 # --- FASE 5: DISTRIBUICAO PARA DESTINOS E EXPURGO AUTOMATICO ---
-$fileName = Split-Path $tempZip -Leaf
+$fileName = Split-Path $tempGz -Leaf
 $localSuccessList = @()
 $networkSuccessList = @()
 $failedDestinations = @()
@@ -3176,7 +3201,7 @@ $failedDestinations = @()
 foreach ($destTrimmed in $resolvedDestList) {
     $isNetwork = $destTrimmed.StartsWith("\\")
     $destTypeTag = if ($isNetwork) { "[REDE UNC]" } else { "[LOCAL]" }
-    Log-Message "Gravando backup ZIP no destino $($destTypeTag) - $destTrimmed"
+    Log-Message "Gravando backup GZ no destino $($destTypeTag) - $destTrimmed"
     
     $destSuccess = $false
     for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
@@ -3222,17 +3247,17 @@ foreach ($destTrimmed in $resolvedDestList) {
 
             $finalPath = Join-Path $destTrimmed $fileName
 
-            # Copia o arquivo .ZIP para o destino
-            Copy-Item -Path $tempZip -Destination $finalPath -Force -ErrorAction Stop
+            # Copia o arquivo .GZ para o destino
+            Copy-Item -Path $tempGz -Destination $finalPath -Force -ErrorAction Stop
 
             if (-not (Test-Path $finalPath)) { throw "Arquivo de destino nao foi gravado." }
 
-            # CONFERENCIA DA COPIA: tamanho e SHA-256 contra o ZIP de origem ja verificado.
+            # CONFERENCIA DA COPIA: tamanho e SHA-256 contra o GZ de origem ja verificado.
             # Uma copia truncada ou com bits trocados (queda de rede, disco com defeito)
             # tem tamanho > 0 e passaria na checagem antiga; aqui ela e reprovada e a
             # tentativa e refeita, sem nunca chegar na politica de retencao.
             $destLen = (Get-Item $finalPath).Length
-            $srcLen  = (Get-Item $tempZip).Length
+            $srcLen  = (Get-Item $tempGz).Length
             if ($destLen -ne $srcLen) {
                 throw "Copia incompleta em '$finalPath': $destLen bytes gravados de $srcLen esperados."
             }
@@ -3253,14 +3278,14 @@ foreach ($destTrimmed in $resolvedDestList) {
                 } else {
                     $localSuccessList += $finalPath
                 }
-                Log-Message "Backup ZIP gravado e CONFERIDO em: $finalPath (SHA-256 identico a origem)"
+                Log-Message "Backup GZ gravado e CONFERIDO em: $finalPath (SHA-256 identico a origem)"
 
                 # Politica de Retencao (Expurgo dos mais antigos por tarefa / prefixo)
                 try {
                     Log-Message "Aplicando politica de retencao em $destTrimmed (Manter ultimos $keepBackupsCount backups do prefixo '$basePrefix')..."
                     $escapedPrefix = [regex]::Escape($basePrefix)
                     $backupFiles = Get-ChildItem -Path $destTrimmed -File -ErrorAction SilentlyContinue | Where-Object {
-                        $_.Name -match "^${escapedPrefix}[-_]\d{4,}\.zip$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.zip$"
+                        $_.Name -match "^${escapedPrefix}[-_]\d{4,}\.GZ$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.GZ$"
                     } | Sort-Object LastWriteTime -Descending
                     
                     if ($backupFiles.Count -gt $keepBackupsCount) {
@@ -3312,7 +3337,7 @@ if ($localSuccessList.Count -eq 0 -and $networkSuccessList.Count -eq 0) {
     try {
         if (-not (Test-Path $localSafeDir)) { New-Item -ItemType Directory -Path $localSafeDir -Force -ErrorAction Stop | Out-Null }
         $safeFinalPath = Join-Path $localSafeDir $fileName
-        Copy-Item -Path $tempZip -Destination $safeFinalPath -Force -ErrorAction Stop
+        Copy-Item -Path $tempGz -Destination $safeFinalPath -Force -ErrorAction Stop
         if (Test-Path $safeFinalPath) {
             # A copia de ultima linha tambem passa pela conferencia: e justamente a que
             # sera usada num desastre, entao nao pode ser aceita sem verificacao.
@@ -3331,7 +3356,7 @@ if ($localSuccessList.Count -eq 0 -and $networkSuccessList.Count -eq 0) {
 }
 
 # --- FASE 6: LIMPEZA FINAL DE ARQUIVOS TEMPORARIOS E LIBERACAO DO LOCK ---
-if (Test-Path $tempZip) { Remove-Item $tempZip -Force -ErrorAction SilentlyContinue }
+if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
 if (Test-Path $gbakLog) { Remove-Item $gbakLog -Force -ErrorAction SilentlyContinue }
 if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
 
@@ -3341,8 +3366,8 @@ $gbakDurationStr = if ($global:gbakTimer.ElapsedMilliseconds -gt 0) { Format-Dur
 $zipDurationStr = if ($global:zipTimer.ElapsedMilliseconds -gt 0) { Format-DurationText $global:zipTimer.Elapsed } else { "N/A" }
 
 $compRatio = ""
-if ($dbSizeMB -gt 0 -and $zipSizeMB -gt 0) {
-    $pct = [Math]::Round((1.0 - ([double]$zipSizeMB / [double]$dbSizeMB)) * 100, 1)
+if ($dbSizeMB -gt 0 -and $gzSizeMB -gt 0) {
+    $pct = [Math]::Round((1.0 - ([double]$gzSizeMB / [double]$dbSizeMB)) * 100, 1)
     if ($pct -gt 0) {
         $compRatio = "$pct% menor"
     }
@@ -3365,7 +3390,7 @@ try {
 if ($localSuccessList.Count -eq 0 -and $networkSuccessList.Count -eq 0) {
     $errMsg = "ERRO CRITICO: Nenhum destino (local ou rede) pode ser gravado com sucesso! Backup abortado."
     Log-Message $errMsg
-    Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha Geral de Destinos ($TaskName)" -BodyDetails $errMsg -ZipFile $fileName -ZipSize "$zipSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo
+    Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha Geral de Destinos ($TaskName)" -BodyDetails $errMsg -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo
     exit 1
 }
 
@@ -3394,7 +3419,7 @@ Status: SUCESSO $(if ($failedDestinations.Count -gt 0) { '(COM AVISO DE REDE)' }
 Tarefa: $TaskName
 Computador / Servidor: $env:COMPUTERNAME
 Arquivo Gerado: $fileName
-Tamanho Compactado: $zipSizeMB MB
+Tamanho Compactado: $gzSizeMB MB
 Banco Original: $dbPath ($dbSizeMB MB)
 
 Destinos Gravados com Sucesso:
@@ -3433,9 +3458,9 @@ Avisos de Destinos Nao Sincronizados (Rede):
 $($failedDestinations -join "`r`n")
 (Observacao: O backup local no servidor foi concluido com 100% de integridade. Verifique se os computadores da rede acima estao ligados.)
 "@
-    Send-BackupNotification -Status "SUCESSO" -SubjectInfo "Backup $TaskName Concluido ($zipSizeMB MB) [Alerta Rede]" -BodyDetails $bodyReport -ZipFile $fileName -ZipSize "$zipSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo -SuccessDests $allSuccessList -WarningDests $failedDestinations
+    Send-BackupNotification -Status "SUCESSO" -SubjectInfo "Backup $TaskName Concluido ($gzSizeMB MB) [Alerta Rede]" -BodyDetails $bodyReport -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo -SuccessDests $allSuccessList -WarningDests $failedDestinations
 } else {
-    Send-BackupNotification -Status "SUCESSO" -SubjectInfo "Backup $TaskName Concluido com Sucesso ($zipSizeMB MB)" -BodyDetails $bodyReport -ZipFile $fileName -ZipSize "$zipSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo -SuccessDests $allSuccessList -WarningDests @()
+    Send-BackupNotification -Status "SUCESSO" -SubjectInfo "Backup $TaskName Concluido com Sucesso ($gzSizeMB MB)" -BodyDetails $bodyReport -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo -SuccessDests $allSuccessList -WarningDests @()
 }
 
 # --- FASE 7: AUDITORIA PREVENTIVA DIARIA DE INTEGRIDADE (SANDBOX ISOLADA) ---
