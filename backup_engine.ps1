@@ -660,6 +660,46 @@ function Send-BackupNotification {
         $useSsl = if ($null -ne $pref.SmtpUseSsl) { [bool]$pref.SmtpUseSsl } else { $false }
         $timestampNow = Get-Date -Format 'dd/MM/yyyy HH:mm:ss'
 
+        $isOddTask = ($TaskName -match "EXTERN" -or $TaskName -eq "BKP_EXTERNO")
+        $taskBadgeHtml = if ($isOddTask) {
+            "<span style='display:inline-block; margin-left:8px; padding:3px 8px; border-radius:4px; font-size:11.5px; font-weight:700; background-color:#1e3a8a; color:#93c5fd; border:1px solid #3b82f6;'>C&Oacute;PIA EXTERNA (HORAS &Iacute;MPARES)</span>"
+        } else {
+            "<span style='display:inline-block; margin-left:8px; padding:3px 8px; border-radius:4px; font-size:11.5px; font-weight:700; background-color:#064e3b; color:#6ee7b7; border:1px solid #10b981;'>BACKUP LOCAL NO SERVIDOR (HORAS PARES)</span>"
+        }
+
+        $isNetFailure = ($isOddTask -or $SubjectInfo -match "Externo|Rede|Terminal" -or $BodyDetails -match "CONECTIVIDADE|REDE EXTERNA")
+        $recActionsHtml = if ($isNetFailure) {
+            @"
+            <div style='margin-bottom:8px;'>
+              <strong>1. Terminal da Recep&ccedil;&atilde;o:</strong> Verificar se o computador de destino est&aacute; ligado, n&atilde;o est&aacute; hibernando e com cabo de rede conectado.
+            </div>
+            <div style='margin-bottom:8px;'>
+              <strong>2. Compartilhamento do Windows:</strong> Confirmar se a pasta de backup continua compartilhada na rede e acess&iacute;vel.
+            </div>
+            <div style='margin-bottom:8px;'>
+              <strong>3. Usu&aacute;rio e Senha (Credenciais):</strong> Verificar se a senha do Windows do terminal foi alterada recentemente.
+            </div>
+            <div>
+              <strong>4. Banco de Dados Local:</strong> Nenhuma a&ccedil;&atilde;o necess&aacute;ria no banco Firebird (o banco est&aacute; 100% &iacute;ntegro e seguro no servidor).
+            </div>
+"@
+        } else {
+            @"
+            <div style='margin-bottom:8px;'>
+              <strong>1. Acesso Remoto:</strong> Conectar no servidor via AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).
+            </div>
+            <div style='margin-bottom:8px;'>
+              <strong>2. Servi&ccedil;o Firebird:</strong> Abrir o <code>services.msc</code> e confirmar se o servi&ccedil;o <code>Firebird Server</code> est&aacute; em execu&ccedil;&atilde;o.
+            </div>
+            <div style='margin-bottom:8px;'>
+              <strong>3. Espa&ccedil;o em Disco:</strong> Verificar se a unidade de destino possui espa&ccedil;o livre suficiente para armazenar o banco.
+            </div>
+            <div>
+              <strong>4. Logs Detalhados:</strong> Consultar o log da rotina em <code>C:\Microtecs\FIBS\logs\</code>.
+            </div>
+"@
+        }
+
         $htmlBody = @"
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -743,7 +783,7 @@ function Send-BackupNotification {
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#e2e8f0;">
                       <tr>
                         <td width="38%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Tarefa Executada:</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:15.5px;">$TaskName</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:15px;">$TaskName $taskBadgeHtml</td>
                       </tr>
                       $(if ($DurationStr) {
                       "<tr>
@@ -754,7 +794,7 @@ function Send-BackupNotification {
                       $(if ($GbakDurationStr -or $ZipDurationStr) {
                       "<tr>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Extra&ccedil;&atilde;o &bull; Compress&atilde;o:</td>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#cbd5e1; font-size:14px;'>$GbakDurationStr (GBAK) &bull; $ZipDurationStr (ZIP)</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#cbd5e1; font-size:14px;'>$GbakDurationStr (GBAK) &bull; $ZipDurationStr (.GZ)</td>
                       </tr>"
                       })
                       $(if ($DbPath) {
@@ -818,18 +858,7 @@ function Send-BackupNotification {
                 </tr>
                 <tr>
                   <td bgcolor='#1e293b' style='background-color:#1e293b; padding:16px 18px; font-size:13.5px; color:#cbd5e1; line-height:1.7;'>
-                    <div style='margin-bottom:8px;'>
-                      <strong>1. Acesso Remoto:</strong> Conectar no servidor via AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).
-                    </div>
-                    <div style='margin-bottom:8px;'>
-                      <strong>2. Servi&ccedil;o Firebird:</strong> Abrir o <code>services.msc</code> e confirmar se o servi&ccedil;o <code>Firebird Server</code> est&aacute; em execu&ccedil;&atilde;o.
-                    </div>
-                    <div style='margin-bottom:8px;'>
-                      <strong>3. Espa&ccedil;o em Disco:</strong> Verificar se a unidade de destino possui espa&ccedil;o livre suficiente para armazenar o banco.
-                    </div>
-                    <div>
-                      <strong>4. Logs Detalhados:</strong> Consultar o log da rotina em <code>C:\Microtecs\FIBS\logs\</code>.
-                    </div>
+                    $recActionsHtml
                   </td>
                 </tr>
               </table>
