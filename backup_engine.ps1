@@ -475,12 +475,13 @@ function Send-MailWithRetry {
             $global:mailSent = $true
             return
         } catch {
+            $inner = if ($_.Exception -and $_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
             if ($try -lt $Attempts) {
                 $espera = 15 * $try
-                Log-Message "Aviso: tentativa $try de envio de e-mail falhou ($_). Nova tentativa em ${espera}s..."
+                Log-Message "Aviso: tentativa $try de envio de e-mail falhou ($inner). Nova tentativa em ${espera}s..."
                 Start-Sleep -Seconds $espera
             } else {
-                Log-Message "ERRO: todas as $Attempts tentativas de envio de e-mail falharam. Ultimo erro: $_"
+                Log-Message "ERRO: todas as $Attempts tentativas de envio de e-mail falharam. Ultimo erro: $inner"
             }
         } finally {
             if ($null -ne $smtp) { try { $smtp.Dispose() } catch {} }
@@ -2388,7 +2389,7 @@ function Invoke-MecLiveUpdate {
         [switch]$Force = $false
     )
     
-    $engineVersion = "2.2.11"
+    $engineVersion = "2.2.12"
     $webClient = $null
     
     try {
@@ -3391,9 +3392,28 @@ try {
 
 # Verificacao de integridade final: ao menos 1 destino deve ter sido gravado com sucesso
 if ($localSuccessList.Count -eq 0 -and $networkSuccessList.Count -eq 0) {
-    $errMsg = "ERRO CRITICO: Nenhum destino (local ou rede) pode ser gravado com sucesso! Backup abortado."
+    $isNetTask = ($TaskName -match "EXTERN" -or $TaskName -eq "BKP_EXTERNO" -or ($allDestinations | Where-Object { $_ -match '^\\\\' }))
+    if ($isNetTask) {
+        $subjectInfo = "Destino Externo Offline / Inacessivel ($TaskName)"
+        $errMsg = @"
+AVISO DE CONECTIVIDADE / REDE EXTERNA:
+O backup do banco de dados foi extraido e compactado com 100% DE SUCESSO no servidor, porem nao foi possivel copiar para o computador de destino na rede ($($failedDestinations -join ', ')).
+
+Causas mais frequentes para verificar:
+1. Computador da Recepcao/Terminal desligado, hibernando ou fora da tomada/rede;
+2. Pasta descompartilhada, renomeada ou sem permissao no computador remoto;
+3. Usuario ou senha do Windows alterados na maquina de destino (problema de credenciais);
+4. Cabo de rede desconectado, oscilacao de Wi-Fi ou IP do terminal alterado.
+
+OBSERVACAO DE SEGURANCA:
+O banco de dados do Sismotel no servidor principal continua 100% integro, saudavel e seguro.
+"@
+    } else {
+        $subjectInfo = "Falha ao Gravar nos Discos Locais ($TaskName)"
+        $errMsg = "ERRO CRITICO: Nao foi possivel gravar nos discos locais do servidor ($($failedDestinations -join ', ')). Verifique se as unidades locais estao cheias ou sem permissao de gravacao."
+    }
     Log-Message $errMsg
-    Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha Geral de Destinos ($TaskName)" -BodyDetails $errMsg -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo
+    Send-BackupNotification -Status "FALHA" -SubjectInfo $subjectInfo -BodyDetails $errMsg -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo
     exit 1
 }
 

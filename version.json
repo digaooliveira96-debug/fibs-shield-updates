@@ -1,7 +1,7 @@
 {
-  "version": "2.2.11",
-  "releaseDate": "2026-09-24",
+  "version": "2.2.12",
+  "releaseDate": "2026-09-25",
   "minEngineVersion": "2.1.0",
   "downloadUrl": "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
-  "changelog": "1. Resolve crash (ObjectDisposedException) no painel C# ao fechar a janela durante a espera do Lock.\n2. Mecanismo Inteligente de Processamento: Se a unidade secundária alvo (ex: G:) não tiver espaço, o script agora procura automaticamente espaço na unidade primária (C:) ou em outras partições para evitar abortar a rotina precocemente."
+  "changelog": "1. Mensagens de alerta amigaveis: Alerta de destino externo explica com clareza causas provaveis (terminal desligado, pasta descompartilhada, credenciais) sem assustar o suporte.\n2. Diagnostico visual claro de que o banco de dados local esta 100% seguro."
 }
