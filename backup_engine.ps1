@@ -2561,10 +2561,38 @@ function Invoke-MecLiveUpdate {
         # Prepara pasta temporaria isolada
         $tempDir = Join-Path $scriptDir "temp"
         if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
+
+        # Tenta atualizacao completa via instalador silencioso oficial (Setup)
+        $setupUrl = if ($null -ne $manifest.setupUrl -and -not [string]::IsNullOrWhiteSpace($manifest.setupUrl)) {
+            $manifest.setupUrl
+        } else {
+            "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe"
+        }
+        
+        $tempSetup = Join-Path $tempDir "MEC_Shield_Setup.exe"
+        try {
+            Log-Message "[LIVEUPDATE] Baixando instalador completo oficial v$($manifest.version)..."
+            if (Test-Path $tempSetup) { Remove-Item $tempSetup -Force -ErrorAction SilentlyContinue }
+            $webClient.DownloadFile($setupUrl, $tempSetup)
+            if ((Test-Path $tempSetup) -and (Get-Item $tempSetup).Length -gt 1MB) {
+                Log-Message "[LIVEUPDATE] Executando instalador oficial silencioso (/SP- /VERYSILENT)..."
+                $proc = Start-Process -FilePath $tempSetup -ArgumentList "/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait -PassThru
+                if ($proc.ExitCode -eq 0) {
+                    Log-Message "[LIVEUPDATE 100% SUCESSO] Pacote completo v$($manifest.version) (Interface, Servico e Motor) instalado com sucesso!"
+                    Remove-Item $tempSetup -Force -ErrorAction SilentlyContinue
+                    return
+                } else {
+                    Log-Message "[LIVEUPDATE AVISO] Instalador retornou codigo $($proc.ExitCode). Realizando fallback para atualizacao direta do motor..."
+                }
+            }
+        } catch {
+            Log-Message "[LIVEUPDATE AVISO] Falha ao executar instalador completo: $_. Prosseguindo com atualizacao direta do motor..."
+        }
+
         $stageFile = Join-Path $tempDir "backup_engine_stage.ps1"
         if (Test-Path $stageFile) { Remove-Item $stageFile -Force -ErrorAction SilentlyContinue }
         
-        # Baixa o script da nova versao
+        # Baixa o script da nova versao (Fallback Direto do Motor)
         $webClient.DownloadFile($downloadUrl, $stageFile)
         
         if (-not (Test-Path $stageFile)) {
