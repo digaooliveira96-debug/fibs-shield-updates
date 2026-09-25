@@ -203,6 +203,18 @@ function Resolve-MappedDrivePath {
             } catch {}
         }
 
+        if ([string]::IsNullOrWhiteSpace($remotePath)) {
+            try {
+                $netLines = net.exe use 2>$null
+                foreach ($line in $netLines) {
+                    if ($line -match "(?i)\b${driveLetter}:\s+(\\\\[^\s]+)") {
+                        $remotePath = $matches[1]
+                        break
+                    }
+                }
+            } catch {}
+        }
+
         if (-not [string]::IsNullOrWhiteSpace($remotePath)) {
             $remotePath = $remotePath.TrimEnd('\')
             if (-not [string]::IsNullOrWhiteSpace($subPath)) {
@@ -911,7 +923,7 @@ function Send-BackupNotification {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.3 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v2.2.13 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Central de Monitoramento Cont&iacute;nuo
@@ -1063,7 +1075,7 @@ function Send-WelcomeEmail {
             <td bgcolor="#111827" style="padding:24px 28px 12px 28px;">
               <h2 style="margin:0 0 8px 0; color:#ffffff; font-size:21px; font-weight:700;">Seja bem-vindo ao novo padr&atilde;o corporativo de seguran&ccedil;a cont&iacute;nua</h2>
               <p style="margin:0 0 14px 0; color:#cbd5e1; font-size:14px; line-height:1.65;">
-                A instala&ccedil;&atilde;o do sistema corporativo <strong style="color:#10b981;">FIBS MEC Shield Enterprise (v2.2.3)</strong> foi conclu&iacute;da com &ecirc;xito neste servidor. Esta nova gera&ccedil;&atilde;o substitui integralmente as rotinas legadas e traz uma arquitetura avan&ccedil;ada de conting&ecirc;ncia concebida sob medida para o regime ininterrupto (24/7) de mot&eacute;is, blindando o banco de dados do <strong>Sismotel</strong> com prote&ccedil;&atilde;o em m&uacute;ltiplas camadas e sem nenhum impacto na agilidade da recep&ccedil;&atilde;o.
+                A instala&ccedil;&atilde;o do sistema corporativo <strong style="color:#10b981;">FIBS MEC Shield Enterprise (v2.2.13)</strong> foi conclu&iacute;da com &ecirc;xito neste servidor. Esta nova gera&ccedil;&atilde;o substitui integralmente as rotinas legadas e traz uma arquitetura avan&ccedil;ada de conting&ecirc;ncia concebida sob medida para o regime ininterrupto (24/7) de mot&eacute;is, blindando o banco de dados do <strong>Sismotel</strong> com prote&ccedil;&atilde;o em m&uacute;ltiplas camadas e sem nenhum impacto na agilidade da recep&ccedil;&atilde;o.
               </p>
             </td>
           </tr>
@@ -1102,7 +1114,7 @@ function Send-WelcomeEmail {
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Edi&ccedil;&atilde;o / Vers&atilde;o:</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#34d399; font-weight:700; font-size:13.5px;">v2.2.3 &bull; Enterprise Shield</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#34d399; font-weight:700; font-size:13.5px;">v2.2.13 &bull; Enterprise Shield</td>
                       </tr>
                     </table>
                   </td>
@@ -1230,7 +1242,7 @@ function Send-WelcomeEmail {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.3 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v2.2.13 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Central de Monitoramento Cont&iacute;nuo
@@ -1544,7 +1556,7 @@ function Send-NetworkFailureAlert {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.3 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v2.2.13 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Central de Monitoramento Cont&iacute;nuo
@@ -1659,6 +1671,12 @@ function Test-ExternalDestinationsHealth {
             $destTrim = $dest.TrimEnd('\', '/')
             if ([string]::IsNullOrWhiteSpace($destTrim)) { continue }
 
+            # Traducao automatica de unidade mapeada (ex: Z:\... -> \\servidor\pasta\...) para servicos Windows (SYSTEM)
+            $destResolved = Resolve-MappedDrivePath $destTrim
+            if ($destResolved -ne $destTrim) {
+                $destTrim = $destResolved.TrimEnd('\', '/')
+            }
+
             if (-not $netTracker.ContainsKey($destTrim)) { $netTracker[$destTrim] = @{} }
 
             # Autenticacao proativa se for UNC de rede e houver credenciais
@@ -1685,6 +1703,44 @@ function Test-ExternalDestinationsHealth {
                     $existingGzs = Get-ChildItem -Path "$destTrim\*" -Include "*.GZ", "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
                     if ($existingGzs -and $existingGzs.Count -gt 0) {
                         $realLastBackupTime = $existingGzs[0].LastWriteTime
+                    }
+                } elseif ($destTrim.StartsWith("\\")) {
+                    # Tenta compartilhamento administrativo (C$ ou D$) antes de dar como inacessivel
+                    $cleanP = $destTrim.TrimStart('\')
+                    $pParts = $cleanP.Split('\')
+                    if ($pParts.Length -ge 2 -and $pParts[1] -notmatch '^[A-Za-z]\$') {
+                        $uncH = $pParts[0]
+                        $sName = $pParts[1]
+                        $subR = if ($pParts.Length -gt 2) { ($pParts[2..($pParts.Length - 1)]) -join '\' } else { "" }
+                        foreach ($altDrive in @("c$", "d$")) {
+                            $altRoot = "\\$uncH\$altDrive"
+                            if (-not [string]::IsNullOrWhiteSpace($tConf.NetworkUser)) {
+                                try {
+                                    $normUser = $tConf.NetworkUser
+                                    while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
+                                    $senhaRede = Unprotect-String $tConf.NetworkPassword
+                                    $netUseArgs = @("use", "`"$altRoot`"", "`"$senhaRede`"", "/user:`"$normUser`"", "/persistent:no")
+                                    Start-Process -FilePath "net.exe" -ArgumentList $netUseArgs -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
+                                    if ($normUser -notmatch '\\' -and -not [string]::IsNullOrWhiteSpace($uncH)) {
+                                        $hostUser = "$uncH\$normUser"
+                                        $netUseArgs = @("use", "`"$altRoot`"", "`"$senhaRede`"", "/user:`"$hostUser`"", "/persistent:no")
+                                        Start-Process -FilePath "net.exe" -ArgumentList $netUseArgs -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
+                                    }
+                                } catch {}
+                            }
+                            $checkPath = "\\$uncH\$altDrive\$sName" + (if ($subR) { "\$subR" } else { "" })
+                            try {
+                                if (Test-Path $checkPath) {
+                                    $destAccessible = $true
+                                    $existingGzs = Get-ChildItem -Path "$checkPath\*" -Include "*.GZ", "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+                                    if ($existingGzs -and $existingGzs.Count -gt 0) {
+                                        $realLastBackupTime = $existingGzs[0].LastWriteTime
+                                    }
+                                    Log-Message "Monitor de Destino: Destino '$destTrim' verificado com sucesso via compartilhamento alternativo: $checkPath"
+                                    break
+                                }
+                            } catch {}
+                        }
                     }
                 }
             } catch {}
@@ -2030,7 +2086,7 @@ function Send-AuditAlertNotification {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.3 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v2.2.13 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Auditoria Preventiva Di&aacute;ria
@@ -2418,7 +2474,7 @@ function Invoke-MecLiveUpdate {
         [switch]$Force = $false
     )
     
-    $engineVersion = "2.2.12"
+    $engineVersion = "2.2.13"
     $webClient = $null
     
     try {
@@ -2570,27 +2626,45 @@ for ($w = 0; $w -lt $maxLockWaitSec; $w += 5) {
     if (-not (Test-Path $lockFile)) {
         try {
             $lockContent = "$TaskName | PID:$PID | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-            [System.IO.File]::WriteAllText($lockFile, $lockContent)
+            $fs = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockContent)
+            $fs.Write($bytes, 0, $bytes.Length)
+            $fs.Close()
+            $fs.Dispose()
             $lockAcquired = $true
             break
         } catch {}
-    } else {
-        try {
-            $existingLock = Get-Content $lockFile -Raw -ErrorAction SilentlyContinue
-            if ($existingLock -match 'PID:(\d+)') {
-                $ownerPid = [int]$matches[1]
-                $ownerProc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
-                if ($null -eq $ownerProc) {
-                    Log-Message "Aviso: Lock orfao anterior detectado (PID $ownerPid inativo). Liberando lock..."
-                    Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
-                    continue
-                }
-            }
-        } catch {}
-
-        Log-Message "Aviso: Outra tarefa de backup em andamento ($existingLock). Aguardando liberacao ($w/$maxLockWaitSec s)..."
-        Start-Sleep -Seconds 5
     }
+
+    try {
+        $existingLock = Get-Content $lockFile -Raw -ErrorAction SilentlyContinue
+        $existingTask = ""
+        $ownerPid = 0
+        if ($existingLock -match '^(.*?)\s*\|\s*PID:(\d+)') {
+            $existingTask = $matches[1].Trim()
+            $ownerPid = [int]$matches[2]
+        }
+
+        if ($ownerPid -gt 0) {
+            $ownerProc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+            if ($null -eq $ownerProc) {
+                Log-Message "Aviso: Lock orfao anterior detectado (PID $ownerPid inativo). Liberando lock..."
+                Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
+                continue
+            }
+
+            # Se o lock pertence A MESMA TAREFA e o processo esta ativo:
+            # Trata-se de um disparo duplo simultaneo (ex: MEC_Shield_Service e Windows Task Scheduler no mesmo segundo).
+            # Para rotinas agendadas (-not $Manual), encerra imediatamente sem travar nem reexecutar.
+            if (-not $Manual -and $existingTask -eq $TaskName) {
+                Log-Message "DISPARO CONCORRENTE IGNORADO: A rotina da tarefa '$TaskName' ja esta em andamento pelo processo PID $ownerPid. Execucao duplicada cancelada com seguranca."
+                exit 0
+            }
+        }
+    } catch {}
+
+    Log-Message "Aviso: Outra tarefa de backup em andamento ($existingLock). Aguardando liberacao ($w/$maxLockWaitSec s)..."
+    Start-Sleep -Seconds 5
 }
 
 if (-not $lockAcquired) {
@@ -3273,12 +3347,38 @@ foreach ($destTrimmed in $resolvedDestList) {
                 }
             }
 
-            # Cria a pasta caso nao exista
-            if (-not (Test-Path $destTrimmed)) {
-                New-Item -ItemType Directory -Path $destTrimmed -Force -ErrorAction Stop | Out-Null
-            }
+            # Normalizacao e limpeza do caminho de destino
+            $destClean = $destTrimmed.Trim().Trim('"', "'").TrimEnd('\', '/')
+            $fileNameClean = (Split-Path $tempGz -Leaf).Trim().Trim('"', "'")
+            $finalPath = "$destClean\$fileNameClean"
 
-            $finalPath = Join-Path $destTrimmed $fileName
+            # Cria a pasta caso nao exista (com protecao contra "The path is not of a legal form" em compartilhamento UNC)
+            if (-not $isNetwork) {
+                if (-not (Test-Path $destClean)) {
+                    [System.IO.Directory]::CreateDirectory($destClean) | Out-Null
+                }
+            } else {
+                $uncParts = $destClean.TrimStart('\').Split('\')
+                if ($uncParts.Length -le 2) {
+                    # Trata-se de \\servidor\compartilhamento raiz
+                    if (-not (Test-Path $destClean)) {
+                        throw "O compartilhamento de rede '$destClean' esta inacessivel ou nao existe no servidor remoto."
+                    }
+                } else {
+                    # Trata-se de \\servidor\compartilhamento\subpasta ou \\servidor\c$\subpasta
+                    $uncRoot = "\\$($uncParts[0])\$($uncParts[1])"
+                    if (-not (Test-Path $uncRoot)) {
+                        throw "O compartilhamento base '$uncRoot' esta inacessivel ou nao existe no servidor remoto."
+                    }
+                    if (-not (Test-Path $destClean)) {
+                        try {
+                            [System.IO.Directory]::CreateDirectory($destClean) | Out-Null
+                        } catch {
+                            throw "Nao foi possivel criar a subpasta em '$destClean': $_"
+                        }
+                    }
+                }
+            }
 
             # Copia o arquivo .GZ para o destino
             Copy-Item -Path $tempGz -Destination $finalPath -Force -ErrorAction Stop
@@ -3350,6 +3450,89 @@ foreach ($destTrimmed in $resolvedDestList) {
 
         if ($attempt -lt $retryCount) {
             Start-Sleep -Seconds $retryInterval
+        }
+    }
+
+    # FALLBACK AUTOMATICO DE COMPARTILHAMENTO ADMINISTRATIVO:
+    # Se a pasta compartilhada normal (\\terminal\pasta) falhou (descompartilhada ou sem permissao),
+    # tenta automaticamente via compartilhamento administrativo (C$ ou D$) com as mesmas credenciais
+    if (-not $destSuccess -and $isNetwork) {
+        $cleanPath = $destTrimmed.TrimStart('\')
+        $parts = $cleanPath.Split('\')
+        if ($parts.Length -ge 2) {
+            $uncHost = $parts[0]
+            $shareName = $parts[1]
+            $subRest = if ($parts.Length -gt 2) { ($parts[2..($parts.Length - 1)]) -join '\' } else { "" }
+
+            $altCandidates = @()
+            if ($shareName -notmatch '^[A-Za-z]\$') {
+                $cPath = "\\$uncHost\c$\$shareName" + (if ($subRest) { "\$subRest" } else { "" })
+                $dPath = "\\$uncHost\d$\$shareName" + (if ($subRest) { "\$subRest" } else { "" })
+                $altCandidates += $cPath
+                $altCandidates += $dPath
+            } elseif ($shareName -match '^[A-Za-z]\$') {
+                if (-not [string]::IsNullOrWhiteSpace($subRest)) {
+                    $altCandidates += "\\$uncHost\$subRest"
+                }
+            }
+
+            foreach ($altDest in $altCandidates) {
+                Log-Message "REDE RESILIENTE: Destino principal falhou. Tentando variacao via compartilhamento administrativo: $altDest..."
+                try {
+                    $altParts = $altDest.TrimStart('\').Split('\')
+                    $altRoot = "\\$($altParts[0])\$($altParts[1])"
+                    if (-not [string]::IsNullOrWhiteSpace($networkUser)) {
+                        $normUser = $networkUser.Replace('/', '\')
+                        while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
+                        $netUseArgs = @("use", "`"$altRoot`"", "`"$networkPassword`"", "/user:`"$normUser`"", "/persistent:no")
+                        $netUseProc = Start-Process -FilePath "net.exe" -ArgumentList $netUseArgs -NoNewWindow -Wait -PassThru
+                        if ($netUseProc.ExitCode -ne 0 -and $normUser -notmatch '\\') {
+                            $hostUser = "$uncHost\$normUser"
+                            $netUseArgs = @("use", "`"$altRoot`"", "`"$networkPassword`"", "/user:`"$hostUser`"", "/persistent:no")
+                            Start-Process -FilePath "net.exe" -ArgumentList $netUseArgs -NoNewWindow -Wait -PassThru | Out-Null
+                        }
+                    }
+
+                    if (-not (Test-Path $altDest)) {
+                        try { [System.IO.Directory]::CreateDirectory($altDest) | Out-Null } catch {}
+                    }
+
+                    if (Test-Path $altDest) {
+                        $altDestClean = $altDest.Trim().Trim('"', "'").TrimEnd('\', '/')
+                        $finalPathAlt = "$altDestClean\$fileNameClean"
+                        Copy-Item -Path $tempGz -Destination $finalPathAlt -Force -ErrorAction Stop
+                        $destShaAlt = Get-Sha256OfFile -Path $finalPathAlt
+                        if ($destShaAlt -eq $zipSha) {
+                            $destSuccess = $true
+                            $networkSuccessList += $finalPathAlt
+                            Log-Message "SUCESSO no destino alternativo administrativo: $finalPathAlt (Copia gravada e SHA-256 conferido!)"
+
+                            # Aplica politica de retencao no destino alternativo
+                            try {
+                                Log-Message "Aplicando politica de retencao em $altDestClean (Manter ultimos $keepBackupsCount backups do prefixo '$basePrefix')..."
+                                $escapedPrefix = [regex]::Escape($basePrefix)
+                                $backupFilesAlt = Get-ChildItem -Path $altDestClean -File -ErrorAction SilentlyContinue | Where-Object {
+                                    $_.Name -match "^${escapedPrefix}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.(GZ|zip)$"
+                                } | Sort-Object LastWriteTime -Descending
+
+                                if ($backupFilesAlt.Count -gt $keepBackupsCount) {
+                                    $filesToRemove = $backupFilesAlt | Select-Object -Skip $keepBackupsCount
+                                    foreach ($oldFile in $filesToRemove) {
+                                        Log-Message "Excluindo backup excedente antigo: $($oldFile.Name)"
+                                        Remove-Item $oldFile.FullName -Force -ErrorAction SilentlyContinue
+                                    }
+                                }
+                            } catch {
+                                Log-Message "Aviso na politica de retencao em $($altDestClean): $_"
+                            }
+
+                            break
+                        }
+                    }
+                } catch {
+                    Log-Message "Tentativa no destino alternativo '$altDest' falhou: $_"
+                }
+            }
         }
     }
 
@@ -3548,3 +3731,4 @@ try {
 
 Log-Message "======================================================"
 exit 0
+
