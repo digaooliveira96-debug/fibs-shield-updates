@@ -2549,12 +2549,27 @@ function Invoke-MecLiveUpdate {
         $remoteVer = [System.Version]$manifest.version
         $localVer = [System.Version]$engineVersion
         
-        if ($remoteVer -le $localVer -and -not $Force) {
-            Log-Message "[LIVEUPDATE] FIBS esta atualizado na ultima versao ($engineVersion). Nenhuma acao necessaria."
+        $localExe = Join-Path $scriptDir "MEC_Shield.exe"
+        $exeVer = [System.Version]"0.0.0.0"
+        if (Test-Path $localExe) {
+            try {
+                $fvi = (Get-Item $localExe).VersionInfo.FileVersion
+                if (-not [string]::IsNullOrWhiteSpace($fvi)) { $exeVer = [System.Version]$fvi }
+            } catch {}
+        }
+        
+        $remoteVer3 = [System.Version]"$($remoteVer.Major).$($remoteVer.Minor).$($remoteVer.Build)"
+        $exeVer3 = [System.Version]"$($exeVer.Major).$($exeVer.Minor).$($exeVer.Build)"
+        $exeNeedsUpdate = ($exeVer.Major -eq 0) -or ($exeVer3 -lt $remoteVer3)
+        $engineNeedsUpdate = ($remoteVer -gt $localVer)
+        
+        if (-not $engineNeedsUpdate -and -not $exeNeedsUpdate -and -not $Force) {
+            Log-Message "[LIVEUPDATE] FIBS esta 100% atualizado (Motor: v$engineVersion, Interface: v$exeVer). Nenhuma acao necessaria."
             return
         }
         
-        Log-Message "[LIVEUPDATE] Nova versao detectada no GitHub: v$($manifest.version) (Instalada: v$engineVersion)! Baixando..."
+        $statusDesc = if ($engineNeedsUpdate) { "Motor: v$engineVersion -> v$($manifest.version)" } else { "Interface defasada: v$exeVer -> v$($manifest.version)" }
+        Log-Message "[LIVEUPDATE] Atualizacao detectada no GitHub: v$($manifest.version) ($statusDesc)! Baixando..."
         $downloadUrl = $manifest.downloadUrl
         if ([string]::IsNullOrWhiteSpace($downloadUrl)) {
             $downloadUrl = "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1"
