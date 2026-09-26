@@ -3757,7 +3757,7 @@ try {
 
 # 11. CAMADA AUTO-UPDATE EM NUVEM (MEC LiveUpdate via GitHub)
 try {
-    Invoke-MecLiveUpdate
+    Invoke-MecLiveUpdate -Force:$ForceUpdate
 } catch {
     Log-Message "Aviso na verificacao de auto-update: $_"
 }
