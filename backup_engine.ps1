@@ -104,6 +104,10 @@ function Convert-PlainPasswordsInConfig {
             $mudou = $true; $campos += "SmtpPass"
         }
         foreach ($t in $cfg.Tasks) {
+            if ($null -eq $t.NetworkPassword) {
+                $t.NetworkPassword = ""
+                $mudou = $true; $campos += "$($t.TaskName).NetworkPassword (null para vazio)"
+            }
             foreach ($nome in @("DbPassword", "NetworkPassword")) {
                 $valor = $t.$nome
                 if (-not [string]::IsNullOrWhiteSpace($valor) -and -not $valor.StartsWith("AQAAANCMnd8BF")) {
@@ -116,7 +120,7 @@ function Convert-PlainPasswordsInConfig {
         if ($mudou) {
             $json = $cfg | ConvertTo-Json -Depth 10
             [System.IO.File]::WriteAllText($configFile, $json, [System.Text.Encoding]::UTF8)
-            Log-Message "SEGURANCA: senha(s) em texto puro convertidas para forma criptografada neste servidor ($($campos -join ', ')). O config.json local nao guarda mais credencial legivel."
+            Log-Message "SEGURANCA: credencial(is) normalizada(s) ou convertida(s) neste servidor ($($campos -join ', ')). O config.json local nao guarda senha legivel."
         }
     } catch {
         Log-Message "Aviso ao criptografar credenciais do config.json: $_"
@@ -224,6 +228,23 @@ function Resolve-MappedDrivePath {
         }
     }
     return $p
+}
+
+function Disconnect-HostConnections {
+    param([string]$HostName)
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return }
+    $cleanHost = $HostName.TrimStart('\').Split('\')[0]
+    if ([string]::IsNullOrWhiteSpace($cleanHost)) { return }
+    try {
+        $netOut = & net.exe use 2>&1
+        $pattern = "\\\\" + [regex]::Escape($cleanHost) + "\\[^\s]+"
+        foreach ($line in $netOut) {
+            if ($line -match $pattern) {
+                $remotePath = $matches[0].TrimEnd(':', '.')
+                try { & net.exe use "`"$remotePath`"" /delete /yes 2>&1 | Out-Null } catch {}
+            }
+        }
+    } catch {}
 }
 
 # ==============================================================================
@@ -1678,19 +1699,31 @@ function Test-ExternalDestinationsHealth {
             }
 
             if (-not $netTracker.ContainsKey($destTrim)) { $netTracker[$destTrim] = @{} }
+            $detectedReason = $FailureReason
 
             # Autenticacao proativa se for UNC de rede e houver credenciais
-            if ($destTrim.StartsWith("\\") -and -not [string]::IsNullOrWhiteSpace($tConf.NetworkUser)) {
+            $senhaRede = Unprotect-String $tConf.NetworkPassword
+            $hasNetUser = -not [string]::IsNullOrWhiteSpace($tConf.NetworkUser)
+            $isNetPasswordEmpty = [string]::IsNullOrWhiteSpace($senhaRede)
+
+            if ($destTrim.StartsWith("\\") -and $hasNetUser) {
                 $uncParts = $destTrim -split '\\'
                 if ($uncParts.Count -ge 4) {
+                    $uncHost = $uncParts[2]
                     $uncRoot = "\\$($uncParts[2])\$($uncParts[3])"
-                    try {
-                        $normUser = $tConf.NetworkUser
-                        while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
-                        $senhaRede = Unprotect-String $tConf.NetworkPassword
-                        $netUseArgs = @("use", "`"$uncRoot`"", "`"$senhaRede`"", "/user:`"$normUser`"", "/persistent:no")
-                        Start-Process -FilePath "net.exe" -ArgumentList $netUseArgs -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
-                    } catch {}
+                    if (-not $isNetPasswordEmpty) {
+                        try {
+                            $normUser = $tConf.NetworkUser
+                            while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
+                            Disconnect-HostConnections $uncHost
+                            & net.exe use "`"$uncRoot`"" "`"$senhaRede`"" "/user:`"$normUser`"" /persistent:no 2>&1 | Out-Null
+                        } catch {}
+                    } else {
+                        Log-Message "Aviso: Senha de rede em branco para usuario '$($tConf.NetworkUser)' ao verificar saude de $uncRoot."
+                        if ([string]::IsNullOrWhiteSpace($detectedReason)) {
+                            $detectedReason = "Senha de rede nao configurada (campo NetworkPassword vazio ou nulo no config.json para o usuario '$($tConf.NetworkUser)')."
+                        }
+                    }
                 }
             }
 
@@ -1704,7 +1737,7 @@ function Test-ExternalDestinationsHealth {
                     if ($existingGzs -and $existingGzs.Count -gt 0) {
                         $realLastBackupTime = $existingGzs[0].LastWriteTime
                     }
-                } elseif ($destTrim.StartsWith("\\")) {
+                } elseif ($destTrim.StartsWith("\\") -and -not $isNetPasswordEmpty) {
                     # Tenta compartilhamento administrativo (C$ ou D$) antes de dar como inacessivel
                     $cleanP = $destTrim.TrimStart('\')
                     $pParts = $cleanP.Split('\')
@@ -1714,17 +1747,16 @@ function Test-ExternalDestinationsHealth {
                         $subR = if ($pParts.Length -gt 2) { ($pParts[2..($pParts.Length - 1)]) -join '\' } else { "" }
                         foreach ($altDrive in @("c$", "d$")) {
                             $altRoot = "\\$uncH\$altDrive"
-                            if (-not [string]::IsNullOrWhiteSpace($tConf.NetworkUser)) {
+                            if ($hasNetUser) {
                                 try {
                                     $normUser = $tConf.NetworkUser
                                     while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
-                                    $senhaRede = Unprotect-String $tConf.NetworkPassword
-                                    $netUseArgs = @("use", "`"$altRoot`"", "`"$senhaRede`"", "/user:`"$normUser`"", "/persistent:no")
-                                    Start-Process -FilePath "net.exe" -ArgumentList $netUseArgs -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
-                                    if ($normUser -notmatch '\\' -and -not [string]::IsNullOrWhiteSpace($uncH)) {
+                                    Disconnect-HostConnections $uncH
+                                    & net.exe use "`"$altRoot`"" "`"$senhaRede`"" "/user:`"$normUser`"" /persistent:no 2>&1 | Out-Null
+                                    if ($LASTEXITCODE -ne 0 -and $normUser -notmatch '\\' -and -not [string]::IsNullOrWhiteSpace($uncH)) {
                                         $hostUser = "$uncH\$normUser"
-                                        $netUseArgs = @("use", "`"$altRoot`"", "`"$senhaRede`"", "/user:`"$hostUser`"", "/persistent:no")
-                                        Start-Process -FilePath "net.exe" -ArgumentList $netUseArgs -NoNewWindow -Wait -ErrorAction SilentlyContinue | Out-Null
+                                        Disconnect-HostConnections $uncH
+                                        & net.exe use "`"$altRoot`"" "`"$senhaRede`"" "/user:`"$hostUser`"" /persistent:no 2>&1 | Out-Null
                                     }
                                 } catch {}
                             }
@@ -1739,16 +1771,17 @@ function Test-ExternalDestinationsHealth {
                                         $realLastBackupTime = $existingGzs[0].LastWriteTime
                                     }
                                     Log-Message "Monitor de Destino: Destino '$destTrim' verificado com sucesso via compartilhamento alternativo: $checkPath"
+                                    try { & net.exe use "`"$altRoot`"" /delete /yes 2>&1 | Out-Null } catch {}
                                     break
                                 }
                             } catch {}
+                            try { & net.exe use "`"$altRoot`"" /delete /yes 2>&1 | Out-Null } catch {}
                         }
                     }
                 }
             } catch {}
 
             $hoursSince = 0
-            $detectedReason = $FailureReason
             if ($destAccessible) {
                 if ($null -ne $realLastBackupTime) {
                     $hoursSince = ((Get-Date) - $realLastBackupTime).TotalHours
@@ -1883,6 +1916,13 @@ function Update-ConfigAuditDate {
             $cfg = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json
             if ($null -ne $cfg.Preferences) {
                 $cfg.Preferences.LastAuditDate = $NewDate
+                if ($null -ne $cfg.Tasks) {
+                    foreach ($t in $cfg.Tasks) {
+                        if ($null -eq $t.NetworkPassword) { $t.NetworkPassword = "" }
+                        if ($null -eq $t.NetworkUser) { $t.NetworkUser = "" }
+                        if ($null -eq $t.NetworkTerminalName) { $t.NetworkTerminalName = "" }
+                    }
+                }
                 $cfgJson = $cfg | ConvertTo-Json -Depth 10
                 [System.IO.File]::WriteAllText($configFile, $cfgJson, [System.Text.Encoding]::UTF8)
             }
@@ -2476,7 +2516,7 @@ function Invoke-MecLiveUpdate {
         [switch]$Force = $false
     )
     
-    $engineVersion = "2.2.14"
+    $engineVersion = "2.2.15"
     $webClient = $null
     
     try {
@@ -2872,6 +2912,11 @@ $runGfixSweep        = if ($null -ne $task.RunGfixSweep) { [bool]$task.RunGfixSw
 $runGfixValidate     = if ($null -ne $task.RunGfixValidate) { [bool]$task.RunGfixValidate } else { $false }
 $networkUser         = $task.NetworkUser
 $networkPassword     = Unprotect-String $task.NetworkPassword
+$networkConfigFailureReason = ""
+if (-not [string]::IsNullOrWhiteSpace($networkUser) -and [string]::IsNullOrWhiteSpace($networkPassword)) {
+    $networkConfigFailureReason = "Senha de rede nao configurada (campo NetworkPassword vazio ou nulo no config.json para o usuario '$networkUser')."
+    Log-Message "ERRO DE CONFIGURACAO: $networkConfigFailureReason O servico SYSTEM nao conseguira autenticar para gravacao em rede."
+}
 
 # --- FASE 1: AUTO-RECUPERACAO E ESPERA DE PRONTIDAO NO BOOT ---
 $maxBootWaitSec = 45
@@ -2972,6 +3017,7 @@ if ($null -ne $destinations) {
 }
 
 $resolvedDestList = @()
+$missingLocalDests = @()
 foreach ($dest in $destList) {
     if ([string]::IsNullOrWhiteSpace($dest)) { continue }
     $destTrimmed = $dest.Trim()
@@ -2990,18 +3036,16 @@ foreach ($dest in $destList) {
         # Destino local
         $destRoot = [System.IO.Path]::GetPathRoot($destTrimmed)
         if (-not (Test-Path $destRoot)) {
-            Log-Message "Aviso: A particao/unidade '$destRoot' nao existe neste computador (sistema com particao unica ou drive ausente)."
-            $fallbackDest = "C:\BKP_SISMOTEL"
-            if (-not ($resolvedDestList -contains $fallbackDest)) {
-                Log-Message "Redirecionando destino local automaticamente para: $fallbackDest"
-                $resolvedDestList += $fallbackDest
+            Log-Message "FALHA DE DESTINO: A particao/unidade '$destRoot' nao existe neste computador (drive ausente ou inacessivel para a conta SYSTEM). Destino '$destTrimmed' registrado como FALHA."
+            if (-not ($missingLocalDests -contains $destTrimmed)) {
+                $missingLocalDests += $destTrimmed
             }
         } else {
             $resolvedDestList += $destTrimmed
         }
     }
 }
-if ($resolvedDestList.Count -eq 0) {
+if ($resolvedDestList.Count -eq 0 -and $destList.Count -eq 0) {
     $resolvedDestList += "C:\BKP_SISMOTEL"
 }
 foreach ($d in $resolvedDestList) {
@@ -3355,12 +3399,25 @@ try {
 $fileName = Split-Path $tempGz -Leaf
 $localSuccessList = @()
 $networkSuccessList = @()
-$failedDestinations = @()
+$failedDestinations = @($missingLocalDests)
+$destinationFailureReasons = @{}
 
 foreach ($destTrimmed in $resolvedDestList) {
+    # Motivo de falha pertence somente a este destino. Nunca reutilizar uma falha
+    # de autenticacao para decidir se o proximo UNC deve ou nao ser tentado.
+    $destinationFailureReason = ""
     $isNetwork = $destTrimmed.StartsWith("\\")
     $destTypeTag = if ($isNetwork) { "[REDE UNC]" } else { "[LOCAL]" }
     Log-Message "Gravando backup GZ no destino $($destTypeTag) - $destTrimmed"
+
+    if ($isNetwork -and -not [string]::IsNullOrWhiteSpace($networkConfigFailureReason)) {
+        Log-Message "FALHA DE DESTINO: $networkConfigFailureReason Nenhuma tentativa de net use ou copia sera executada para '$destTrimmed'."
+        $destinationFailureReasons[$destTrimmed] = $networkConfigFailureReason
+        if (-not ($failedDestinations -contains $destTrimmed)) {
+            $failedDestinations += $destTrimmed
+        }
+        continue
+    }
     
     $destSuccess = $false
     for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
@@ -3377,24 +3434,39 @@ foreach ($destTrimmed in $resolvedDestList) {
                     $normUser = $networkUser.Replace('/', '\')
                     while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
 
-                    Log-Message "Autenticando rede em $uncRoot com usuario '$normUser'..."
-                    try {
-                        & net.exe use $uncRoot /delete /yes 2>&1 | Out-Null
-                        $netUseArgs = @("use", "`"$uncRoot`"", "`"$networkPassword`"", "/user:`"$normUser`"", "/persistent:no")
-                        $netUseProc = Start-Process -FilePath "net.exe" -ArgumentList $netUseArgs -NoNewWindow -Wait -PassThru
-                        if ($netUseProc.ExitCode -ne 0 -and $normUser -notmatch '\\' -and -not [string]::IsNullOrWhiteSpace($uncHost)) {
-                            $hostUser = "$uncHost\$normUser"
-                            Log-Message "Tentando autenticacao com prefixo do computador: $hostUser..."
-                            $netUseArgs = @("use", "`"$uncRoot`"", "`"$networkPassword`"", "/user:`"$hostUser`"", "/persistent:no")
-                            $netUseProc = Start-Process -FilePath "net.exe" -ArgumentList $netUseArgs -NoNewWindow -Wait -PassThru
+                    if ([string]::IsNullOrWhiteSpace($networkPassword)) {
+                        Log-Message "ERRO DE CONFIGURACAO: O usuario de rede '$normUser' esta configurado, mas a senha de rede (NetworkPassword) esta vazia ou nula no config.json. Abortando tentativa de net use com senha em branco."
+                    } else {
+                        if (-not [string]::IsNullOrWhiteSpace($uncHost)) {
+                            Disconnect-HostConnections $uncHost
                         }
-                        if ($netUseProc.ExitCode -ne 0) {
-                            Log-Message "Aviso: net use retornou codigo $($netUseProc.ExitCode) para $uncRoot (o Windows pode ja ter acesso a este compartilhamento; a gravacao sera tentada e conferida normalmente)."
-                        } else {
-                            Log-Message "Autenticacao de rede em $uncRoot estabelecida com sucesso."
+
+                        Log-Message "Autenticando rede em $uncRoot com usuario '$normUser'..."
+                        try {
+                            $netOut = & net.exe use "`"$uncRoot`"" "`"$networkPassword`"" "/user:`"$normUser`"" /persistent:no 2>&1
+                            $netExit = $LASTEXITCODE
+                            $netErrMsg = ($netOut | Out-String).Trim() -replace '(?m)^net\.exe\s*:\s*', ''
+
+                            if ($netExit -ne 0 -and $normUser -notmatch '\\' -and -not [string]::IsNullOrWhiteSpace($uncHost)) {
+                                $hostUser = "$uncHost\$normUser"
+                                Log-Message "Tentando autenticacao com prefixo do computador: $hostUser..."
+                                Disconnect-HostConnections $uncHost
+                                $netOut = & net.exe use "`"$uncRoot`"" "`"$networkPassword`"" "/user:`"$hostUser`"" /persistent:no 2>&1
+                                $netExit = $LASTEXITCODE
+                                $netErrMsg = ($netOut | Out-String).Trim() -replace '(?m)^net\.exe\s*:\s*', ''
+                            }
+
+                            if ($netExit -ne 0) {
+                                $destinationFailureReason = "Autenticacao de rede recusada em $uncRoot (codigo $netExit): $netErrMsg"
+                                Log-Message "Aviso: net use falhou (codigo $netExit) para $uncRoot. Detalhes: $netErrMsg"
+                            } else {
+                                $destinationFailureReason = ""
+                                Log-Message "Autenticacao de rede em $uncRoot estabelecida com sucesso."
+                            }
+                        } catch {
+                            $destinationFailureReason = "Falha ao autenticar em $uncRoot`: $_"
+                            Log-Message "Aviso ao tentar autenticar rede: $_"
                         }
-                    } catch {
-                        Log-Message "Aviso ao tentar autenticar rede: $_"
                     }
                 }
             }
@@ -3536,15 +3608,16 @@ foreach ($destTrimmed in $resolvedDestList) {
                 try {
                     $altParts = $altDest.TrimStart('\').Split('\')
                     $altRoot = "\\$($altParts[0])\$($altParts[1])"
-                    if (-not [string]::IsNullOrWhiteSpace($networkUser)) {
+                    if (-not [string]::IsNullOrWhiteSpace($networkUser) -and -not [string]::IsNullOrWhiteSpace($networkPassword)) {
                         $normUser = $networkUser.Replace('/', '\')
                         while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
-                        $netUseArgs = @("use", "`"$altRoot`"", "`"$networkPassword`"", "/user:`"$normUser`"", "/persistent:no")
-                        $netUseProc = Start-Process -FilePath "net.exe" -ArgumentList $netUseArgs -NoNewWindow -Wait -PassThru
-                        if ($netUseProc.ExitCode -ne 0 -and $normUser -notmatch '\\') {
+                        Disconnect-HostConnections $altParts[0]
+                        $netOut = & net.exe use "`"$altRoot`"" "`"$networkPassword`"" "/user:`"$normUser`"" /persistent:no 2>&1
+                        $netExit = $LASTEXITCODE
+                        if ($netExit -ne 0 -and $normUser -notmatch '\\') {
                             $hostUser = "$uncHost\$normUser"
-                            $netUseArgs = @("use", "`"$altRoot`"", "`"$networkPassword`"", "/user:`"$hostUser`"", "/persistent:no")
-                            Start-Process -FilePath "net.exe" -ArgumentList $netUseArgs -NoNewWindow -Wait -PassThru | Out-Null
+                            Disconnect-HostConnections $altParts[0]
+                            & net.exe use "`"$altRoot`"" "`"$networkPassword`"" "/user:`"$hostUser`"" /persistent:no 2>&1 | Out-Null
                         }
                     }
 
@@ -3586,13 +3659,20 @@ foreach ($destTrimmed in $resolvedDestList) {
                     }
                 } catch {
                     Log-Message "Tentativa no destino alternativo '$altDest' falhou: $_"
+                } finally {
+                    try { & net.exe use "`"$altRoot`"" /delete /yes 2>&1 | Out-Null } catch {}
                 }
             }
         }
     }
 
     if (-not $destSuccess) {
-        $failedDestinations += $destTrimmed
+        if (-not [string]::IsNullOrWhiteSpace($destinationFailureReason)) {
+            $destinationFailureReasons[$destTrimmed] = $destinationFailureReason
+        }
+        if (-not ($failedDestinations -contains $destTrimmed)) {
+            $failedDestinations += $destTrimmed
+        }
         if ($isNetwork) {
             Log-Message "AVISO DE REDE: O computador remoto '$destTrimmed' esta inacessivel (equipamento offline, desligado ou sem permissao). O backup local permanece 100% seguro."
         } else {
@@ -3685,7 +3765,11 @@ O banco de dados do Sismotel no servidor principal continua 100% integro, saudav
 }
 
 $allSuccessList = $localSuccessList + $networkSuccessList
-Log-Message "Rotina de backup concluida com SUCESSO! ($($allSuccessList.Count) destino(s) gravado(s))."
+if ($failedDestinations.Count -gt 0) {
+    Log-Message "Rotina de backup concluida PARCIALMENTE ($($allSuccessList.Count) destino(s) gravado(s), $($failedDestinations.Count) falho(s)/pendente(s): $($failedDestinations -join ', '))."
+} else {
+    Log-Message "Rotina de backup concluida com SUCESSO! ($($allSuccessList.Count) destino(s) gravado(s))."
+}
 
 # Carimba a conclusao para a guarda anti-duplicidade da proxima invocacao.
 # Gravado apenas em caso de sucesso: se a rotina falhar, um novo disparo deve poder tentar.
@@ -3705,7 +3789,7 @@ try {
 
 $bodyReport = @"
 Relatorio de Execucao da Rotina:
-Status: SUCESSO $(if ($failedDestinations.Count -gt 0) { '(COM AVISO DE REDE)' } else { 'COMPLETO' })
+Status: $(if ($failedDestinations.Count -gt 0) { 'PARCIALMENTE CONCLUIDO (DESTINOS PENDENTES)' } else { 'SUCESSO COMPLETO' })
 Tarefa: $TaskName
 Computador / Servidor: $env:COMPUTERNAME
 Arquivo Gerado: $fileName
@@ -3738,17 +3822,23 @@ try { $netTracker | ConvertTo-Json -Depth 10 | Set-Content $networkTrackerFile -
 $isExternalTask = ($TaskName -match "EXTERN" -or $TaskName -eq "BKP_EXTERNO")
 if ($failedDestinations.Count -gt 0 -or $isExternalTask) {
     $destsToCheck = if ($failedDestinations.Count -gt 0) { $failedDestinations } else { $allDestinations }
-    Test-ExternalDestinationsHealth -TaskName $TaskName -Destinations $destsToCheck
+    foreach ($destToCheck in $destsToCheck) {
+        $failureReasonForDestination = $networkConfigFailureReason
+        if ($destinationFailureReasons.ContainsKey($destToCheck)) {
+            $failureReasonForDestination = $destinationFailureReasons[$destToCheck]
+        }
+        Test-ExternalDestinationsHealth -TaskName $TaskName -Destinations @($destToCheck) -FailureReason $failureReasonForDestination
+    }
 }
 
 if ($failedDestinations.Count -gt 0) {
     $bodyReport += @"
 
-Avisos de Destinos Nao Sincronizados (Rede):
+Avisos de Destinos Nao Sincronizados / Com Falha:
 $($failedDestinations -join "`r`n")
-(Observacao: O backup local no servidor foi concluido com 100% de integridade. Verifique se os computadores da rede acima estao ligados.)
+(Observacao: O backup local no servidor foi concluido com 100% de integridade. Verifique se os computadores da rede acima estao ligados ou se as unidades existem.)
 "@
-    Send-BackupNotification -Status "SUCESSO" -SubjectInfo "Backup $TaskName Concluido ($gzSizeMB MB) [Alerta Rede]" -BodyDetails $bodyReport -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo -SuccessDests $allSuccessList -WarningDests $failedDestinations
+    Send-BackupNotification -Status "SUCESSO" -SubjectInfo "Backup $TaskName Concluido Parcialmente ($gzSizeMB MB) [Alerta Destino]" -BodyDetails $bodyReport -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo -SuccessDests $allSuccessList -WarningDests $failedDestinations
 } else {
     Send-BackupNotification -Status "SUCESSO" -SubjectInfo "Backup $TaskName Concluido com Sucesso ($gzSizeMB MB)" -BodyDetails $bodyReport -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo -SuccessDests $allSuccessList -WarningDests @()
 }
