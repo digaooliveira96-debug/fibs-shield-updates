@@ -1728,7 +1728,9 @@ function Test-ExternalDestinationsHealth {
                                     }
                                 } catch {}
                             }
-                            $checkPath = "\\$uncH\$altDrive\$sName" + (if ($subR) { "\$subR" } else { "" })
+                            $subPartR = ""
+                            if (-not [string]::IsNullOrWhiteSpace($subR)) { $subPartR = "\$subR" }
+                            $checkPath = "\\$uncH\$altDrive\$sName$subPartR"
                             try {
                                 if (Test-Path $checkPath) {
                                     $destAccessible = $true
@@ -3492,10 +3494,13 @@ foreach ($destTrimmed in $resolvedDestList) {
             $shareName = $parts[1]
             $subRest = if ($parts.Length -gt 2) { ($parts[2..($parts.Length - 1)]) -join '\' } else { "" }
 
+            $subPartRest = ""
+            if (-not [string]::IsNullOrWhiteSpace($subRest)) { $subPartRest = "\$subRest" }
+
             $altCandidates = @()
             if ($shareName -notmatch '^[A-Za-z]\$') {
-                $cPath = "\\$uncHost\c$\$shareName" + (if ($subRest) { "\$subRest" } else { "" })
-                $dPath = "\\$uncHost\d$\$shareName" + (if ($subRest) { "\$subRest" } else { "" })
+                $cPath = "\\$uncHost\c$\$shareName$subPartRest"
+                $dPath = "\\$uncHost\d$\$shareName$subPartRest"
                 $altCandidates += $cPath
                 $altCandidates += $dPath
             } elseif ($shareName -match '^[A-Za-z]\$') {
