@@ -944,7 +944,7 @@ function Send-BackupNotification {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.14 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v2.2.15 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Central de Monitoramento Cont&iacute;nuo
@@ -1096,7 +1096,7 @@ function Send-WelcomeEmail {
             <td bgcolor="#111827" style="padding:24px 28px 12px 28px;">
               <h2 style="margin:0 0 8px 0; color:#ffffff; font-size:21px; font-weight:700;">Seja bem-vindo ao novo padr&atilde;o corporativo de seguran&ccedil;a cont&iacute;nua</h2>
               <p style="margin:0 0 14px 0; color:#cbd5e1; font-size:14px; line-height:1.65;">
-                A instala&ccedil;&atilde;o do sistema corporativo <strong style="color:#10b981;">FIBS MEC Shield Enterprise (v2.2.14)</strong> foi conclu&iacute;da com &ecirc;xito neste servidor. Esta nova gera&ccedil;&atilde;o substitui integralmente as rotinas legadas e traz uma arquitetura avan&ccedil;ada de conting&ecirc;ncia concebida sob medida para o regime ininterrupto (24/7) de mot&eacute;is, blindando o banco de dados do <strong>Sismotel</strong> com prote&ccedil;&atilde;o em m&uacute;ltiplas camadas e sem nenhum impacto na agilidade da recep&ccedil;&atilde;o.
+                A instala&ccedil;&atilde;o do sistema corporativo <strong style="color:#10b981;">FIBS MEC Shield Enterprise (v2.2.15)</strong> foi conclu&iacute;da com &ecirc;xito neste servidor. Esta nova gera&ccedil;&atilde;o substitui integralmente as rotinas legadas e traz uma arquitetura avan&ccedil;ada de conting&ecirc;ncia concebida sob medida para o regime ininterrupto (24/7) de mot&eacute;is, blindando o banco de dados do <strong>Sismotel</strong> com prote&ccedil;&atilde;o em m&uacute;ltiplas camadas e sem nenhum impacto na agilidade da recep&ccedil;&atilde;o.
               </p>
             </td>
           </tr>
@@ -1135,7 +1135,7 @@ function Send-WelcomeEmail {
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Edi&ccedil;&atilde;o / Vers&atilde;o:</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#34d399; font-weight:700; font-size:13.5px;">v2.2.14 &bull; Enterprise Shield</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#34d399; font-weight:700; font-size:13.5px;">v2.2.15 &bull; Enterprise Shield</td>
                       </tr>
                     </table>
                   </td>
@@ -1263,7 +1263,7 @@ function Send-WelcomeEmail {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.14 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v2.2.15 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Central de Monitoramento Cont&iacute;nuo
@@ -1577,7 +1577,7 @@ function Send-NetworkFailureAlert {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.14 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v2.2.15 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Central de Monitoramento Cont&iacute;nuo
@@ -2128,7 +2128,7 @@ function Send-AuditAlertNotification {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.14 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v2.2.15 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Auditoria Preventiva Di&aacute;ria
