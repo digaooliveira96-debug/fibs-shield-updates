@@ -2516,7 +2516,14 @@ function Invoke-MecLiveUpdate {
             }
         }
         
-        if (-not $Force -and ($fibsState.LastUpdateCheck -eq $todayStr)) {
+        $now = Get-Date
+        $lastCheckTime = [DateTime]::MinValue
+        if (-not [string]::IsNullOrWhiteSpace($fibsState.LastUpdateCheck)) {
+            [DateTime]::TryParse($fibsState.LastUpdateCheck, [ref]$lastCheckTime) | Out-Null
+        }
+        
+        # Se ja verificou ha menos de 2 horas e nao e Force, aguarda o proximo ciclo
+        if (-not $Force -and ($lastCheckTime -gt [DateTime]::MinValue) -and (($now - $lastCheckTime).TotalHours -lt 2)) {
             return
         }
         
@@ -2535,7 +2542,7 @@ function Invoke-MecLiveUpdate {
         $manifest = $manifestJson | ConvertFrom-Json
         
         try {
-            $fibsState.LastUpdateCheck = $todayStr
+            $fibsState.LastUpdateCheck = $now.ToString("yyyy-MM-dd HH:mm:ss")
             $fibsState | ConvertTo-Json -Depth 5 | Set-Content $fibsStateFile -Encoding UTF8
         } catch {
             Log-Message "[LIVEUPDATE AVISO] Nao foi possivel gravar a data da verificacao: $_. A atualizacao continua."
