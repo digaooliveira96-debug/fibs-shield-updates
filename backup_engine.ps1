@@ -18,7 +18,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.19"
+$script:EngineVersion = "2.2.20"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -3090,13 +3090,22 @@ function Invoke-MecLiveUpdate {
             return
         }
 
-        # Chave publica obrigatoria: sem ela nada e baixado nem executado.
+        # Chave publica obrigatoria: valida a assinatura RSA do manifesto
+        $defaultPubKeyXml = '<RSAKeyValue><Modulus>xl4vygVDypOqBtFKnoazM8tDzvS/MubD4ZpMXt+WOFnhlZf3PHI75EEi+EMPqWK1w4MQeSGLbyk1O9uF9H+jC5UrOHZeWaHm8dL/1VR6gMyadIYDUyhf1EE+wNVA2sJptCtTnnMYFuj3YxNMshTJmC6fIzOaMHGup3G+/gZ22RhIYXB/DSRLq7rqIJ4aTlyCRPH1Vfs12q4aDM3XyvYIbb0Woms+zvieiB48mGbyWNOeXKeHnUDlgvoh83Kv2+NWA2qlix/RzNKKIR/bkTwXhGVF0ok5G7eATYGed38RkNsrlZg/KJc410iEhS++llTdTVCfkdWQG7FOnGlm8Ha1jSbBC/jTtAdsIu3+uQoByFoRoovTvnaWquWDTe5IZE/2/Y89D+kkBrI6CyMhLH20xpUcC+bTXLYQc/jgcSvEpuZRL1l0ypxm9oNh1xs8jFK82n38blszsXmiNQzWFJvW+sGXVT806ZkpFiZlrXHBfv4UWWzo+BWqY+MI3seZRK7h</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
         $pubKeyFile = Join-Path $scriptDir "liveupdate_pubkey.xml"
-        if (-not (Test-Path $pubKeyFile)) {
-            Log-Message "[LIVEUPDATE BLOQUEADO] Chave publica de verificacao ausente ($pubKeyFile). Atualizacao automatica desativada ate a reinstalacao com a chave."
-            return
+        $pubKeyXml = $null
+        if (Test-Path $pubKeyFile) {
+            try { $pubKeyXml = Get-Content $pubKeyFile -Raw -Encoding UTF8 } catch {}
         }
-        $pubKeyXml = Get-Content $pubKeyFile -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($pubKeyXml)) {
+            $pubKeyXml = $defaultPubKeyXml
+            try {
+                [System.IO.File]::WriteAllText($pubKeyFile, $defaultPubKeyXml, [System.Text.Encoding]::UTF8)
+                Log-Message "[LIVEUPDATE] Chave publica oficial auto-restaurada em: $pubKeyFile"
+            } catch {
+                Log-Message "[LIVEUPDATE] Usando chave publica oficial embutida em memoria."
+            }
+        }
 
         Log-Message "[LIVEUPDATE] Verificando atualizacoes online no canal oficial GitHub..."
 
