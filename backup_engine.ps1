@@ -11,44 +11,35 @@ param (
     [switch]$CheckUpdateOnly,
     [switch]$ForceUpdate,
     [switch]$CheckExternalHealth,
-    [switch]$Manual
+    [switch]$Manual,
+    [switch]$ScheduledAudit
 )
 
-Add-Type -AssemblyName System.Security
+# Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
+# garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
+# (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
+$script:EngineVersion = "2.2.18"
 
-function Compress-GzFile {
-    param([string]$InFile, [string]$OutFile)
-    try { [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression") | Out-Null } catch {}
-    $inFileStream = [System.IO.File]::OpenRead($InFile)
-    $outFileStream = [System.IO.File]::Create($OutFile)
-    $gzStream = New-Object System.IO.Compression.GZipStream($outFileStream, [System.IO.Compression.CompressionMode]::Compress)
-    $inFileStream.CopyTo($gzStream)
-    $gzStream.Dispose()
-    $outFileStream.Dispose()
-    $inFileStream.Dispose()
+try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
+
+function Test-IsDpapiBlob {
+    param([string]$Value)
+    return (-not [string]::IsNullOrWhiteSpace($Value) -and $Value.StartsWith("AQAAANCMnd8BF"))
 }
 
-function Expand-GzFile {
-    param([string]$InFile, [string]$OutFile)
-    try { [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression") | Out-Null } catch {}
-    $inFileStream = [System.IO.File]::OpenRead($InFile)
-    $gzStream = New-Object System.IO.Compression.GZipStream($inFileStream, [System.IO.Compression.CompressionMode]::Decompress)
-    $outFileStream = [System.IO.File]::Create($OutFile)
-    $gzStream.CopyTo($outFileStream)
-    $outFileStream.Dispose()
-    $gzStream.Dispose()
-    $inFileStream.Dispose()
-}
-
+# Devolve o texto decifrado, o proprio valor se ele nao estiver cifrado, ou $null
+# quando o blob DPAPI NAO abre nesta maquina (config copiado de outro servidor,
+# reinstalacao do Windows). Antes o blob cifrado era devolvido como se fosse a
+# senha, e o erro aparecia como "senha recusada" -- mascarando a causa real.
 function Unprotect-String {
     param([string]$cipherText)
     if ([string]::IsNullOrWhiteSpace($cipherText)) { return $cipherText }
-    if (-not $cipherText.StartsWith("AQAAANCMnd8BF")) { return $cipherText }
+    if (-not (Test-IsDpapiBlob $cipherText)) { return $cipherText }
     try {
         $bytes = [Convert]::FromBase64String($cipherText)
         $decBytes = [System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
         return [System.Text.Encoding]::UTF8.GetString($decBytes)
-    } catch { return $cipherText }
+    } catch { return $null }
 }
 
 # Conversor JSON -> Hashtable compativel com Windows PowerShell 5.1.
@@ -79,7 +70,159 @@ function Protect-String {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($plainText)
         $encBytes = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
         return [Convert]::ToBase64String($encBytes)
-    } catch { return $plainText }
+    } catch {
+        Log-Message "AVISO DE SEGURANCA: nao foi possivel cifrar uma credencial com DPAPI ($($_.Exception.Message)). Ela permanece como estava."
+        return $plainText
+    }
+}
+
+# ==============================================================================
+# EXCLUSAO MUTUA E GRAVACAO SEGURA DE ARQUIVOS
+# ==============================================================================
+# Mutex nomeado do Windows: o sistema operacional libera a trava sozinho quando o
+# processo morre (queda de energia, kill, excecao). O antigo lock por arquivo+PID
+# ficava orfao apos um reboot e, se o PID fosse reaproveitado por outro processo,
+# bloqueava TODOS os backups em silencio.
+$script:MutexPrefix = "Global\MEC_Shield_"
+
+function New-MecNamedMutex {
+    param([string]$Name)
+    $fullName = $script:MutexPrefix + $Name
+    $created = $false
+    try {
+        # SYSTEM, Administradores, usuario atual e usuarios autenticados:
+        # garante interoperabilidade entre servico SYSTEM e painel do operador
+        $sec = New-Object System.Security.AccessControl.MutexSecurity
+        $sids = @("S-1-5-18", "S-1-5-32-544", "S-1-5-11")
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        if ($currentUser -and -not ($sids -contains $currentUser.Value)) { $sids += $currentUser.Value }
+        foreach ($sid in $sids) {
+            try {
+                $id = New-Object System.Security.Principal.SecurityIdentifier($sid)
+                $rule = New-Object System.Security.AccessControl.MutexAccessRule($id, [System.Security.AccessControl.MutexRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)
+                $sec.AddAccessRule($rule)
+            } catch {}
+        }
+        return New-Object System.Threading.Mutex($false, $fullName, [ref]$created, $sec)
+    } catch {
+        try {
+            return [System.Threading.Mutex]::OpenExisting($fullName)
+        } catch {
+            return New-Object System.Threading.Mutex($false, $fullName, [ref]$created)
+        }
+    }
+}
+
+# Tenta obter o mutex. Devolve $true se obteve (inclusive quando o dono anterior
+# morreu sem liberar -- AbandonedMutexException significa "agora e seu").
+function Enter-MecMutex {
+    param([System.Threading.Mutex]$Mutex, [int]$TimeoutMs = 0)
+    try { return $Mutex.WaitOne($TimeoutMs) }
+    catch [System.Threading.AbandonedMutexException] { return $true }
+}
+
+function Exit-MecMutex {
+    param([System.Threading.Mutex]$Mutex)
+    if ($null -eq $Mutex) { return }
+    try { $Mutex.ReleaseMutex() } catch {}
+}
+
+# Executa um bloco com o mutex de estado (config.json e arquivos *.json de estado
+# compartilhados entre motor, monitor e interface).
+function Invoke-WithMecLock {
+    param([string]$Name, [scriptblock]$Script, [int]$TimeoutMs = 30000)
+    $m = $null
+    $got = $false
+    try {
+        $m = New-MecNamedMutex -Name $Name
+        $got = Enter-MecMutex -Mutex $m -TimeoutMs $TimeoutMs
+        if (-not $got) { Log-Message "Aviso: trava '$Name' ocupada ha mais de $([int]($TimeoutMs/1000))s; prosseguindo sem ela." }
+        & $Script
+    } finally {
+        if ($got) { Exit-MecMutex $m }
+        if ($null -ne $m) { try { $m.Dispose() } catch {} }
+    }
+}
+
+# Grava texto de forma atomica: escreve num temporario na MESMA pasta e troca com
+# File.Replace/Move. Uma queda de energia no meio deixa o arquivo antigo intacto,
+# nunca um JSON truncado (que fazia o servico enxergar 0 tarefas e parar em silencio).
+function Write-TextFileAtomic {
+    param([string]$Path, [string]$Content, [string]$BackupPath = $null)
+    $dir = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($dir) -and -not (Test-Path $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $tmp = "$Path.$PID.tmp"
+    [System.IO.File]::WriteAllText($tmp, $Content, (New-Object System.Text.UTF8Encoding($true)))
+    # Outro processo lendo o arquivo naquele instante (antivirus, interface) pode
+    # impedir a troca: tenta algumas vezes antes de desistir.
+    for ($i = 1; $i -le 5; $i++) {
+        try {
+            if (Test-Path $Path) {
+                if ([string]::IsNullOrWhiteSpace($BackupPath)) {
+                    # [NullString]::Value: $null viraria "" ao chamar o .NET e o Replace falharia
+                    [System.IO.File]::Replace($tmp, $Path, [NullString]::Value)
+                } else {
+                    [System.IO.File]::Replace($tmp, $Path, $BackupPath)
+                }
+            } else {
+                [System.IO.File]::Move($tmp, $Path)
+            }
+            return
+        } catch {
+            if ($i -eq 5) {
+                Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                throw
+            }
+            Start-Sleep -Milliseconds (200 * $i)
+        }
+    }
+}
+
+function Save-JsonState {
+    param([string]$Path, $Data, [int]$Depth = 10)
+    $json = $Data | ConvertTo-Json -Depth $Depth
+    Write-TextFileAtomic -Path $Path -Content $json
+}
+
+# Le e interpreta o config.json. Se o arquivo estiver ilegivel (truncado), usa a
+# ultima copia boa (config.json.bak) gerada pela gravacao atomica.
+function Read-ConfigData {
+    param([string]$Path = $configFile)
+    foreach ($candidate in @($Path, "$Path.bak")) {
+        if (-not (Test-Path $candidate)) { continue }
+        for ($i = 1; $i -le 3; $i++) {
+            try {
+                $raw = [System.IO.File]::ReadAllText($candidate, [System.Text.Encoding]::UTF8)
+                $obj = $raw | ConvertFrom-Json
+                if ($null -ne $obj -and $null -ne $obj.Tasks) {
+                    if ($candidate -ne $Path) {
+                        Log-Message "ATENCAO: config.json ilegivel. Usando a ultima copia valida: $candidate"
+                    }
+                    return $obj
+                }
+                break
+            } catch {
+                Start-Sleep -Milliseconds 300
+            }
+        }
+    }
+    return $null
+}
+
+function Save-ConfigData {
+    param($Config)
+    $json = $Config | ConvertTo-Json -Depth 10
+    Invoke-WithMecLock -Name "Config" -Script {
+        Write-TextFileAtomic -Path $configFile -Content $json -BackupPath "$configFile.bak"
+    }
+}
+
+function ConvertTo-HtmlSafe {
+    param([string]$Text)
+    if ($null -eq $Text) { return "" }
+    return [System.Net.WebUtility]::HtmlEncode($Text)
 }
 
 # Converte para forma criptografada, no proprio cliente, qualquer senha que ainda
@@ -93,34 +236,39 @@ function Protect-String {
 function Convert-PlainPasswordsInConfig {
     try {
         if (-not (Test-Path $configFile)) { return }
-        $cfg = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($null -eq $cfg) { return }
-        $mudou = $false
-        $campos = @()
+        # Leitura, conversao e gravacao sob a trava de configuracao: a interface
+        # (ConfigTypes.Save) usa a mesma trava, entao uma nao apaga a gravacao da outra.
+        Invoke-WithMecLock -Name "Config" -Script {
+            $cfg = Read-ConfigData
+            if ($null -eq $cfg) { return }
+            $mudou = $false
+            $campos = @()
 
-        if ($null -ne $cfg.Preferences -and -not [string]::IsNullOrWhiteSpace($cfg.Preferences.SmtpPass) `
-            -and -not $cfg.Preferences.SmtpPass.StartsWith("AQAAANCMnd8BF")) {
-            $cfg.Preferences.SmtpPass = Protect-String $cfg.Preferences.SmtpPass
-            $mudou = $true; $campos += "SmtpPass"
-        }
-        foreach ($t in $cfg.Tasks) {
-            if ($null -eq $t.NetworkPassword) {
-                $t.NetworkPassword = ""
-                $mudou = $true; $campos += "$($t.TaskName).NetworkPassword (null para vazio)"
+            if ($null -ne $cfg.Preferences -and -not [string]::IsNullOrWhiteSpace($cfg.Preferences.SmtpPass) `
+                -and -not (Test-IsDpapiBlob $cfg.Preferences.SmtpPass)) {
+                $cfg.Preferences.SmtpPass = Protect-String $cfg.Preferences.SmtpPass
+                $mudou = $true; $campos += "SmtpPass"
             }
-            foreach ($nome in @("DbPassword", "NetworkPassword")) {
-                $valor = $t.$nome
-                if (-not [string]::IsNullOrWhiteSpace($valor) -and -not $valor.StartsWith("AQAAANCMnd8BF")) {
-                    $t.$nome = Protect-String $valor
-                    $mudou = $true; $campos += "$($t.TaskName).$nome"
+            foreach ($t in $cfg.Tasks) {
+                if ($null -eq $t.NetworkPassword) {
+                    # Add-Member cobre tambem tarefas antigas sem a propriedade
+                    $t | Add-Member -NotePropertyName NetworkPassword -NotePropertyValue "" -Force
+                    $mudou = $true; $campos += "$($t.TaskName).NetworkPassword (null para vazio)"
+                }
+                foreach ($nome in @("DbPassword", "NetworkPassword")) {
+                    $valor = $t.$nome
+                    if (-not [string]::IsNullOrWhiteSpace($valor) -and -not (Test-IsDpapiBlob $valor)) {
+                        $t.$nome = Protect-String $valor
+                        $mudou = $true; $campos += "$($t.TaskName).$nome"
+                    }
                 }
             }
-        }
 
-        if ($mudou) {
-            $json = $cfg | ConvertTo-Json -Depth 10
-            [System.IO.File]::WriteAllText($configFile, $json, [System.Text.Encoding]::UTF8)
-            Log-Message "SEGURANCA: credencial(is) normalizada(s) ou convertida(s) neste servidor ($($campos -join ', ')). O config.json local nao guarda senha legivel."
+            if ($mudou) {
+                $json = $cfg | ConvertTo-Json -Depth 10
+                Write-TextFileAtomic -Path $configFile -Content $json -BackupPath "$configFile.bak"
+                Log-Message "SEGURANCA: credencial(is) normalizada(s) ou convertida(s) neste servidor ($($campos -join ', ')). O config.json local nao guarda senha legivel."
+            }
         }
     } catch {
         Log-Message "Aviso ao criptografar credenciais do config.json: $_"
@@ -144,14 +292,24 @@ $logDir = Join-Path $scriptDir "logs"
 if (-not (Test-Path $logDir)) {
     try { New-Item -ItemType Directory -Path $logDir -Force | Out-Null } catch {}
 }
-$logFile = Join-Path $logDir "backup_$($TaskName)_log.txt"
+# Modos auxiliares (monitor, auditoria, atualizacao) tem log proprio. Antes eles
+# escreviam no log da tarefa BKP_SISMOTEL, e o servico/startup guard confundiam essa
+# escrita com "backup recente", pulando o backup de boot apos queda de energia.
+$logName = if ($CheckExternalHealth) { "monitor_backup_log.txt" }
+           elseif ($RunAuditOnly)    { "auditoria_log.txt" }
+           elseif ($CheckUpdateOnly) { "liveupdate_log.txt" }
+           else                      { "backup_$($TaskName)_log.txt" }
+$logFile = Join-Path $logDir $logName
 
 # Funcao de Registro em Log com Rotacao Ativa (Limite 5 MB para evitar crescimento infinito)
+# Usa Write-Host (e nao Write-Output): assim uma linha de log dentro de uma funcao
+# nunca se mistura ao valor de retorno dela. O console redirecionado (AuditDialog)
+# continua recebendo as linhas normalmente.
 function Log-Message {
     param ([string]$Message)
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logLine = "[$timestamp] [$TaskName] $Message"
-    Write-Output $logLine
+    Write-Host $logLine
     try {
         if (Test-Path $logFile) {
             $f = Get-Item $logFile -ErrorAction SilentlyContinue
@@ -173,7 +331,19 @@ function Resolve-MappedDrivePath {
     if ($p -match '^([A-Za-z]):\\?(.*)$') {
         $driveLetter = $matches[1].ToUpper()
         $subPath = $matches[2]
-        
+
+        # Unidade que existe NESTA sessao (disco fisico, particao, USB) e usada como
+        # esta. Antes, uma letra local podia ser trocada pelo mapeamento de rede de
+        # outro usuario que tivesse a mesma letra.
+        $isLocalDisk = $false
+        try {
+            if (Test-Path "${driveLetter}:\") {
+                $wmiLocal = Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='${driveLetter}:'" -ErrorAction SilentlyContinue
+                if ($null -eq $wmiLocal -or $wmiLocal.DriveType -ne 4) { $isLocalDisk = $true }
+            }
+        } catch {}
+        if ($isLocalDisk) { return $p }
+
         $remotePath = $null
         try {
             $regKey = "HKCU:\Network\$driveLetter"
@@ -219,6 +389,35 @@ function Resolve-MappedDrivePath {
             } catch {}
         }
 
+        # O mapeamento so e visivel sob SYSTEM enquanto o usuario dono esta logado
+        # (hive carregado). Guardamos a ultima traducao conhecida para que a rotina
+        # da madrugada, sem ninguem logado, use o mesmo caminho UNC.
+        $cacheFile = Join-Path $scriptDir "mapped_drives_cache.json"
+        if (-not [string]::IsNullOrWhiteSpace($remotePath)) {
+            try {
+                Invoke-WithMecLock -Name "State" -Script {
+                    $cache = @{}
+                    if (Test-Path $cacheFile) {
+                        $cache = ConvertTo-HashtableCompat (Get-Content $cacheFile -Raw -Encoding UTF8 | ConvertFrom-Json)
+                    }
+                    if ($cache[$driveLetter] -ne $remotePath) {
+                        $cache[$driveLetter] = $remotePath
+                        Save-JsonState -Path $cacheFile -Data $cache
+                    }
+                }
+            } catch {}
+        } else {
+            try {
+                if (Test-Path $cacheFile) {
+                    $cache = ConvertTo-HashtableCompat (Get-Content $cacheFile -Raw -Encoding UTF8 | ConvertFrom-Json)
+                    if (-not [string]::IsNullOrWhiteSpace($cache[$driveLetter])) {
+                        $remotePath = $cache[$driveLetter]
+                        Log-Message "Unidade ${driveLetter}: nao visivel para esta conta; usando a ultima traducao conhecida: $remotePath"
+                    }
+                }
+            } catch {}
+        }
+
         if (-not [string]::IsNullOrWhiteSpace($remotePath)) {
             $remotePath = $remotePath.TrimEnd('\')
             if (-not [string]::IsNullOrWhiteSpace($subPath)) {
@@ -245,6 +444,100 @@ function Disconnect-HostConnections {
             }
         }
     } catch {}
+}
+
+# Conexao SMB via WNetAddConnection2 (mpr.dll). Diferente do "net use", a senha
+# nao aparece na linha de comando de nenhum processo (logs de auditoria 4688/EDR)
+# e o codigo de erro do Windows volta direto (53, 67, 86, 1219, 1326...).
+function Initialize-MecNetApi {
+    if ($null -ne ("MecShield.NetApi" -as [type])) { return }
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace MecShield {
+    public static class NetApi {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public class NETRESOURCE {
+            public int dwScope = 0;
+            public int dwType = 1; // RESOURCETYPE_DISK
+            public int dwDisplayType = 0;
+            public int dwUsage = 0;
+            public string lpLocalName = null;
+            public string lpRemoteName;
+            public string lpComment = null;
+            public string lpProvider = null;
+        }
+        [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+        private static extern int WNetAddConnection2(NETRESOURCE netResource, string password, string username, int flags);
+        [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+        private static extern int WNetCancelConnection2(string name, int flags, bool force);
+        public static int Connect(string remote, string user, string password) {
+            NETRESOURCE nr = new NETRESOURCE();
+            nr.lpRemoteName = remote;
+            return WNetAddConnection2(nr, password, user, 0);
+        }
+        public static int Disconnect(string remote) {
+            return WNetCancelConnection2(remote, 0, true);
+        }
+    }
+}
+"@
+}
+
+function Invoke-SmbConnect {
+    param([string]$UncRoot, [string]$User, [string]$Password)
+    Initialize-MecNetApi
+    return [MecShield.NetApi]::Connect($UncRoot, $User, $Password)
+}
+
+function Get-Win32ErrorText {
+    param([int]$Code)
+    try { return (New-Object System.ComponentModel.Win32Exception($Code)).Message } catch { return "erro $Code" }
+}
+
+# Autentica em \\host\compartilhamento. Derruba conexoes anteriores com o mesmo host
+# SOMENTE quando o Windows responde 1219 (credenciais conflitantes) e o chamador
+# permitir: derrubar sempre cortava copias em andamento de outros processos SYSTEM
+# (as conexoes de rede sao compartilhadas por toda a conta SYSTEM).
+function Connect-NetworkShare {
+    param(
+        [string]$UncRoot,
+        [string]$User,
+        [string]$Password,
+        [switch]$AllowDisconnect
+    )
+    $uncHost = $UncRoot.TrimStart('\').Split('\')[0]
+    $normUser = $User.Replace('/', '\')
+    while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
+
+    $users = @($normUser)
+    if ($normUser -notmatch '\\' -and $normUser -notmatch '@' -and -not [string]::IsNullOrWhiteSpace($uncHost)) {
+        $users += "$uncHost\$normUser"
+    }
+
+    $code = -1
+    foreach ($u in $users) {
+        try { $code = Invoke-SmbConnect -UncRoot $UncRoot -User $u -Password $Password }
+        catch { return [PSCustomObject]@{ Ok = $false; Code = -1; User = $u; Message = "Falha ao chamar WNetAddConnection2: $($_.Exception.Message)" } }
+
+        if ($code -eq 1219 -and $AllowDisconnect) {
+            Log-Message "Conexao anterior com '$uncHost' usa outra credencial (erro 1219). Encerrando conexoes antigas deste host e repetindo..."
+            Disconnect-HostConnections $uncHost
+            try { $code = Invoke-SmbConnect -UncRoot $UncRoot -User $u -Password $Password } catch { $code = -1 }
+        }
+        # 0 = conectado; 85/1202 = ja existe conexao valida para este recurso
+        if ($code -eq 0 -or $code -eq 85 -or $code -eq 1202) {
+            return [PSCustomObject]@{ Ok = $true; Code = $code; User = $u; Message = "OK" }
+        }
+        # Credencial recusada com o nome sem dominio: tenta NOMEDOPC\usuario
+        if ($code -ne 1326 -and $code -ne 86 -and $code -ne 2202) { break }
+    }
+    return [PSCustomObject]@{ Ok = $false; Code = $code; User = $normUser; Message = (Get-Win32ErrorText $code) }
+}
+
+function Disconnect-NetworkShare {
+    param([string]$UncRoot)
+    try { Initialize-MecNetApi; [void][MecShield.NetApi]::Disconnect($UncRoot) } catch {}
 }
 
 # ==============================================================================
@@ -362,13 +655,55 @@ function Get-NextBackupSequenceNumber {
         $candidate = $maxFound + 1
     }
 
-    # Atualiza o arquivo de sequencia para o proximo
-    $seqData[$Prefix] = $candidate + 1
-    try {
-        $seqData | ConvertTo-Json | Set-Content -Path $SequenceFilePath -Encoding UTF8 -Force
-    } catch {}
-
+    # O numero so e gravado como consumido quando o backup termina com sucesso
+    # (Save-BackupSequenceNumber). Rotinas que falham nao "queimam" numeros.
     return $candidate
+}
+
+function Save-BackupSequenceNumber {
+    param([string]$Prefix, [int]$UsedNumber, [string]$SequenceFilePath)
+    try {
+        Invoke-WithMecLock -Name "State" -Script {
+            $seqData = @{}
+            if (Test-Path $SequenceFilePath) {
+                $raw = Get-Content $SequenceFilePath -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($null -ne $raw) {
+                    foreach ($prop in $raw.psobject.Properties) { $seqData[$prop.Name] = [int]$prop.Value }
+                }
+            }
+            $next = $UsedNumber + 1
+            if (-not $seqData.ContainsKey($Prefix) -or [int]$seqData[$Prefix] -lt $next) {
+                $seqData[$Prefix] = $next
+            }
+            Save-JsonState -Path $SequenceFilePath -Data $seqData
+        }
+    } catch {
+        Log-Message "Aviso ao gravar a sequencia de backups: $_"
+    }
+}
+
+# Politica de retencao: mantem os $Keep arquivos mais recentes do prefixo na pasta.
+# Usada nos destinos configurados, no destino alternativo e no fail-safe (antes o
+# fail-safe nao tinha retencao e enchia o disco do banco de dados).
+function Invoke-RetentionPolicy {
+    param([string]$Directory, [string]$Prefix, [int]$Keep)
+    if ($Keep -lt 1) { $Keep = 1 }
+    try {
+        Log-Message "Aplicando politica de retencao em $Directory (Manter ultimos $Keep backups do prefixo '$Prefix')..."
+        $escapedPrefix = [regex]::Escape($Prefix)
+        $backupFiles = @(Get-ChildItem -Path $Directory -File -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match "^${escapedPrefix}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.(GZ|zip)$"
+        } | Sort-Object LastWriteTime -Descending)
+
+        if ($backupFiles.Count -gt $Keep) {
+            foreach ($oldFile in ($backupFiles | Select-Object -Skip $Keep)) {
+                Log-Message "Excluindo backup excedente antigo: $($oldFile.Name)"
+                Remove-Item $oldFile.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        Log-Message "Aviso na politica de retencao em $($Directory): $_"
+    }
 }
 
 # ==============================================================================
@@ -438,38 +773,19 @@ function Get-RemoteBadgesHtml([string]$anyDeskId, [string]$teamViewerId) {
     return [PSCustomObject]@{ AnyDesk = $adBadge; TeamViewer = $tvBadge }
 }
 
+# Credenciais do Firebird por variavel de ambiente (suportado pelo cliente Firebird
+# 2.5+): gbak/gfix/gstat deixam de receber -password na linha de comando.
+function Get-FirebirdEnvironment {
+    param([string]$User, [string]$Password)
+    return @{ ISC_USER = $User; ISC_PASSWORD = $Password }
+}
+
 # Funcao de Envio de Notificacao por E-mail (SMTP)
-# Envio de e-mail com retentativas. Devolve $true somente se a mensagem realmente saiu.
+# Envio de e-mail com retentativas. O resultado sai em $global:mailSent.
 # Isso importa porque os cooldowns anti-flood (12h para falha, prazo do monitor para
 # destino ausente) so podem ser armados APOS um envio confirmado: armar antes fazia um
 # alerta perdido por queda momentanea de internet silenciar o proximo aviso por horas,
 # justamente no cenario em que o cliente mais precisa ser avisado.
-# Inicia um processo externo em prioridade BAIXA e so entao aguarda o termino.
-# Necessario porque "Start-Process -Wait" bloqueia imediatamente, sem deixar janela
-# para ajustar a prioridade: o processo roda inteiro em prioridade normal e disputa
-# CPU e disco com o Firebird/Sismotel em producao.
-function Start-ProcessThrottled {
-    param(
-        [string]$FilePath,
-        [string[]]$ArgumentList,
-        [string]$StdErrFile = $null,
-        [string]$StdOutFile = $null,
-        [int]$TimeoutSeconds = 7200
-    )
-    $sp = @{ FilePath = $FilePath; ArgumentList = $ArgumentList; NoNewWindow = $true; PassThru = $true }
-    if (-not [string]::IsNullOrWhiteSpace($StdErrFile)) { $sp.RedirectStandardError  = $StdErrFile }
-    if (-not [string]::IsNullOrWhiteSpace($StdOutFile)) { $sp.RedirectStandardOutput = $StdOutFile }
-
-    $proc = Start-Process @sp
-    try { $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
-
-    if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
-        try { $proc.Kill() } catch {}
-        Log-Message "AVISO: '$([System.IO.Path]::GetFileName($FilePath))' excedeu $TimeoutSeconds s e foi finalizado."
-    }
-    return $proc
-}
-
 function Send-MailWithRetry {
     param(
         [System.Net.Mail.MailMessage]$Mail,
@@ -479,46 +795,145 @@ function Send-MailWithRetry {
         $Pref,
         [int]$Attempts = 3
     )
-    # IMPORTANTE: o resultado sai por $global:mailSent, NAO pelo valor de retorno.
-    # Log-Message escreve com Write-Output; se o chamador capturasse o retorno desta
-    # funcao, cada linha de log viraria parte do resultado (array = sempre verdadeiro)
-    # e as mensagens de retentativa nunca chegariam ao arquivo de log.
+    # IMPORTANTE: o resultado sai por $global:mailSent, NAO pelo valor de retorno
+    # (padrao mantido por compatibilidade com os chamadores).
     $global:mailSent = $false
-    for ($try = 1; $try -le $Attempts; $try++) {
-        $smtp = $null
-        try {
-            $smtp = New-Object System.Net.Mail.SmtpClient($SmtpServer, $Port)
-            $smtp.EnableSsl = $UseSsl
-            $smtp.DeliveryMethod = [System.Net.Mail.SmtpDeliveryMethod]::Network
-            $smtp.UseDefaultCredentials = $false
-            if (-not [string]::IsNullOrWhiteSpace($Pref.SmtpUser) -and -not [string]::IsNullOrWhiteSpace($Pref.SmtpPass)) {
-                $smtp.Credentials = New-Object System.Net.NetworkCredential($Pref.SmtpUser, (Unprotect-String $Pref.SmtpPass))
-            }
-            $smtp.Timeout = 25000
-            # Habilita TLS 1.2 (e 1.1) antes de conectar. Em Windows Server antigo o
-            # padrao do .NET e Ssl3/Tls1.0, que os provedores de e-mail ja recusam.
-            try {
-                [System.Net.ServicePointManager]::SecurityProtocol = `
-                    [System.Net.ServicePointManager]::SecurityProtocol `
-                    -bor [System.Net.SecurityProtocolType]::Tls12 `
-                    -bor [System.Net.SecurityProtocolType]::Tls11
-            } catch {}
-            try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
-            $smtp.Send($Mail)
-            $global:mailSent = $true
+
+    $smtpPassword = $null
+    if (-not [string]::IsNullOrWhiteSpace($Pref.SmtpUser) -and -not [string]::IsNullOrWhiteSpace($Pref.SmtpPass)) {
+        $smtpPassword = Unprotect-String $Pref.SmtpPass
+        if ($null -eq $smtpPassword) {
+            Log-Message "ERRO: a senha SMTP criptografada (DPAPI) nao pode ser aberta neste servidor. Redigite a senha em Preferencias. E-mail nao enviado."
             return
-        } catch {
-            $inner = if ($_.Exception -and $_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-            if ($try -lt $Attempts) {
-                $espera = 15 * $try
-                Log-Message "Aviso: tentativa $try de envio de e-mail falhou ($inner). Nova tentativa em ${espera}s..."
-                Start-Sleep -Seconds $espera
-            } else {
-                Log-Message "ERRO: todas as $Attempts tentativas de envio de e-mail falharam. Ultimo erro: $inner"
-            }
-        } finally {
-            if ($null -ne $smtp) { try { $smtp.Dispose() } catch {} }
         }
+    }
+
+    # TLS: com usuario/senha, a conexao na porta 587 sempre tenta STARTTLS, para a
+    # senha nao trafegar em texto puro. So cai para texto puro se o servidor declarar
+    # que NAO suporta TLS (nao por erro de certificado).
+    $useTls = $UseSsl -or ($Port -eq 587 -and $null -ne $smtpPassword)
+    # Certificado invalido so e aceito com opt-in explicito (SmtpAllowInvalidCertificate)
+    # e apenas durante este envio -- antes a validacao ficava desligada no processo
+    # inteiro, inclusive para o download do LiveUpdate.
+    $allowInvalidCert = ($null -ne $Pref.SmtpAllowInvalidCertificate -and [bool]$Pref.SmtpAllowInvalidCertificate)
+    $previousCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = `
+            [System.Net.ServicePointManager]::SecurityProtocol `
+            -bor [System.Net.SecurityProtocolType]::Tls12 `
+            -bor [System.Net.SecurityProtocolType]::Tls11
+    } catch {}
+
+    try {
+        if ($allowInvalidCert) {
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        }
+        for ($try = 1; $try -le $Attempts; $try++) {
+            $smtp = $null
+            try {
+                $smtp = New-Object System.Net.Mail.SmtpClient($SmtpServer, $Port)
+                $smtp.EnableSsl = $useTls
+                $smtp.DeliveryMethod = [System.Net.Mail.SmtpDeliveryMethod]::Network
+                $smtp.UseDefaultCredentials = $false
+                if ($null -ne $smtpPassword) {
+                    $smtp.Credentials = New-Object System.Net.NetworkCredential($Pref.SmtpUser, $smtpPassword)
+                }
+                $smtp.Timeout = 25000
+                $smtp.Send($Mail)
+                $global:mailSent = $true
+                return
+            } catch {
+                $inner = if ($_.Exception -and $_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                $semTls = ($useTls -and -not $UseSsl -and ("$($_.Exception.Message) $inner" -match 'secure connections|conex.es seguras|STARTTLS'))
+                if ($semTls) {
+                    Log-Message "Aviso: o servidor SMTP $SmtpServer nao oferece TLS (STARTTLS). Enviando sem criptografia; recomenda-se um servidor com TLS."
+                    $useTls = $false
+                    $try--
+                } elseif ($try -lt $Attempts) {
+                    $espera = 15 * $try
+                    Log-Message "Aviso: tentativa $try de envio de e-mail falhou ($inner). Nova tentativa em ${espera}s..."
+                    Start-Sleep -Seconds $espera
+                } else {
+                    Log-Message "ERRO: todas as $Attempts tentativas de envio de e-mail falharam. Ultimo erro: $inner"
+                }
+            } finally {
+                if ($null -ne $smtp) { try { $smtp.Dispose() } catch {} }
+            }
+        }
+    } finally {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $previousCallback
+    }
+}
+
+function Test-WithinCooldown {
+    param($Timestamp, [double]$Hours)
+    if ($null -eq $Timestamp -or [string]::IsNullOrWhiteSpace("$Timestamp")) { return $false }
+    try {
+        $dt = [DateTime]::Parse("$Timestamp")
+        $elapsed = ((Get-Date) - $dt).TotalHours
+        return ($elapsed -ge 0 -and $elapsed -lt $Hours)
+    } catch { return $false }
+}
+
+function New-TaskNotificationState {
+    return [PSCustomObject]@{
+        InFailureState      = $false
+        LastFailureAlert    = $null
+        InWarningState      = $false
+        LastWarningAlert    = $null
+        ConsecutiveFailures = 0
+        LastConfigWarning   = $null
+    }
+}
+
+# backup_state.json = { "Tasks": { "<tarefa>": { ...estado... } } }
+# O formato antigo (um unico estado para tudo) e migrado para a tarefa atual.
+function Get-TaskNotificationState {
+    param([string]$TaskName)
+    $stateFile = Join-Path $scriptDir "backup_state.json"
+    $state = New-TaskNotificationState
+    try {
+        if (Test-Path $stateFile) {
+            $raw = Get-Content $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $src = $null
+            if ($null -ne $raw.Tasks -and $null -ne $raw.Tasks.$TaskName) {
+                $src = $raw.Tasks.$TaskName
+            } elseif ($null -eq $raw.Tasks -and $null -ne $raw.PSObject.Properties["InFailureState"]) {
+                $src = $raw
+            }
+            if ($null -ne $src) {
+                foreach ($prop in $state.PSObject.Properties.Name) {
+                    if ($null -ne $src.PSObject.Properties[$prop]) { $state.$prop = $src.$prop }
+                }
+            }
+        }
+    } catch {
+        Log-Message "Aviso: estado de notificacoes ilegivel; iniciando estado limpo para '$TaskName'."
+    }
+    if ($null -eq $state.ConsecutiveFailures) { $state.ConsecutiveFailures = 0 }
+    return $state
+}
+
+function Save-TaskNotificationState {
+    param([string]$TaskName, $State)
+    $stateFile = Join-Path $scriptDir "backup_state.json"
+    try {
+        Invoke-WithMecLock -Name "State" -Script {
+            $all = @{}
+            if (Test-Path $stateFile) {
+                try {
+                    $raw = Get-Content $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                    if ($null -ne $raw.Tasks) {
+                        foreach ($p in $raw.Tasks.PSObject.Properties) { $all[$p.Name] = $p.Value }
+                    }
+                } catch {}
+            }
+            $all[$TaskName] = $State
+            Save-JsonState -Path $stateFile -Data @{ Tasks = $all } -Depth 6
+        }
+    } catch {
+        Log-Message "Aviso ao gravar o estado de notificacoes: $_"
     }
 }
 
@@ -564,23 +979,10 @@ function Send-BackupNotification {
         $cooldownHours = if ($pref.FailureCooldownHours -gt 0) { [int]$pref.FailureCooldownHours } else { 12 }
         $hostName = $env:COMPUTERNAME
 
-        # Estado persistente para Cooldown e Auto-Recuperacao (Anti-Flood para +100 clientes)
-        $stateFile = Join-Path $scriptDir "backup_state.json"
-        $state = $null
-        if (Test-Path $stateFile) {
-            try { $state = Get-Content $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
-        }
-        if ($null -eq $state) {
-            $state = [PSCustomObject]@{
-                InFailureState = $false
-                LastFailureAlert = $null
-                InWarningState = $false
-                LastWarningAlert = $null
-                ConsecutiveFailures = 0
-            }
-        }
-        if ($null -eq $state.InWarningState) { $state | Add-Member -NotePropertyName InWarningState -NotePropertyValue $false -Force }
-        if ($null -eq $state.LastWarningAlert) { $state | Add-Member -NotePropertyName LastWarningAlert -NotePropertyValue $null -Force }
+        # Estado anti-flood POR TAREFA. Antes era um estado unico para todas: o sucesso
+        # de uma tarefa zerava o cooldown da outra (alerta a cada 2h alternando horas
+        # pares/impares) e uma segunda falha diferente ficava escondida por 12h.
+        $state = Get-TaskNotificationState -TaskName $TaskName
 
         $isRecovery = $false
         $shouldSend = $false
@@ -596,15 +998,16 @@ function Send-BackupNotification {
                 # RECUPERADO de falha critica - silencioso, apenas limpa o estado
                 $state.InFailureState = $false
                 $state.LastFailureAlert = $null
+                if ($WarningDests.Count -gt 0) { $state.InWarningState = $true }
                 Log-Message "Sistema recuperado de falha anterior. Backup voltou a funcionar normalmente (notificacao suprimida - Zero Spam)."
-                try { $state | ConvertTo-Json | Set-Content $stateFile -Encoding UTF8 } catch {}
+                Save-TaskNotificationState -TaskName $TaskName -State $state
                 return
             } elseif ($WarningDests.Count -eq 0 -and $state.InWarningState -eq $true) {
                 # RECUPERADO de destino de rede offline - silencioso, apenas limpa o estado
                 $state.InWarningState = $false
                 $state.LastWarningAlert = $null
                 Log-Message "Destino de rede reconectado. Sincronizacao voltou ao normal (notificacao suprimida - Zero Spam)."
-                try { $state | ConvertTo-Json | Set-Content $stateFile -Encoding UTF8 } catch {}
+                Save-TaskNotificationState -TaskName $TaskName -State $state
                 return
             } else {
                 if ($WarningDests.Count -gt 0) {
@@ -614,13 +1017,13 @@ function Send-BackupNotification {
                     $state.InWarningState = $true
                     Log-Message "AVISO SILENCIOSO DE REDE: Destino(s) externo(s) inacessivel(is) nesta rotina. Monitorando acumulo (alerta sera enviado somente apos 24h continuas sem sincronizacao)."
                     Log-Message "Destinos nao sincronizados: $($WarningDests -join ' | ')"
-                    try { $state | ConvertTo-Json | Set-Content $stateFile -Encoding UTF8 } catch {}
+                    Save-TaskNotificationState -TaskName $TaskName -State $state
                     return
                 } else {
                     # Silencio Total em Rotinas Normais com Sucesso (Zero Spam - nao envia e-mail em rotinas normais)
                     $state.InWarningState = $false
                     Log-Message "Notificacao por e-mail suprimida (Backup de rotina 100% gravado com sucesso - Zero Spam)."
-                    try { $state | ConvertTo-Json | Set-Content $stateFile -Encoding UTF8 } catch {}
+                    Save-TaskNotificationState -TaskName $TaskName -State $state
                     return
                 }
             }
@@ -629,21 +1032,16 @@ function Send-BackupNotification {
             $state.ConsecutiveFailures++
 
             if ($pref.NotifyOnFailure -ne $true) {
-                try { $state | ConvertTo-Json | Set-Content $stateFile -Encoding UTF8 } catch {}
+                Save-TaskNotificationState -TaskName $TaskName -State $state
                 return
             }
 
             # Validacao de Cooldown Anti-Flood (nao mandar a cada hora se falhar repetidamente)
-            if ($state.LastFailureAlert) {
-                try {
-                    $lastDt = [DateTime]::Parse($state.LastFailureAlert)
-                    $hoursSince = ((Get-Date) - $lastDt).TotalHours
-                    if ($hoursSince -lt $cooldownHours) {
-                        Log-Message "ANTI-FLOOD ATIVO: Alerta de falha ja enviado ha $([Math]::Round($hoursSince, 1))h. E-mail suprimido para nao lotar a caixa de entrada (Cooldown: ${cooldownHours}h)."
-                        try { $state | ConvertTo-Json | Set-Content $stateFile -Encoding UTF8 } catch {}
-                        return
-                    }
-                } catch {}
+            if (Test-WithinCooldown -Timestamp $state.LastFailureAlert -Hours $cooldownHours) {
+                $hoursSince = ((Get-Date) - [DateTime]::Parse("$($state.LastFailureAlert)")).TotalHours
+                Log-Message "ANTI-FLOOD ATIVO: Alerta de falha ja enviado ha $([Math]::Round($hoursSince, 1))h. E-mail suprimido para nao lotar a caixa de entrada (Cooldown: ${cooldownHours}h)."
+                Save-TaskNotificationState -TaskName $TaskName -State $state
+                return
             }
 
             $shouldSend = $true
@@ -654,10 +1052,31 @@ function Send-BackupNotification {
 
             # NAO armar $state.LastFailureAlert aqui: o cooldown de ${cooldownHours}h so e
             # gravado depois que o envio for confirmado, la no fim desta funcao.
-            try { $state | ConvertTo-Json | Set-Content $stateFile -Encoding UTF8 } catch {}
+            Save-TaskNotificationState -TaskName $TaskName -State $state
+        } elseif ($Status -eq "AVISO") {
+            # Problema de configuracao que NAO impediu o backup (ex.: banco encontrado
+            # fora do caminho configurado). Avisa no maximo 1 vez a cada 24h por tarefa,
+            # sem mexer no estado de falha.
+            if ($pref.NotifyOnFailure -ne $true) { return }
+            if (Test-WithinCooldown -Timestamp $state.LastConfigWarning -Hours 24) {
+                Log-Message "Aviso de configuracao ja enviado nas ultimas 24h. E-mail suprimido (Zero Spam)."
+                return
+            }
+            $shouldSend = $true
+            $subjectTag = "[MEC AVISO]"
+            $statusTitle = "ATENCAO: CONFIGURACAO PRECISA DE REVISAO"
+            $bannerBg = "#d97706"
+            $bannerType = "WARNING"
         }
 
         if (-not $shouldSend) { return }
+
+        # Tudo que vem de mensagens de erro, caminhos e config entra no HTML escapado.
+        $clientNameHtml = ConvertTo-HtmlSafe $clientName
+        $BodyDetails = ConvertTo-HtmlSafe $BodyDetails
+        $DbPath = ConvertTo-HtmlSafe $DbPath
+        $SuccessDests = @($SuccessDests | ForEach-Object { ConvertTo-HtmlSafe $_ })
+        $WarningDests = @($WarningDests | ForEach-Object { ConvertTo-HtmlSafe $_ })
 
         # Auto-preenchimento inteligente de telemetria se nao passado pelo chamador
         if ([string]::IsNullOrWhiteSpace($DurationStr) -and $null -ne $global:routineTimer -and $global:routineTimer.IsRunning) {
@@ -777,7 +1196,7 @@ function Send-BackupNotification {
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#ffffff;">
                       <tr>
                         <td width="36%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Cliente / Empresa:</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:16px;">$clientName</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:16px;">$clientNameHtml</td>
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Servidor / Hostname:</td>
@@ -872,7 +1291,7 @@ function Send-BackupNotification {
           </tr>
 
           <!-- CARD 3: DETALHES DE ERRO & CHECKLIST DO SUPORTE (SE FALHA CRITICA) -->
-          $(if ($Status -eq "FALHA" -and $BodyDetails) {
+          $(if (($Status -eq "FALHA" -or $Status -eq "AVISO") -and $BodyDetails) {
           "<tr>
             <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
               <div style='background-color:#450a0a; border:1px solid #7f1d1d; border-left:4px solid #ef4444; border-radius:8px; padding:16px; font-size:13.5px; color:#fca5a5; line-height:1.6;'>
@@ -944,7 +1363,7 @@ function Send-BackupNotification {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.15 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v$($script:EngineVersion) &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Central de Monitoramento Cont&iacute;nuo
@@ -995,8 +1414,11 @@ function Send-BackupNotification {
             Log-Message "E-mail de notificacao ($subjectTag) enviado com sucesso para: $recipient"
             if ($Status -eq "FALHA") {
                 $state.LastFailureAlert = (Get-Date).ToString("o")
-                try { $state | ConvertTo-Json | Set-Content $stateFile -Encoding UTF8 } catch {}
+                Save-TaskNotificationState -TaskName $TaskName -State $state
                 Log-Message "Cooldown anti-flood de ${cooldownHours}h armado (a partir da entrega confirmada)."
+            } elseif ($Status -eq "AVISO") {
+                $state.LastConfigWarning = (Get-Date).ToString("o")
+                Save-TaskNotificationState -TaskName $TaskName -State $state
             }
         } else {
             Log-Message "ATENCAO: o e-mail de notificacao NAO pode ser entregue. O cooldown nao sera armado, para que a proxima rotina tente avisar novamente."
@@ -1096,7 +1518,7 @@ function Send-WelcomeEmail {
             <td bgcolor="#111827" style="padding:24px 28px 12px 28px;">
               <h2 style="margin:0 0 8px 0; color:#ffffff; font-size:21px; font-weight:700;">Seja bem-vindo ao novo padr&atilde;o corporativo de seguran&ccedil;a cont&iacute;nua</h2>
               <p style="margin:0 0 14px 0; color:#cbd5e1; font-size:14px; line-height:1.65;">
-                A instala&ccedil;&atilde;o do sistema corporativo <strong style="color:#10b981;">FIBS MEC Shield Enterprise (v2.2.15)</strong> foi conclu&iacute;da com &ecirc;xito neste servidor. Esta nova gera&ccedil;&atilde;o substitui integralmente as rotinas legadas e traz uma arquitetura avan&ccedil;ada de conting&ecirc;ncia concebida sob medida para o regime ininterrupto (24/7) de mot&eacute;is, blindando o banco de dados do <strong>Sismotel</strong> com prote&ccedil;&atilde;o em m&uacute;ltiplas camadas e sem nenhum impacto na agilidade da recep&ccedil;&atilde;o.
+                A instala&ccedil;&atilde;o do sistema corporativo <strong style="color:#10b981;">FIBS MEC Shield Enterprise (v$($script:EngineVersion))</strong> foi conclu&iacute;da com &ecirc;xito neste servidor. Esta nova gera&ccedil;&atilde;o substitui integralmente as rotinas legadas e traz uma arquitetura avan&ccedil;ada de conting&ecirc;ncia concebida sob medida para o regime ininterrupto (24/7) de mot&eacute;is, blindando o banco de dados do <strong>Sismotel</strong> com prote&ccedil;&atilde;o em m&uacute;ltiplas camadas e sem nenhum impacto na agilidade da recep&ccedil;&atilde;o.
               </p>
             </td>
           </tr>
@@ -1135,7 +1557,7 @@ function Send-WelcomeEmail {
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Edi&ccedil;&atilde;o / Vers&atilde;o:</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#34d399; font-weight:700; font-size:13.5px;">v2.2.15 &bull; Enterprise Shield</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#34d399; font-weight:700; font-size:13.5px;">v$($script:EngineVersion) &bull; Enterprise Shield</td>
                       </tr>
                     </table>
                   </td>
@@ -1263,7 +1685,7 @@ function Send-WelcomeEmail {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.15 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v$($script:EngineVersion) &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Central de Monitoramento Cont&iacute;nuo
@@ -1355,6 +1777,9 @@ function Send-NetworkFailureAlert {
         $remoteBadges = Get-RemoteBadgesHtml -anyDeskId $anyDeskId -teamViewerId $teamViewerId
         $timestampNow = Get-Date -Format 'dd/MM/yyyy HH:mm:ss'
 
+        $clientNameHtml = ConvertTo-HtmlSafe $clientName
+        $Destination = ConvertTo-HtmlSafe $Destination
+        $FailureReason = ConvertTo-HtmlSafe $FailureReason
         $daysStr = if ($DelayHours -ge 24) { "$([Math]::Floor($DelayHours / 24)) dia(s) e $($DelayHours % 24)h" } else { "${DelayHours}h" }
         $urgencyColor = if ($DelayHours -ge 48) { "#b91c1c" } elseif ($DelayHours -ge 24) { "#dc2626" } else { "#d97706" }
         $urgencyLabel = if ($DelayHours -ge 48) { "URGENTE - MAIS DE 2 DIAS" } elseif ($DelayHours -ge 24) { "ATENCAO - 24H SEM COPIA EXTERNA" } else { "PREVENTIVO - MONITORANDO" }
@@ -1412,7 +1837,7 @@ function Send-NetworkFailureAlert {
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#ffffff;">
                       <tr>
                         <td width="36%" bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Cliente / Empresa:</td>
-                        <td bgcolor="#1e293b" style="padding:7px 0; font-weight:800; color:#ffffff; font-size:16px;">$clientName</td>
+                        <td bgcolor="#1e293b" style="padding:7px 0; font-weight:800; color:#ffffff; font-size:16px;">$clientNameHtml</td>
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Servidor / Hostname:</td>
@@ -1577,7 +2002,7 @@ function Send-NetworkFailureAlert {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.15 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v$($script:EngineVersion) &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Central de Monitoramento Cont&iacute;nuo
@@ -1640,11 +2065,37 @@ function Send-NetworkFailureAlert {
 # ==============================================================================
 # MONITOR DE SAUDE DE DESTINOS EXTERNOS E REDE (24 HORAS CONTINUO)
 # ==============================================================================
+# Grava no network_tracker.json apenas as entradas que este processo atualizou,
+# relendo o arquivo sob trava: monitor horario e rotina de backup nao apagam mais
+# as atualizacoes um do outro.
+function Save-NetworkTrackerEntries {
+    param([hashtable]$Entries, [string[]]$Keys)
+    $trackerFile = Join-Path $scriptDir "network_tracker.json"
+    try {
+        Invoke-WithMecLock -Name "State" -Script {
+            $current = @{}
+            if (Test-Path $trackerFile) {
+                try { $current = ConvertTo-HashtableCompat (Get-Content $trackerFile -Raw -Encoding UTF8 | ConvertFrom-Json) } catch {}
+            }
+            foreach ($k in ($Keys | Select-Object -Unique)) {
+                if ($Entries.ContainsKey($k)) { $current[$k] = $Entries[$k] }
+            }
+            Save-JsonState -Path $trackerFile -Data $current
+        }
+    } catch {
+        Log-Message "Aviso ao gravar o rastreador de destinos: $_"
+    }
+}
+
 function Test-ExternalDestinationsHealth {
     param (
         [string]$TaskName = "BKP_EXTERNO",
         [string[]]$Destinations = @(),
-        [string]$FailureReason = ""
+        [string]$FailureReason = "",
+        # Derrubar conexoes antigas com o host (erro 1219) so e seguro quando nenhum
+        # backup esta copiando para ele. O modo monitor so passa este switch se
+        # conseguir a trava de backup.
+        [switch]$AllowDisconnect
     )
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Tasks) {
@@ -1654,9 +2105,9 @@ function Test-ExternalDestinationsHealth {
         }
         if ($null -eq $global:configData -or $null -eq $global:configData.Tasks) { return }
 
-        $tConf = $global:configData.Tasks | Where-Object { $_.TaskName -eq $TaskName }
+        $tConf = $global:configData.Tasks | Where-Object { $_.TaskName -eq $TaskName } | Select-Object -First 1
         if ($null -eq $tConf) {
-            $tConf = $global:configData.Tasks | Where-Object { $_.TaskName -match "EXTERN" }
+            $tConf = $global:configData.Tasks | Where-Object { $_.TaskName -match "EXTERN" } | Select-Object -First 1
         }
         if ($null -eq $tConf) { return }
 
@@ -1688,6 +2139,7 @@ function Test-ExternalDestinationsHealth {
         $netTerm = if (-not [string]::IsNullOrWhiteSpace($tConf.NetworkTerminalName)) { $tConf.NetworkTerminalName } else { "" }
         $nomeTarefaReal = if (-not [string]::IsNullOrWhiteSpace($tConf.TaskName)) { $tConf.TaskName } else { $TaskName }
 
+        $touchedKeys = @()
         foreach ($dest in $destsToCheck) {
             $destTrim = $dest.TrimEnd('\', '/')
             if ([string]::IsNullOrWhiteSpace($destTrim)) { continue }
@@ -1699,25 +2151,32 @@ function Test-ExternalDestinationsHealth {
             }
 
             if (-not $netTracker.ContainsKey($destTrim)) { $netTracker[$destTrim] = @{} }
+            $touchedKeys += $destTrim
             $detectedReason = $FailureReason
 
             # Autenticacao proativa se for UNC de rede e houver credenciais
             $senhaRede = Unprotect-String $tConf.NetworkPassword
             $hasNetUser = -not [string]::IsNullOrWhiteSpace($tConf.NetworkUser)
+            $dpapiIlegivel = ($null -eq $senhaRede -and (Test-IsDpapiBlob $tConf.NetworkPassword))
             $isNetPasswordEmpty = [string]::IsNullOrWhiteSpace($senhaRede)
 
             if ($destTrim.StartsWith("\\") -and $hasNetUser) {
                 $uncParts = $destTrim -split '\\'
                 if ($uncParts.Count -ge 4) {
-                    $uncHost = $uncParts[2]
                     $uncRoot = "\\$($uncParts[2])\$($uncParts[3])"
-                    if (-not $isNetPasswordEmpty) {
-                        try {
-                            $normUser = $tConf.NetworkUser
-                            while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
-                            Disconnect-HostConnections $uncHost
-                            & net.exe use "`"$uncRoot`"" "`"$senhaRede`"" "/user:`"$normUser`"" /persistent:no 2>&1 | Out-Null
-                        } catch {}
+                    if ($dpapiIlegivel) {
+                        Log-Message "ERRO DE CONFIGURACAO: a senha de rede de '$($tConf.NetworkUser)' esta criptografada para OUTRO computador (DPAPI) e nao abre neste servidor."
+                        if ([string]::IsNullOrWhiteSpace($detectedReason)) {
+                            $detectedReason = "Senha de rede ilegivel neste servidor (criptografia DPAPI de outra maquina). Redigite a senha da tarefa no MEC Shield."
+                        }
+                    } elseif (-not $isNetPasswordEmpty) {
+                        $conn = Connect-NetworkShare -UncRoot $uncRoot -User $tConf.NetworkUser -Password $senhaRede -AllowDisconnect:$AllowDisconnect
+                        if (-not $conn.Ok) {
+                            Log-Message "Monitor: autenticacao em $uncRoot falhou (codigo $($conn.Code)): $($conn.Message)"
+                            if ([string]::IsNullOrWhiteSpace($detectedReason)) {
+                                $detectedReason = "Autenticacao de rede recusada em $uncRoot (codigo $($conn.Code)): $($conn.Message)"
+                            }
+                        }
                     } else {
                         Log-Message "Aviso: Senha de rede em branco para usuario '$($tConf.NetworkUser)' ao verificar saude de $uncRoot."
                         if ([string]::IsNullOrWhiteSpace($detectedReason)) {
@@ -1733,8 +2192,8 @@ function Test-ExternalDestinationsHealth {
             try {
                 if (Test-Path $destTrim) {
                     $destAccessible = $true
-                    $existingGzs = Get-ChildItem -Path "$destTrim\*" -Include "*.GZ", "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
-                    if ($existingGzs -and $existingGzs.Count -gt 0) {
+                    $existingGzs = @(Get-ChildItem -Path "$destTrim\*" -Include "*.GZ", "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+                    if ($existingGzs.Count -gt 0) {
                         $realLastBackupTime = $existingGzs[0].LastWriteTime
                     }
                 } elseif ($destTrim.StartsWith("\\") -and -not $isNetPasswordEmpty) {
@@ -1747,35 +2206,28 @@ function Test-ExternalDestinationsHealth {
                         $subR = if ($pParts.Length -gt 2) { ($pParts[2..($pParts.Length - 1)]) -join '\' } else { "" }
                         foreach ($altDrive in @("c$", "d$")) {
                             $altRoot = "\\$uncH\$altDrive"
+                            $altConn = $null
                             if ($hasNetUser) {
-                                try {
-                                    $normUser = $tConf.NetworkUser
-                                    while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
-                                    Disconnect-HostConnections $uncH
-                                    & net.exe use "`"$altRoot`"" "`"$senhaRede`"" "/user:`"$normUser`"" /persistent:no 2>&1 | Out-Null
-                                    if ($LASTEXITCODE -ne 0 -and $normUser -notmatch '\\' -and -not [string]::IsNullOrWhiteSpace($uncH)) {
-                                        $hostUser = "$uncH\$normUser"
-                                        Disconnect-HostConnections $uncH
-                                        & net.exe use "`"$altRoot`"" "`"$senhaRede`"" "/user:`"$hostUser`"" /persistent:no 2>&1 | Out-Null
-                                    }
-                                } catch {}
+                                $altConn = Connect-NetworkShare -UncRoot $altRoot -User $tConf.NetworkUser -Password $senhaRede -AllowDisconnect:$AllowDisconnect
                             }
                             $subPartR = ""
                             if (-not [string]::IsNullOrWhiteSpace($subR)) { $subPartR = "\$subR" }
                             $checkPath = "\\$uncH\$altDrive\$sName$subPartR"
+                            $found = $false
                             try {
                                 if (Test-Path $checkPath) {
+                                    $found = $true
                                     $destAccessible = $true
-                                    $existingGzs = Get-ChildItem -Path "$checkPath\*" -Include "*.GZ", "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
-                                    if ($existingGzs -and $existingGzs.Count -gt 0) {
+                                    $existingGzs = @(Get-ChildItem -Path "$checkPath\*" -Include "*.GZ", "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+                                    if ($existingGzs.Count -gt 0) {
                                         $realLastBackupTime = $existingGzs[0].LastWriteTime
                                     }
                                     Log-Message "Monitor de Destino: Destino '$destTrim' verificado com sucesso via compartilhamento alternativo: $checkPath"
-                                    try { & net.exe use "`"$altRoot`"" /delete /yes 2>&1 | Out-Null } catch {}
-                                    break
                                 }
                             } catch {}
-                            try { & net.exe use "`"$altRoot`"" /delete /yes 2>&1 | Out-Null } catch {}
+                            # So desconecta o que ESTE monitor conectou
+                            if ($null -ne $altConn -and $altConn.Ok -and $altConn.Code -eq 0) { Disconnect-NetworkShare $altRoot }
+                            if ($found) { break }
                         }
                     }
                 }
@@ -1838,7 +2290,7 @@ function Test-ExternalDestinationsHealth {
             }
         }
 
-        try { $netTracker | ConvertTo-Json -Depth 10 | Set-Content $networkTrackerFile -Encoding UTF8 } catch {}
+        Save-NetworkTrackerEntries -Entries $netTracker -Keys @($touchedKeys)
     } catch {
         Log-Message "Aviso em Test-ExternalDestinationsHealth: $_"
     }
@@ -1909,25 +2361,34 @@ function Get-OptimalSandboxDir {
     return [PSCustomObject]@{ Path = $null; Drive = $null; FreeMB = 0; RequiredMB = $minRequiredMB; Status = "INSUFFICIENT_SPACE" }
 }
 
-function Update-ConfigAuditDate {
-    param ([string]$NewDate)
+# Estado da auditoria diaria em arquivo proprio (audit_state.json). Antes a data
+# era gravada reescrevendo o config.json inteiro, concorrendo com a interface.
+function Get-AuditState {
+    $f = Join-Path $scriptDir "audit_state.json"
+    $st = [PSCustomObject]@{ LastAuditDate = ""; LastResult = ""; ConsecutiveInconclusive = 0; LastInconclusiveAlert = $null }
     try {
-        if (Test-Path $configFile) {
-            $cfg = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($null -ne $cfg.Preferences) {
-                $cfg.Preferences.LastAuditDate = $NewDate
-                if ($null -ne $cfg.Tasks) {
-                    foreach ($t in $cfg.Tasks) {
-                        if ($null -eq $t.NetworkPassword) { $t.NetworkPassword = "" }
-                        if ($null -eq $t.NetworkUser) { $t.NetworkUser = "" }
-                        if ($null -eq $t.NetworkTerminalName) { $t.NetworkTerminalName = "" }
-                    }
-                }
-                $cfgJson = $cfg | ConvertTo-Json -Depth 10
-                [System.IO.File]::WriteAllText($configFile, $cfgJson, [System.Text.Encoding]::UTF8)
+        if (Test-Path $f) {
+            $raw = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($prop in $st.PSObject.Properties.Name) {
+                if ($null -ne $raw.PSObject.Properties[$prop]) { $st.$prop = $raw.$prop }
             }
+        } elseif ($null -ne $global:configData -and $null -ne $global:configData.Preferences -and -not [string]::IsNullOrWhiteSpace($global:configData.Preferences.LastAuditDate)) {
+            # Migracao: instalacoes antigas guardavam a data no config.json
+            $st.LastAuditDate = "$($global:configData.Preferences.LastAuditDate)"
         }
     } catch {}
+    if ($null -eq $st.ConsecutiveInconclusive) { $st.ConsecutiveInconclusive = 0 }
+    return $st
+}
+
+function Save-AuditState {
+    param($State)
+    $f = Join-Path $scriptDir "audit_state.json"
+    try {
+        Invoke-WithMecLock -Name "State" -Script { Save-JsonState -Path $f -Data $State }
+    } catch {
+        Log-Message "Aviso ao gravar o estado da auditoria: $_"
+    }
 }
 
 function Send-AuditAlertNotification {
@@ -1940,8 +2401,14 @@ function Send-AuditAlertNotification {
         [int]$PageErrors,
         [long]$TransactionGap,
         [long]$NextTransaction,
-        [string]$AuditLogSnippet
+        [string]$AuditLogSnippet,
+        [string]$Headline = "ANOMALIA DETECTADA NO FIREBIRD",
+        [string]$Diagnosis = ""
     )
+    $headlineHtml = ConvertTo-HtmlSafe $Headline
+    $diagnosisHtml = ConvertTo-HtmlSafe $Diagnosis
+    $AuditLogSnippet = ConvertTo-HtmlSafe $AuditLogSnippet
+    $DbPath = ConvertTo-HtmlSafe $DbPath
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
             if (Test-Path $configFile) {
@@ -1997,7 +2464,7 @@ function Send-AuditAlertNotification {
           <!-- FAIXA DE STATUS PRINCIPAL -->
           <tr>
             <td bgcolor="#b91c1c" style="background-color:#b91c1c; color:#ffffff; padding:13px 28px; font-weight:800; font-size:14.5px; letter-spacing:0.5px; text-transform:uppercase;">
-              &#9679; AUDITORIA PREVENTIVA &bull; ANOMALIA DETECTADA NO FIREBIRD
+              &#9679; AUDITORIA PREVENTIVA &bull; $headlineHtml
             </td>
           </tr>
 
@@ -2008,6 +2475,7 @@ function Send-AuditAlertNotification {
               <p style="margin:0; color:#cbd5e1; font-size:14px; line-height:1.65;">
                 A auditoria preventiva di&aacute;ria executada em sandbox isolado identificou anomalias no banco de dados Firebird. <span style="color:#34d399; font-weight:600;">O banco ativo no motel permanece operando normalmente sem paradas</span>, por&eacute;m requer interven&ccedil;&atilde;o t&eacute;cnica preventiva programada da equipe MEC para preservar a integridade dos dados.
               </p>
+              $(if ($diagnosisHtml) { "<p style='margin:12px 0 0 0; padding:12px 14px; background-color:#450a0a; border-left:4px solid #ef4444; border-radius:6px; color:#fecaca; font-size:14px; line-height:1.6;'><strong>Diagn&oacute;stico:</strong> $diagnosisHtml</p>" })
             </td>
           </tr>
 
@@ -2025,7 +2493,7 @@ function Send-AuditAlertNotification {
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#ffffff;">
                       <tr>
                         <td width="36%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Cliente / Empresa:</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:16px;">$cleanClient</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:16px;">$(ConvertTo-HtmlSafe $cleanClient)</td>
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Terminal / Servidor:</td>
@@ -2128,7 +2596,7 @@ function Send-AuditAlertNotification {
           <tr>
             <td bgcolor="#0a0e17" style="background-color:#0a0e17; padding:18px 28px; border-top:1px solid #1f2937; text-align:center;">
               <p style="margin:0; font-size:12.5px; color:#94a3b8; font-weight:600;">
-                MEC Shield Enterprise v2.2.15 &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
+                MEC Shield Enterprise v$($script:EngineVersion) &bull; FIBS Prote&ccedil;&atilde;o 24/7 &bull; Desenvolvido por Rodrigo
               </p>
               <p style="margin:5px 0 0 0; font-size:11.5px; color:#64748b;">
                 Powered by MEC Tecnologias Corporativas &bull; Auditoria Preventiva Di&aacute;ria
@@ -2155,7 +2623,7 @@ function Send-AuditAlertNotification {
             }
         }
         if ($mail.To.Count -eq 0) { Log-Message "ERRO: nenhum destinatario valido em '$recipient'. E-mail nao enviado."; return }
-        $mail.Subject = "[ALERTA DE BANCO SISMOTEL] Anomalia Detectada em Auditoria - $cleanClient ($hostName)"
+        $mail.Subject = "[ALERTA DE BANCO SISMOTEL] $Headline - $cleanClient ($hostName)"
         $mail.SubjectEncoding = [System.Text.Encoding]::UTF8
         $mail.BodyEncoding = [System.Text.Encoding]::UTF8
         $mail.HeadersEncoding = [System.Text.Encoding]::UTF8
@@ -2185,25 +2653,103 @@ function Send-AuditAlertNotification {
     }
 }
 
+# ------------------------------------------------------------------------------
+# Classificadores das saidas do Firebird (funcoes puras, cobertas pelo Pester).
+# Regra de ouro: "nao consegui verificar" NUNCA vira "banco integro".
+# ------------------------------------------------------------------------------
+function Test-FirebirdAccessProblem {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    return ($Text -match 'user name and password|password are not defined|Unable to complete network request|connection rejected|unavailable database|no permission for|Access is denied|Acesso negado|login|cannot attach|lock time-out')
+}
+
+function Get-GstatHeaderInfo {
+    param([string]$Output)
+    $info = [PSCustomObject]@{ Ok = $false; Oldest = [long]0; Next = [long]0; Gap = [long]0; Reason = "" }
+    $mOld = [regex]::Match("$Output", 'Oldest transaction\s+(\d+)')
+    $mNext = [regex]::Match("$Output", 'Next transaction\s+(\d+)')
+    if ($mOld.Success -and $mNext.Success) {
+        $info.Ok = $true
+        $info.Oldest = [long]$mOld.Groups[1].Value
+        $info.Next = [long]$mNext.Groups[1].Value
+        $info.Gap = $info.Next - $info.Oldest
+    } else {
+        $trecho = "$Output".Trim()
+        if ($trecho.Length -gt 300) { $trecho = $trecho.Substring(0, 300) }
+        $info.Reason = "gstat -h nao retornou o cabecalho do banco (saida: '$trecho')."
+    }
+    return $info
+}
+
+# Resultado da restauracao de teste (gbak -rep) na sandbox.
+#  OK             : codigo 0, FDB criado e sem "ERROR" na saida
+#  INCONCLUSIVO   : o Firebird recusou acesso (senha, servico, permissao)
+#  NAO_RESTAURAVEL: qualquer outra falha -> o arquivo de backup nao serve para desastre
+function Get-RestoreVerdict {
+    param($ExitCode, [bool]$FdbExists, [long]$FdbSize, [string]$Output)
+    $temErro = ("$Output" -match '(?im)^\s*gbak:\s*ERROR|ERROR:')
+    if ($ExitCode -eq 0 -and $FdbExists -and $FdbSize -gt 0 -and -not $temErro) {
+        return [PSCustomObject]@{ Verdict = "OK"; Reason = "Restauracao de teste concluida." }
+    }
+    if (Test-FirebirdAccessProblem $Output) {
+        return [PSCustomObject]@{ Verdict = "INCONCLUSIVO"; Reason = "O Firebird recusou a restauracao de teste por acesso/credencial (codigo $ExitCode)." }
+    }
+    return [PSCustomObject]@{ Verdict = "NAO_RESTAURAVEL"; Reason = "O backup mais recente NAO restaurou (gbak codigo $ExitCode, FDB criado: $FdbExists)." }
+}
+
+# Resultado da validacao gfix -v -full no banco restaurado.
+function Get-GfixVerdict {
+    param($ExitCode, [string]$Output)
+    $rec = 0; $pag = 0
+    $mRec = [regex]::Match("$Output", 'Number of record level errors\s*:\s*(\d+)')
+    $mPag = [regex]::Match("$Output", 'Number of database page errors\s*:\s*(\d+)')
+    if ($mRec.Success) { $rec = [int]$mRec.Groups[1].Value }
+    if ($mPag.Success) { $pag = [int]$mPag.Groups[1].Value }
+    $corrupcao = ("$Output" -match 'checksum error|wrong page type|corrupt')
+    if ($corrupcao -and $pag -eq 0) { $pag = 1 }
+
+    if ($rec -gt 0 -or $pag -gt 0) {
+        return [PSCustomObject]@{ Verdict = "CORROMPIDO"; RecordErrors = $rec; PageErrors = $pag; Reason = "gfix encontrou $rec erro(s) de registro e $pag erro(s) de pagina." }
+    }
+    if (($mRec.Success -or $mPag.Success) -and $ExitCode -eq 0) {
+        return [PSCustomObject]@{ Verdict = "OK"; RecordErrors = 0; PageErrors = 0; Reason = "gfix sem erros." }
+    }
+    # Firebird 2.5 nao imprime nada quando a validacao passa limpa.
+    $semTextoDeErro = -not ("$Output" -match '(?i)error|failed|unable|denied|negado|falha|not found|nao encontrado')
+    if ($ExitCode -eq 0 -and $semTextoDeErro) {
+        return [PSCustomObject]@{ Verdict = "OK"; RecordErrors = 0; PageErrors = 0; Reason = "gfix sem erros." }
+    }
+    if (Test-FirebirdAccessProblem $Output) {
+        return [PSCustomObject]@{ Verdict = "INCONCLUSIVO"; RecordErrors = 0; PageErrors = 0; Reason = "gfix nao conseguiu acessar o banco restaurado (codigo $ExitCode)." }
+    }
+    return [PSCustomObject]@{ Verdict = "INCONCLUSIVO"; RecordErrors = 0; PageErrors = 0; Reason = "gfix terminou com codigo $ExitCode sem relatorio de validacao." }
+}
+
+# Le o cabecalho do banco ativo (gstat -h). Isolado em funcao para os testes.
+function Invoke-GstatHeader {
+    param([string]$GstatExe, [string]$DbPath, [hashtable]$Environment = @{})
+    $saved = @{}
+    foreach ($k in $Environment.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k, "Process"); [Environment]::SetEnvironmentVariable($k, [string]$Environment[$k], "Process") }
+    try { return (& "$GstatExe" -h "$DbPath" 2>&1 | Out-String) }
+    catch { return "$_" }
+    finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], "Process") } }
+}
+
 function Invoke-DatabaseHealthAudit {
     param (
-        [string]$TaskName,
-        [switch]$Force
+        [string]$TaskName
     )
-    
+    $script:LastAuditVerdict = "INCONCLUSIVO"
+
     Log-Message "--------------------------------------------------------------------------------"
     Log-Message "[AUDITORIA DE SAUDE] Iniciando diagnostico preventivo de integridade do Sismotel..."
-    
-    if ($null -eq $global:configData) {
-        if (Test-Path $configFile) {
-            try { $global:configData = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
-        }
-    }
+
+    if ($null -eq $global:configData) { $global:configData = Read-ConfigData }
     if ($null -eq $global:configData) {
         Log-Message "[AUDITORIA ERRO] Arquivo config.json nao pode ser carregado."
-        return
+        return $script:LastAuditVerdict
     }
-    
+
     $pref = $global:configData.Preferences
     $task = $global:configData.Tasks | Where-Object { $_.TaskName -eq $TaskName } | Select-Object -First 1
     if ($null -eq $task) {
@@ -2211,247 +2757,652 @@ function Invoke-DatabaseHealthAudit {
     }
     if ($null -eq $task) {
         Log-Message "[AUDITORIA ERRO] Nenhuma tarefa encontrada para auditoria."
-        return
+        return $script:LastAuditVerdict
     }
-    
+
     $clientName = if (-not [string]::IsNullOrWhiteSpace($pref.ClientName)) { $pref.ClientName } else { "CLIENTE SISMOTEL" }
     $anyDeskId = if (-not [string]::IsNullOrWhiteSpace($pref.AnyDeskId)) { $pref.AnyDeskId } else { "N&atilde;o configurado" }
     $teamViewerId = if (-not [string]::IsNullOrWhiteSpace($pref.TeamViewerId)) { $pref.TeamViewerId } else { "N&atilde;o configurado" }
     $gapThreshold = if ($null -ne $pref.AuditGapWarningThreshold -and $pref.AuditGapWarningThreshold -gt 0) { [int]$pref.AuditGapWarningThreshold } else { 200000 }
-    
-    # 1. Ferramentas Firebird
-    $gbakExe = $task.GbakPath
-    if (-not (Test-Path $gbakExe)) {
-        $autoGbak = "C:\Program Files\Firebird\Firebird_2_5\bin\gbak.exe"
-        if (Test-Path $autoGbak) { $gbakExe = $autoGbak }
-        else {
-            $autoGbak86 = "C:\Program Files (x86)\Firebird\Firebird_2_5\bin\gbak.exe"
-            if (Test-Path $autoGbak86) { $gbakExe = $autoGbak86 }
-        }
-    }
-    $fbBinDir = Split-Path -Parent $gbakExe
-    $gfixExe = Join-Path $fbBinDir "gfix.exe"
-    $gstatExe = Join-Path $fbBinDir "gstat.exe"
-    
-    if (-not (Test-Path $gstatExe)) {
-        Log-Message "[AUDITORIA ERRO] gstat.exe nao localizado em: $fbBinDir"
-        return
-    }
-    
-    # 2. ETAPA 1: DIAGNOSTICO DE CABECALHO E TRANSACAO NO BANCO ATIVO (gstat -h, Zero Locks, 0.05s)
-    $liveDb = $task.DatabasePath
-    if (-not (Test-Path $liveDb)) {
-        if ($liveDb -like "C:\*" -and (Test-Path ("D:" + $liveDb.Substring(2)))) { $liveDb = "D:" + $liveDb.Substring(2) }
-        elseif ($liveDb -like "D:\*" -and (Test-Path ("C:" + $liveDb.Substring(2)))) { $liveDb = "C:" + $liveDb.Substring(2) }
-    }
-    
-    Log-Message "[AUDITORIA] 1/4 - Analisando transacoes ativas via gstat -h (Zero Locks, 100% online)..."
-    $gstatOut = & "$gstatExe" -h "$liveDb" 2>&1 | Out-String
-    
-    $oldestTrans = 0
-    $nextTrans = 0
-    if ($gstatOut -match 'Oldest transaction\s+(\d+)') { $oldestTrans = [long]$matches[1] }
-    if ($gstatOut -match 'Next transaction\s+(\d+)') { $nextTrans = [long]$matches[1] }
-    
-    $transGap = $nextTrans - $oldestTrans
-    $isGapAlert = ($transGap -ge $gapThreshold)
-    $is32BitAlert = ($nextTrans -ge 1500000000)
-    
-    Log-Message "[AUDITORIA] Metricas de Transacao: Oldest=$oldestTrans | Next=$nextTrans | Transaction Gap=$transGap (Alerta: $gapThreshold)"
-    if ($isGapAlert) {
-        Log-Message "[AUDITORIA ALERTA] Transaction Gap elevado ($transGap)! Acumulo de transacoes sem commit detectado."
-    }
-    if ($is32BitAlert) {
-        Log-Message "[AUDITORIA CRITICO] Next Transaction proximo ao limite de 32 bits ($nextTrans)! Executar fixtranslimit."
-    }
-    
-    # 3. ETAPA 2: LOCALIZA ULTIMO BACKUP PARA RESTAURACAO EM SANDBOX
-    Log-Message "[AUDITORIA] 2/4 - Localizando ultimo arquivo de backup valido para teste fisico..."
-    $searchDirs = @()
-    if ($null -ne $task.Destinations) {
-        foreach ($d in $task.Destinations) {
-            if (-not [string]::IsNullOrWhiteSpace($d) -and -not $d.StartsWith("\\") -and (Test-Path $d)) {
-                $searchDirs += $d
-            }
-        }
-    }
-    if (Test-Path "D:\BKP_SISMOTEL") { $searchDirs += "D:\BKP_SISMOTEL" }
-    if (Test-Path "C:\BKP_SISMOTEL") { $searchDirs += "C:\BKP_SISMOTEL" }
-    $searchDirs = $searchDirs | Select-Object -Unique
-    
-    $latestGz = $null
-    foreach ($sd in $searchDirs) {
-        $zips = Get-ChildItem -Path $sd -Filter "*.GZ" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
-        if ($zips.Count -gt 0) {
-            $latestGz = $zips[0]
-            break
-        }
-    }
-    
-    if ($null -eq $latestGz) {
-        Log-Message "[AUDITORIA AVISO] Nenhum arquivo .GZ de backup localizado para teste fisico. Validacao fisica ignorada."
-        Update-ConfigAuditDate -NewDate (Get-Date -Format "yyyy-MM-dd")
-        return
-    }
-    
-    Log-Message "[AUDITORIA] Arquivo de backup selecionado: $($latestGz.FullName) ($([math]::Round($latestGz.Length / 1MB, 2)) MB)"
-    
-    # 4. ETAPA 3: SELECAO INTELIGENTE DO DISCO SANDBOX (C:, D: ou E:)
-    $dbSizeMB = 0
-    try {
-        $dbSizeMB = [math]::Round(((Get-Item $liveDb -ErrorAction Stop).Length / 1MB), 2)
-    } catch {
-        Log-Message "[AUDITORIA AVISO] Nao foi possivel obter tamanho do banco ($liveDb): $_. Usando estimativa do GZ."
-        $dbSizeMB = [math]::Round(($latestGz.Length / 1MB) * 1.3, 2)
-    }
-    $sandboxInfo = Get-OptimalSandboxDir -DbPath $liveDb -DbSizeMB $dbSizeMB -ConfiguredDestinations $task.Destinations
-    
-    if ($sandboxInfo.Status -eq "INSUFFICIENT_SPACE") {
-        Log-Message "[AUDITORIA AVISO] Espaco em disco insuficiente para criacao da sandbox (Minimo: $($sandboxInfo.RequiredMB) MB). Restauracao fisica ignorada para proteger o servidor."
-        Update-ConfigAuditDate -NewDate (Get-Date -Format "yyyy-MM-dd")
-        return
-    }
-    
-    $sandboxDir = $sandboxInfo.Path
-    Log-Message "[AUDITORIA] 3/4 - Ambiente Sandbox Isolado: $($sandboxInfo.Drive) | Caminho: $sandboxDir | Espaco Livre: $($sandboxInfo.FreeMB) MB"
-    
-    if (-not (Test-Path $sandboxDir)) {
-        New-Item -ItemType Directory -Path $sandboxDir -Force | Out-Null
-    } else {
-        Get-ChildItem -Path $sandboxDir -Filter "audit_sandbox*.fdb" | ForEach-Object {
-            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
-        }
-    }
-    
-    $sandboxDbPath = Join-Path $sandboxDir "audit_sandbox_$(Get-Date -Format 'yyyyMMdd_HHmmss').fdb"
-    $extractedFbkPath = $null
+
+    $verdict = "OK"
+    $motivos = @()
     $recordErrors = 0
     $pageErrors = 0
     $gfixLog = ""
-    $auditSuccess = $false
-    $auditException = $false
-    
+    $oldestTrans = 0
+    $nextTrans = 0
+    $transGap = 0
+
+    # 1. Ferramentas Firebird
+    $gbakExe = "$($task.GbakPath)"
+    if ([string]::IsNullOrWhiteSpace($gbakExe) -or -not (Test-Path $gbakExe)) {
+        foreach ($cand in @("C:\Program Files\Firebird\Firebird_2_5\bin\gbak.exe", "C:\Program Files (x86)\Firebird\Firebird_2_5\bin\gbak.exe")) {
+            if (Test-Path $cand) { $gbakExe = $cand; break }
+        }
+    }
+    $fbBinDir = if (-not [string]::IsNullOrWhiteSpace($gbakExe)) { Split-Path -Parent $gbakExe } else { "" }
+    $gfixExe = Join-Path $fbBinDir "gfix.exe"
+    $gstatExe = Join-Path $fbBinDir "gstat.exe"
+
+    $dbUser = if (-not [string]::IsNullOrWhiteSpace($task.DbUser)) { $task.DbUser } else { "SYSDBA" }
+    $dbPassRaw = if (-not [string]::IsNullOrWhiteSpace($task.DbPassword)) { $task.DbPassword } else { "masterkey" }
+    $dbPass = Unprotect-String $dbPassRaw
+    $fbEnv = Get-FirebirdEnvironment -User $dbUser -Password $dbPass
+
+    $liveDb = "$($task.DatabasePath)"
+    if (-not [string]::IsNullOrWhiteSpace($liveDb) -and -not (Test-Path $liveDb)) {
+        if ($liveDb -like "C:\*" -and (Test-Path ("D:" + $liveDb.Substring(2)))) { $liveDb = "D:" + $liveDb.Substring(2) }
+        elseif ($liveDb -like "D:\*" -and (Test-Path ("C:" + $liveDb.Substring(2)))) { $liveDb = "C:" + $liveDb.Substring(2) }
+    }
+
+    $sandboxDir = $null
+    $sandboxDbPath = $null
+    $extractedFbkPath = $null
+    $zip = $null
+
     try {
-        # Extrai FBK do GZ
+        if ($null -eq $dbPass) {
+            throw [System.InvalidOperationException]::new("A senha do banco (DbPassword) esta criptografada para outro computador e nao abre neste servidor.")
+        }
+        if ([string]::IsNullOrWhiteSpace($gbakExe) -or -not (Test-Path $gbakExe) -or -not (Test-Path $gfixExe) -or -not (Test-Path $gstatExe)) {
+            throw [System.InvalidOperationException]::new("Ferramentas do Firebird (gbak/gfix/gstat) nao localizadas em '$fbBinDir'.")
+        }
+
+        # 2. ETAPA 1: cabecalho e transacoes no banco ativo (gstat -h, leitura rapida)
+        Log-Message "[AUDITORIA] 1/4 - Analisando transacoes ativas via gstat -h (Zero Locks, 100% online)..."
+        $gstatOut = Invoke-GstatHeader -GstatExe $gstatExe -DbPath $liveDb -Environment $fbEnv
+        $hdr = Get-GstatHeaderInfo -Output $gstatOut
+        if ($hdr.Ok) {
+            $oldestTrans = $hdr.Oldest; $nextTrans = $hdr.Next; $transGap = $hdr.Gap
+            Log-Message "[AUDITORIA] Metricas de Transacao: Oldest=$oldestTrans | Next=$nextTrans | Transaction Gap=$transGap (Alerta: $gapThreshold)"
+            if ($transGap -ge $gapThreshold) {
+                Log-Message "[AUDITORIA ALERTA] Transaction Gap elevado ($transGap)! Acumulo de transacoes sem commit detectado."
+            }
+            if ($nextTrans -ge 1500000000) {
+                Log-Message "[AUDITORIA CRITICO] Next Transaction proximo ao limite de 32 bits ($nextTrans)! Executar fixtranslimit."
+                $verdict = "LIMITE_TRANSACOES"
+                $motivos += "O contador de transacoes ($nextTrans) esta perto do limite de 32 bits do Firebird 2.5. Ao atingir o limite o banco para de aceitar gravacoes."
+            }
+        } else {
+            Log-Message "[AUDITORIA AVISO] $($hdr.Reason)"
+            $motivos += $hdr.Reason
+            $verdict = "INCONCLUSIVO"
+        }
+
+        # 3. ETAPA 2: ultimo backup local para restauracao de teste
+        Log-Message "[AUDITORIA] 2/4 - Localizando ultimo arquivo de backup valido para teste fisico..."
+        $searchDirs = @()
+        if ($null -ne $task.Destinations) {
+            foreach ($d in $task.Destinations) {
+                if (-not [string]::IsNullOrWhiteSpace($d) -and -not $d.StartsWith("\\") -and (Test-Path $d)) { $searchDirs += $d }
+            }
+        }
+        foreach ($d in @("D:\BKP_SISMOTEL", "C:\BKP_SISMOTEL")) { if (Test-Path $d) { $searchDirs += $d } }
+        $searchDirs = @($searchDirs | Select-Object -Unique)
+
+        $latestGz = $null
+        foreach ($sd in $searchDirs) {
+            $zips = @(Get-ChildItem -Path $sd -Filter "*.GZ" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+            if ($zips.Count -gt 0 -and ($null -eq $latestGz -or $zips[0].LastWriteTime -gt $latestGz.LastWriteTime)) { $latestGz = $zips[0] }
+        }
+        if ($null -eq $latestGz) {
+            throw [System.InvalidOperationException]::new("Nenhum arquivo .GZ de backup local foi encontrado para o teste de restauracao.")
+        }
+        Log-Message "[AUDITORIA] Arquivo de backup selecionado: $($latestGz.FullName) ($([math]::Round($latestGz.Length / 1MB, 2)) MB)"
+
+        # 4. ETAPA 3: disco da sandbox
+        $dbSizeMB = 0
+        try { $dbSizeMB = [math]::Round(((Get-Item $liveDb -ErrorAction Stop).Length / 1MB), 2) }
+        catch { $dbSizeMB = [math]::Round(($latestGz.Length / 1MB) * 1.3, 2) }
+        $sandboxInfo = Get-OptimalSandboxDir -DbPath $liveDb -DbSizeMB $dbSizeMB -ConfiguredDestinations $task.Destinations
+        if ($sandboxInfo.Status -eq "INSUFFICIENT_SPACE") {
+            throw [System.InvalidOperationException]::new("Espaco em disco insuficiente para a sandbox (minimo $($sandboxInfo.RequiredMB) MB). O teste de restauracao nao foi feito.")
+        }
+        $sandboxDir = $sandboxInfo.Path
+        Log-Message "[AUDITORIA] 3/4 - Ambiente Sandbox Isolado: $($sandboxInfo.Drive) | Caminho: $sandboxDir | Espaco Livre: $($sandboxInfo.FreeMB) MB"
+        if (Test-Path $sandboxDir) {
+            Get-ChildItem -Path $sandboxDir -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+        } else {
+            New-Item -ItemType Directory -Path $sandboxDir -Force | Out-Null
+        }
+        $sandboxDbPath = Join-Path $sandboxDir "audit_sandbox_$(Get-Date -Format 'yyyyMMdd_HHmmss').fdb"
+
+        # Extrai o FBK
         Log-Message "[AUDITORIA] Extraindo .FBK do backup para o sandbox..."
         try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue } catch {}
-        
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($latestGz.FullName)
-        $fbkEntry = $zip.Entries | Where-Object { $_.Name.EndsWith(".fbk", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
-        if ($null -eq $fbkEntry) {
-            throw "Arquivo .FBK nao encontrado dentro de $($latestGz.Name)"
+        try {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($latestGz.FullName)
+            $fbkEntry = $zip.Entries | Where-Object { $_.Name.EndsWith(".fbk", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+            if ($null -eq $fbkEntry) { throw "o arquivo .FBK nao existe dentro de $($latestGz.Name)" }
+            $extractedFbkPath = Join-Path $sandboxDir $fbkEntry.Name
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($fbkEntry, $extractedFbkPath, $true)
+        } catch {
+            # Arquivo de backup que nem abre e, por definicao, um backup inutilizavel
+            $verdict = "NAO_RESTAURAVEL"
+            $motivos += "O arquivo $($latestGz.Name) nao pode ser aberto/extraido: $($_.Exception.Message)"
+            throw
+        } finally {
+            if ($null -ne $zip) { try { $zip.Dispose() } catch {}; $zip = $null }
         }
-        
-        $extractedFbkPath = Join-Path $sandboxDir $fbkEntry.Name
-        if (Test-Path $extractedFbkPath) { Remove-Item $extractedFbkPath -Force -ErrorAction SilentlyContinue }
-        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($fbkEntry, $extractedFbkPath, $true)
-        $zip.Dispose()
-        $zip = $null
-        
-        Log-Message "[AUDITORIA] Arquivo FBK extraido ($([math]::Round((Get-Item $extractedFbkPath).Length / 1MB, 2)) MB). Iniciando restauracao de teste (gbak -c -v)..."
-        
-        if (Test-Path $sandboxDbPath) { Remove-Item $sandboxDbPath -Force -ErrorAction SilentlyContinue }
-        
-        $dbUser = if (-not [string]::IsNullOrWhiteSpace($task.DbUser)) { $task.DbUser } else { "SYSDBA" }
-        $dbPassRaw = if (-not [string]::IsNullOrWhiteSpace($task.DbPassword)) { $task.DbPassword } else { "masterkey" }
-        $dbPass = Unprotect-String $dbPassRaw
-        
-        $gbakErrLog = Join-Path $sandboxDir "gbak_restore_err.log"
-        $gbakArgs = @("-rep", "-v", "-user", $dbUser, "-password", $dbPass, "`"$extractedFbkPath`"", "`"$sandboxDbPath`"")
-        $procGbak = Start-ProcessThrottled -FilePath $gbakExe -ArgumentList $gbakArgs -StdErrFile $gbakErrLog -TimeoutSeconds 7200
-        
-        # Exclui o FBK extraido imediatamente para liberar espaco
-        if (Test-Path $extractedFbkPath) { Remove-Item $extractedFbkPath -Force -ErrorAction SilentlyContinue; $extractedFbkPath = $null }
-        
-        if (-not (Test-Path $sandboxDbPath)) {
-            $restoreErr = if (Test-Path $gbakErrLog) { Get-Content $gbakErrLog -Raw } else { "ExitCode $($procGbak.ExitCode)" }
-            throw "Falha ao restaurar banco na sandbox: $restoreErr"
+        Log-Message "[AUDITORIA] Arquivo FBK extraido ($([math]::Round((Get-Item $extractedFbkPath).Length / 1MB, 2)) MB). Iniciando restauracao de teste (gbak -rep)..."
+
+        # Restauracao de teste
+        $gbakArgs = @("-rep", "-v", "`"$extractedFbkPath`"", "`"$sandboxDbPath`"")
+        $rGbak = Invoke-ExternalTool -FilePath $gbakExe -Arguments ($gbakArgs -join " ") -Environment $fbEnv -TimeoutMs 7200000
+        $saidaGbak = @("$($rGbak.StdOut)" -split "`r?`n")
+        $restoreText = "$($rGbak.StdErr)`n" + (($saidaGbak | Select-Object -Last 40) -join "`n")
+        if ($rGbak.TimedOut) { $restoreText += "`nRestauracao de teste excedeu 2 horas e foi interrompida." }
+        Remove-Item $extractedFbkPath -Force -ErrorAction SilentlyContinue; $extractedFbkPath = $null
+
+        $fdbExists = Test-Path $sandboxDbPath
+        $fdbSize = if ($fdbExists) { (Get-Item $sandboxDbPath).Length } else { 0 }
+        $rv = Get-RestoreVerdict -ExitCode $rGbak.ExitCode -FdbExists $fdbExists -FdbSize $fdbSize -Output $restoreText
+        if ($rv.Verdict -ne "OK") {
+            $gfixLog = $restoreText
+            if ($rv.Verdict -eq "NAO_RESTAURAVEL") { $verdict = "NAO_RESTAURAVEL" } elseif ($verdict -eq "OK") { $verdict = "INCONCLUSIVO" }
+            $motivos += $rv.Reason
+            Log-Message "[AUDITORIA FALHA] $($rv.Reason)"
+        } else {
+            Log-Message "[AUDITORIA] Banco restaurado na sandbox com sucesso ($([math]::Round($fdbSize / 1MB, 2)) MB). Arquivo de backup 100% legivel!"
+
+            # 5. ETAPA 4: validacao profunda (gfix -v -full -no_update)
+            Log-Message "[AUDITORIA] 4/4 - Executando gfix -v -full -no_update no banco de sandbox isolado..."
+            $rGfix = Invoke-ExternalTool -FilePath $gfixExe -Arguments "-v -full -no_update `"$sandboxDbPath`"" -Environment $fbEnv -TimeoutMs 3600000
+            $gfixLog = "$($rGfix.StdErr)$($rGfix.StdOut)"
+            if ($rGfix.TimedOut) { $gfixLog += "`nValidacao gfix excedeu 1 hora e foi interrompida." }
+
+            $gv = Get-GfixVerdict -ExitCode $rGfix.ExitCode -Output $gfixLog
+            $recordErrors = $gv.RecordErrors
+            $pageErrors = $gv.PageErrors
+            Log-Message "[AUDITORIA] Resultado da Verificacao Fisica: Record Errors = $recordErrors | Page Errors = $pageErrors ($($gv.Reason))"
+            if ($gv.Verdict -eq "CORROMPIDO") {
+                $verdict = "CORROMPIDO"; $motivos += $gv.Reason
+            } elseif ($gv.Verdict -eq "INCONCLUSIVO") {
+                if ($verdict -eq "OK") { $verdict = "INCONCLUSIVO" }
+                $motivos += $gv.Reason
+            }
         }
-        if ($procGbak.ExitCode -ne 0) {
-            Log-Message "[AUDITORIA AVISO] gbak retornou codigo $($procGbak.ExitCode) (possiveis alertas menores), mas o arquivo FDB foi recriado com sucesso."
-        }
-        
-        Log-Message "[AUDITORIA] Banco restaurado na sandbox com sucesso ($([math]::Round((Get-Item $sandboxDbPath).Length / 1MB, 2)) MB). Arquivo de backup 100% legivel!"
-        
-        # 5. ETAPA 4: VALIDACAO PROFUNDA VIA GFIX (-v -full -no_update)
-        Log-Message "[AUDITORIA] 4/4 - Executando gfix -v -full -no_update no banco de sandbox isolado..."
-        $gfixArgs = @("-v", "-full", "-no_update", "-user", $dbUser, "-password", $dbPass, "`"$sandboxDbPath`"")
-        
-        $gfixErrFile = Join-Path $sandboxDir "gfix_validation.log"
-        $gfixOutFile = Join-Path $sandboxDir "gfix_out.log"
-        $procGfix = Start-ProcessThrottled -FilePath $gfixExe -ArgumentList $gfixArgs -StdErrFile $gfixErrFile -StdOutFile $gfixOutFile -TimeoutSeconds 3600
-        
-        $gfixLog = ""
-        if (Test-Path $gfixErrFile) { $gfixLog += Get-Content $gfixErrFile -Raw }
-        if (Test-Path $gfixOutFile) { $gfixLog += Get-Content $gfixOutFile -Raw }
-        
-        # Extrai contagem de erros
-        if ($gfixLog -match 'Number of record level errors\s*:\s*(\d+)') {
-            $recordErrors = [int]$matches[1]
-        }
-        if ($gfixLog -match 'Number of database page errors\s*:\s*(\d+)') {
-            $pageErrors = [int]$matches[1]
-        }
-        
-        $hasCorruptionKeywords = ($gfixLog -match 'checksum error' -or $gfixLog -match 'wrong page type' -or $gfixLog -match 'corrupt')
-        if ($hasCorruptionKeywords -and $pageErrors -eq 0) {
-            $pageErrors = 1
-        }
-        
-        Log-Message "[AUDITORIA] Resultado da Verificacao Fisica: Record Errors = $recordErrors | Page Errors = $pageErrors"
-        # Politica MEC: Notifica somente se houver corrupcao fisica real (Record Errors > 0 ou Page Errors > 0).
-        # Metricas de transacao (Gap/Next) sao medidas e reportadas caso haja erro fisico, mas nao disparam email sozinhas.
-        $auditSuccess = ($recordErrors -eq 0 -and $pageErrors -eq 0)
-        
     } catch {
-        Log-Message "[AUDITORIA ERRO] Excecao durante auditoria em sandbox: $_"
-        $auditException = $true
-        $recordErrors = 0
-        $pageErrors = 0
-        $gfixLog = "Excecao no processo de auditoria: $_"
+        $msg = if ($_.Exception) { $_.Exception.Message } else { "$_" }
+        Log-Message "[AUDITORIA ERRO] $msg"
+        if ($verdict -eq "OK") { $verdict = "INCONCLUSIVO" }
+        if (-not ($motivos | Where-Object { "$_".Contains($msg) })) { $motivos += $msg }
+        if ([string]::IsNullOrWhiteSpace($gfixLog)) { $gfixLog = $msg }
     } finally {
         # 6. LIMPEZA COMPLETA E GARANTIDA DO AMBIENTE SANDBOX
-        Log-Message "[AUDITORIA] Limpando ambiente sandbox temporario..."
         if ($null -ne $zip) { try { $zip.Dispose() } catch {} }
-        if ($null -ne $extractedFbkPath -and (Test-Path $extractedFbkPath)) {
-            Remove-Item $extractedFbkPath -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path $sandboxDbPath) {
-            Remove-Item $sandboxDbPath -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path $sandboxDir) {
+        if (-not [string]::IsNullOrWhiteSpace($sandboxDir) -and (Split-Path $sandboxDir -Leaf) -eq "_temp_audit" -and (Test-Path $sandboxDir)) {
+            Log-Message "[AUDITORIA] Limpando ambiente sandbox temporario..."
             Remove-Item $sandboxDir -Recurse -Force -ErrorAction SilentlyContinue
+            Log-Message "[AUDITORIA] Limpeza da sandbox concluida."
         }
-        Log-Message "[AUDITORIA] Limpeza da sandbox concluida com 0 bytes residuais em disco."
     }
-    
-    # 7. REGISTRO E DISPARO DE NOTIFICACAO (POLITICA ZERO SPAM)
-    Update-ConfigAuditDate -NewDate (Get-Date -Format "yyyy-MM-dd")
-    
-    if ($auditException) {
-        Log-Message "[AUDITORIA AVISO] O processo falhou e nao pode ser concluido. Notificacao de corrupcao ignorada para nao gerar alarme falso."
-    } elseif ($auditSuccess) {
-        if ($isGapAlert) {
-            Log-Message "[AUDITORIA 100% SUCESSO] Banco de dados Sismotel FISICAMENTE INTEGRO! 0 erros de registro, 0 erros de paginas. Transaction Gap em $transGap (notificacao de e-mail silenciada)."
-        } else {
-            Log-Message "[AUDITORIA 100% SUCESSO] Banco de dados Sismotel FISICAMENTE INTEGRO! 0 erros de registro, 0 erros de paginas, Transaction Gap normal ($transGap)."
-        }
+
+    # 7. REGISTRO E NOTIFICACAO (Zero Spam, mas nunca silencio diante de risco real)
+    $script:LastAuditVerdict = $verdict
+    $auditState = Get-AuditState
+    $auditState.LastAuditDate = (Get-Date -Format "yyyy-MM-dd")
+    $auditState.LastResult = $verdict
+    $diagnostico = ($motivos | Select-Object -Unique) -join " "
+
+    $headline = $null
+    if ($verdict -eq "OK") {
+        $auditState.ConsecutiveInconclusive = 0
+        $gapTxt = if ($transGap -ge $gapThreshold) { "Transaction Gap em $transGap (notificacao de e-mail silenciada)." } else { "Transaction Gap normal ($transGap)." }
+        Log-Message "[AUDITORIA 100% SUCESSO] Backup restaurado e banco FISICAMENTE INTEGRO! 0 erros de registro, 0 erros de paginas. $gapTxt"
         Log-Message "[AUDITORIA ZERO SPAM] Operacao 100% silenciosa no e-mail conforme politica corporativa."
+    } elseif ($verdict -eq "INCONCLUSIVO") {
+        $auditState.ConsecutiveInconclusive = [int]$auditState.ConsecutiveInconclusive + 1
+        Log-Message "[AUDITORIA INCONCLUSIVA] A integridade NAO foi comprovada hoje ($($auditState.ConsecutiveInconclusive) dia(s) seguido(s)). Motivo: $diagnostico"
+        # Falha persistente (2 auditorias seguidas) avisa; um soluco isolado nao.
+        if ($auditState.ConsecutiveInconclusive -ge 2 -and -not (Test-WithinCooldown -Timestamp $auditState.LastInconclusiveAlert -Hours 20)) {
+            $headline = "AUDITORIA NAO CONSEGUE VALIDAR O BANCO"
+        }
     } else {
-        Log-Message "[AUDITORIA ALERTA CRITICO] Corrupcao fisica detectada no Firebird! Record Errors: $recordErrors | Page Errors: $pageErrors. Disparando notificacao de emergencia para equipe tecnica..."
-        Send-AuditAlertNotification -ClientName $clientName -AnyDeskId $anyDeskId -TeamViewerId $teamViewerId -DbPath $liveDb -RecordErrors $recordErrors -PageErrors $pageErrors -TransactionGap $transGap -NextTransaction $nextTrans -AuditLogSnippet $gfixLog
+        $auditState.ConsecutiveInconclusive = 0
+        $headline = switch ($verdict) {
+            "NAO_RESTAURAVEL"   { "BACKUP NAO RESTAURAVEL" }
+            "CORROMPIDO"        { "CORRUPCAO FISICA DETECTADA NO FIREBIRD" }
+            "LIMITE_TRANSACOES" { "LIMITE DE TRANSACOES DO FIREBIRD PROXIMO" }
+            default             { "ANOMALIA DETECTADA NO FIREBIRD" }
+        }
+        Log-Message "[AUDITORIA ALERTA CRITICO] $headline. $diagnostico Disparando notificacao para a equipe tecnica..."
     }
+
+    if ($null -ne $headline) {
+        $global:mailSent = $false
+        Send-AuditAlertNotification -ClientName $clientName -AnyDeskId $anyDeskId -TeamViewerId $teamViewerId -DbPath $liveDb -RecordErrors $recordErrors -PageErrors $pageErrors -TransactionGap $transGap -NextTransaction $nextTrans -AuditLogSnippet $gfixLog -Headline $headline -Diagnosis $diagnostico
+        if ($verdict -eq "INCONCLUSIVO" -and $global:mailSent) {
+            $auditState.LastInconclusiveAlert = (Get-Date).ToString("o")
+        }
+    }
+    Save-AuditState -State $auditState
     Log-Message "--------------------------------------------------------------------------------"
+    return $verdict
 }
 
-# INTERCEPTADOR: EXECUCAO DE AUDITORIA SOB DEMANDA (-RunAuditOnly)
+# ==============================================================================
+# CAMADA OFICIAL DE AUTO-UPDATE EM NUVEM (MEC LIVEUPDATE VIA GITHUB)
+# ==============================================================================
+# ------------------------------------------------------------------------------
+# Seguranca do LiveUpdate: o manifesto (version.json) precisa estar ASSINADO com a
+# chave privada da MEC (RSA/SHA-256). O servidor so conhece a chave PUBLICA
+# (liveupdate_pubkey.xml, instalada junto com o sistema). Assim, mesmo que o
+# repositorio publico seja comprometido, ninguem consegue fazer os servidores dos
+# clientes executarem um instalador falso como SYSTEM.
+# Ferramentas: tools\liveupdate_gerar_chaves.ps1 e tools\liveupdate_assinar_release.ps1
+# ------------------------------------------------------------------------------
+function Get-LiveUpdatePayload {
+    param($Manifest)
+    $setupSha = "$($Manifest.setupSha256)".Trim().ToUpperInvariant()
+    $engineSha = "$($Manifest.engineSha256)".Trim().ToUpperInvariant()
+    return "MECSHIELD-LIVEUPDATE|v1|$("$($Manifest.version)".Trim())|$setupSha|$engineSha"
+}
+
+function Test-LiveUpdateSignature {
+    param([string]$PublicKeyXml, [string]$Payload, [string]$SignatureBase64)
+    if ([string]::IsNullOrWhiteSpace($PublicKeyXml) -or [string]::IsNullOrWhiteSpace($SignatureBase64)) { return $false }
+    try {
+        $data = [System.Text.Encoding]::UTF8.GetBytes($Payload)
+        $sig = [Convert]::FromBase64String($SignatureBase64.Trim())
+        try {
+            $rsa = [System.Security.Cryptography.RSA]::Create()
+            $rsa.FromXmlString($PublicKeyXml)
+            return [bool]$rsa.VerifyData($data, $sig, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        } catch {
+            # .NET Framework sem a API moderna (HashAlgorithmName/RSASignaturePadding)
+            $csp = New-Object System.Security.Cryptography.RSACryptoServiceProvider
+            $csp.PersistKeyInCsp = $false
+            $csp.FromXmlString($PublicKeyXml)
+            return [bool]$csp.VerifyData($data, "SHA256", $sig)
+        }
+    } catch {
+        return $false
+    }
+}
+
+# Decide se deve tentar atualizar. Nunca repete a MESMA versao remota em menos de
+# 24h: se algo impedir o motor de reconhecer a nova versao, o servidor nao fica
+# reinstalando o pacote a cada rotina (causa da reinstalacao silenciosa em loop).
+function Test-LiveUpdateAttemptAllowed {
+    param($State, [string]$RemoteVersion, [switch]$Force)
+    if ($Force) { return $true }
+    if ("$($State.LastUpdateAttemptVersion)" -ne $RemoteVersion) { return $true }
+    return -not (Test-WithinCooldown -Timestamp $State.LastUpdateAttemptAt -Hours 24)
+}
+
+function Invoke-MecLiveUpdate {
+    param (
+        [switch]$Force = $false
+    )
+
+    $engineVersion = $script:EngineVersion
+    $webClient = $null
+
+    try {
+        if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
+            $global:configData = Read-ConfigData
+        }
+        $pref = if ($null -ne $global:configData) { $global:configData.Preferences } else { $null }
+
+        $enableAutoUpdate = if ($null -ne $pref -and $null -ne $pref.AutoUpdateEnabled) { [bool]$pref.AutoUpdateEnabled } else { $true }
+        if (-not $enableAutoUpdate -and -not $Force) {
+            Log-Message "[LIVEUPDATE] Auto-Update desativado nas preferencias locais."
+            return
+        }
+
+        $updateUrl = if ($null -ne $pref -and -not [string]::IsNullOrWhiteSpace($pref.AutoUpdateUrl)) {
+            $pref.AutoUpdateUrl
+        } else {
+            "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/version.json"
+        }
+        if (-not $updateUrl.StartsWith("https://", [StringComparison]::OrdinalIgnoreCase)) {
+            Log-Message "[LIVEUPDATE BLOQUEADO] URL de atualizacao sem HTTPS ($updateUrl)."
+            return
+        }
+
+        $fibsStateFile = Join-Path $scriptDir "fibs_state.json"
+        $fibsState = $null
+        if (Test-Path $fibsStateFile) {
+            try { $fibsState = Get-Content $fibsStateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+        }
+        if ($null -eq $fibsState) {
+            $fibsState = [PSCustomObject]@{ WelcomeEmailSent = $false; LastUpdateCheck = "" }
+        }
+        # Garante as propriedades esperadas mesmo em arquivos gravados por versoes antigas
+        foreach ($prop in @("WelcomeEmailSent", "LastUpdateCheck", "LastUpdateAttemptVersion", "LastUpdateAttemptAt")) {
+            if ($null -eq $fibsState.PSObject.Properties[$prop]) {
+                $valor = if ($prop -eq "WelcomeEmailSent") { $false } else { "" }
+                $fibsState | Add-Member -NotePropertyName $prop -NotePropertyValue $valor -Force
+            }
+        }
+
+        $now = Get-Date
+        $lastCheckTime = [DateTime]::MinValue
+        if (-not [string]::IsNullOrWhiteSpace("$($fibsState.LastUpdateCheck)")) {
+            [DateTime]::TryParse("$($fibsState.LastUpdateCheck)", [ref]$lastCheckTime) | Out-Null
+        }
+
+        # Se ja verificou ha menos de 2 horas e nao e Force, aguarda o proximo ciclo
+        if (-not $Force -and ($lastCheckTime -gt [DateTime]::MinValue) -and (($now - $lastCheckTime).TotalHours -lt 2)) {
+            return
+        }
+
+        # Chave publica obrigatoria: sem ela nada e baixado nem executado.
+        $pubKeyFile = Join-Path $scriptDir "liveupdate_pubkey.xml"
+        if (-not (Test-Path $pubKeyFile)) {
+            Log-Message "[LIVEUPDATE BLOQUEADO] Chave publica de verificacao ausente ($pubKeyFile). Atualizacao automatica desativada ate a reinstalacao com a chave."
+            return
+        }
+        $pubKeyXml = Get-Content $pubKeyFile -Raw -Encoding UTF8
+
+        Log-Message "[LIVEUPDATE] Verificando atualizacoes online no canal oficial GitHub..."
+
+        # Garante suporte a TLS 1.2 para comunicacao segura com o GitHub
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        } catch {}
+        # Nunca herdar um "aceitar qualquer certificado" de outro trecho do processo
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+
+        $webClient = New-Object System.Net.WebClient
+        $webClient.Headers.Add("User-Agent", "MEC-Shield-LiveUpdate/$engineVersion")
+
+        # Le manifesto remoto (version.json)
+        $manifestJson = $webClient.DownloadString($updateUrl)
+        $manifest = $manifestJson | ConvertFrom-Json
+
+        try {
+            $fibsState.LastUpdateCheck = $now.ToString("yyyy-MM-dd HH:mm:ss")
+            Save-JsonState -Path $fibsStateFile -Data $fibsState -Depth 5
+        } catch {
+            Log-Message "[LIVEUPDATE AVISO] Nao foi possivel gravar a data da verificacao: $_. A atualizacao continua."
+        }
+
+        if ($null -eq $manifest -or [string]::IsNullOrWhiteSpace($manifest.version)) {
+            Log-Message "[LIVEUPDATE AVISO] Manifesto de versao invalido recebido do servidor."
+            return
+        }
+
+        $remoteVer = [System.Version]$manifest.version
+        $localVer = [System.Version]$engineVersion
+
+        $localExe = Join-Path $scriptDir "MEC_Shield.exe"
+        $exeVer = [System.Version]"0.0.0.0"
+        if (Test-Path $localExe) {
+            try {
+                $fvi = (Get-Item $localExe).VersionInfo.FileVersion
+                if (-not [string]::IsNullOrWhiteSpace($fvi)) { $exeVer = [System.Version]$fvi }
+            } catch {}
+        }
+
+        $remoteVer3 = [System.Version]"$($remoteVer.Major).$($remoteVer.Minor).$([Math]::Max(0, $remoteVer.Build))"
+        $exeVer3 = [System.Version]"$($exeVer.Major).$($exeVer.Minor).$([Math]::Max(0, $exeVer.Build))"
+        $exeNeedsUpdate = ($exeVer.Major -eq 0) -or ($exeVer3 -lt $remoteVer3)
+        $engineNeedsUpdate = ($remoteVer -gt $localVer)
+
+        if (-not $engineNeedsUpdate -and -not $exeNeedsUpdate -and -not $Force) {
+            Log-Message "[LIVEUPDATE] FIBS esta 100% atualizado (Motor: v$engineVersion, Interface: v$exeVer). Nenhuma acao necessaria."
+            return
+        }
+
+        # Assinatura do manifesto: sem assinatura valida, nada e baixado.
+        $payload = Get-LiveUpdatePayload -Manifest $manifest
+        if (-not (Test-LiveUpdateSignature -PublicKeyXml $pubKeyXml -Payload $payload -SignatureBase64 "$($manifest.signature)")) {
+            Log-Message "[LIVEUPDATE BLOQUEADO] O manifesto v$($manifest.version) NAO tem assinatura valida da MEC. Atualizacao recusada por seguranca."
+            return
+        }
+
+        if (-not (Test-LiveUpdateAttemptAllowed -State $fibsState -RemoteVersion "$($manifest.version)" -Force:$Force)) {
+            Log-Message "[LIVEUPDATE] A versao v$($manifest.version) ja foi aplicada/tentada nas ultimas 24h. Nova tentativa somente apos esse prazo."
+            return
+        }
+        $fibsState.LastUpdateAttemptVersion = "$($manifest.version)"
+        $fibsState.LastUpdateAttemptAt = (Get-Date).ToString("o")
+        try { Save-JsonState -Path $fibsStateFile -Data $fibsState -Depth 5 } catch {}
+
+        $statusDesc = if ($engineNeedsUpdate) { "Motor: v$engineVersion -> v$($manifest.version)" } else { "Interface defasada: v$exeVer -> v$($manifest.version)" }
+        Log-Message "[LIVEUPDATE] Atualizacao assinada detectada: v$($manifest.version) ($statusDesc). Baixando..."
+
+        # Prepara pasta temporaria isolada
+        $tempDir = Join-Path $scriptDir "temp"
+        if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
+
+        # 1) Instalador completo (Interface, Servico e Motor)
+        $setupUrl = "$($manifest.setupUrl)"
+        $setupSha = "$($manifest.setupSha256)".Trim().ToUpperInvariant()
+        if (-not [string]::IsNullOrWhiteSpace($setupUrl) -and -not [string]::IsNullOrWhiteSpace($setupSha)) {
+            $tempSetup = Join-Path $tempDir "MEC_Shield_Setup.exe"
+            try {
+                Log-Message "[LIVEUPDATE] Baixando instalador completo oficial v$($manifest.version)..."
+                if (Test-Path $tempSetup) { Remove-Item $tempSetup -Force -ErrorAction SilentlyContinue }
+                $webClient.DownloadFile($setupUrl, $tempSetup)
+                $gotSha = Get-Sha256OfFile -Path $tempSetup
+                if ($gotSha -ne $setupSha) {
+                    Remove-Item $tempSetup -Force -ErrorAction SilentlyContinue
+                    throw "SHA-256 do instalador baixado nao confere com o manifesto assinado."
+                }
+                Log-Message "[LIVEUPDATE] Instalador conferido (SHA-256 assinado). Executando em modo silencioso..."
+                $proc = Start-Process -FilePath $tempSetup -ArgumentList "/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -PassThru
+                $null = $proc.Handle
+                if (-not $proc.WaitForExit(15 * 60 * 1000)) {
+                    Log-Message "[LIVEUPDATE AVISO] O instalador passou de 15 minutos. Ele continua em segundo plano; esta rotina segue sem aguardar."
+                    return
+                }
+                if ($proc.ExitCode -eq 0) {
+                    Log-Message "[LIVEUPDATE 100% SUCESSO] Pacote completo v$($manifest.version) (Interface, Servico e Motor) instalado com sucesso!"
+                    Remove-Item $tempSetup -Force -ErrorAction SilentlyContinue
+                    return
+                }
+                Log-Message "[LIVEUPDATE AVISO] Instalador retornou codigo $($proc.ExitCode). Tentando atualizacao direta do motor..."
+            } catch {
+                Log-Message "[LIVEUPDATE AVISO] Falha no instalador completo: $_. Tentando atualizacao direta do motor..."
+            }
+        }
+
+        # 2) Fallback: somente o motor (mesma exigencia de hash assinado)
+        $downloadUrl = "$($manifest.downloadUrl)"
+        $engineSha = "$($manifest.engineSha256)".Trim().ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($downloadUrl) -or [string]::IsNullOrWhiteSpace($engineSha)) {
+            Log-Message "[LIVEUPDATE] Manifesto sem motor avulso assinado. Nenhuma alteracao feita."
+            return
+        }
+
+        $stageFile = Join-Path $tempDir "backup_engine_stage.ps1"
+        if (Test-Path $stageFile) { Remove-Item $stageFile -Force -ErrorAction SilentlyContinue }
+        $webClient.DownloadFile($downloadUrl, $stageFile)
+        if ((Get-Sha256OfFile -Path $stageFile) -ne $engineSha) {
+            Remove-Item $stageFile -Force -ErrorAction SilentlyContinue
+            throw "SHA-256 do motor baixado nao confere com o manifesto assinado."
+        }
+
+        $stageContent = Get-Content $stageFile -Raw -Encoding UTF8
+        $parseErrors = $null
+        $null = [System.Management.Automation.PSParser]::Tokenize($stageContent, [ref]$parseErrors)
+        if ($null -ne $parseErrors -and $parseErrors.Count -gt 0) {
+            throw "O arquivo baixado contem $($parseErrors.Count) erro(s) de sintaxe PowerShell. Abortando com seguranca."
+        }
+
+        # Backup garantido do script atual (.bak) e troca
+        $liveEngineFile = Join-Path $scriptDir "backup_engine.ps1"
+        $bakEngineFile = Join-Path $scriptDir "backup_engine.ps1.bak"
+        Copy-Item $liveEngineFile $bakEngineFile -Force
+        Move-Item $stageFile $liveEngineFile -Force
+
+        Log-Message "[LIVEUPDATE 100% SUCESSO] Motor FIBS atualizado com sucesso para a versao v$($manifest.version)!"
+        Log-Message "[LIVEUPDATE] Backup da versao anterior salvo em: $bakEngineFile"
+
+    } catch {
+        Log-Message "[LIVEUPDATE] Checagem de atualizacoes concluida sem alteracao no sistema: $_"
+    } finally {
+        if ($null -ne $webClient) { $webClient.Dispose() }
+    }
+}
+
+# ==============================================================================
+# TRAVA DE EXECUCAO DO BACKUP (mutex do Windows + arquivo informativo p/ interface)
+# ==============================================================================
+$lockFile = Join-Path $scriptDir "backup_execution.lock"
+$script:BackupMutex = $null
+$script:BackupLockHeld = $false
+
+# Devolve "Acquired", "Duplicate" (mesma tarefa ja rodando, disparo agendado) ou "Timeout".
+function Enter-BackupLock {
+    param([string]$TaskName, [switch]$Manual, [int]$MaxWaitSec = 300)
+    if ($null -eq $script:BackupMutex) { $script:BackupMutex = New-MecNamedMutex -Name "Backup" }
+    $waited = 0
+    while ($true) {
+        if (Enter-MecMutex -Mutex $script:BackupMutex -TimeoutMs 0) {
+            $script:BackupLockHeld = $true
+            try { Write-TextFileAtomic -Path $lockFile -Content "$TaskName | PID:$PID | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" } catch {}
+            return "Acquired"
+        }
+        $owner = ""
+        try { $owner = "$(Get-Content $lockFile -Raw -ErrorAction SilentlyContinue)".Trim() } catch {}
+        $ownerTask = ""
+        if ($owner -match '^(.*?)\s*\|\s*PID:(\d+)') { $ownerTask = $matches[1].Trim() }
+        if (-not $Manual -and $ownerTask -eq $TaskName) { return "Duplicate" }
+        if ($waited -ge $MaxWaitSec) { return "Timeout" }
+        Log-Message "Aviso: Outra tarefa de backup em andamento ($owner). Aguardando liberacao ($waited/$MaxWaitSec s)..."
+        if (Enter-MecMutex -Mutex $script:BackupMutex -TimeoutMs 5000) {
+            $script:BackupLockHeld = $true
+            try { Write-TextFileAtomic -Path $lockFile -Content "$TaskName | PID:$PID | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" } catch {}
+            return "Acquired"
+        }
+        $waited += 5
+    }
+}
+
+function Exit-BackupLock {
+    if (-not $script:BackupLockHeld) { return }
+    try { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue } catch {}
+    Exit-MecMutex $script:BackupMutex
+    $script:BackupLockHeld = $false
+}
+
+function Get-DriveFreeMB {
+    param([string]$Path)
+    try {
+        $r = [System.IO.Path]::GetPathRoot($Path)
+        $d = New-Object System.IO.DriveInfo($r)
+        return [math]::Round($d.AvailableFreeSpace / 1MB, 2)
+    } catch { return 0 }
+}
+
+# Remove sobras de rotinas interrompidas (FBK/GZ parciais) das pastas temporarias
+# exclusivas do MEC Shield. So e chamada com a trava de backup em maos.
+function Clear-StaleBackupTemp {
+    param([string[]]$Directories)
+    foreach ($dir in ($Directories | Select-Object -Unique)) {
+        if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path $dir)) { continue }
+        $leaf = Split-Path $dir -Leaf
+        if ($leaf -ne "FIBS_TEMP" -and $leaf -ne "temp_backup") { continue }
+        Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.(fbk|GZ)$' -or $_.Name -match '^gbak_.*_log\.txt$' } | ForEach-Object {
+            Log-Message "Limpeza: removendo sobra de rotina interrompida: $($_.FullName) ($([math]::Round($_.Length / 1MB, 2)) MB)"
+            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Pasta do fail-safe (ultima linha). Prefere um disco diferente do banco e so grava
+# no disco do banco se, apos a copia, sobrar folga (>= 10% e >= 2 GB): encher o disco
+# do Firebird derrubaria o Sismotel.
+function Select-FailSafeDirectory {
+    param([string]$DbPath, [double]$GzSizeMB)
+    $dbRoot = [System.IO.Path]::GetPathRoot($DbPath)
+    $candidatos = @()
+    if (Test-Path "D:\") { $candidatos += "D:\BKP_SISMOTEL" }
+    $candidatos += "C:\BKP_SISMOTEL"
+    foreach ($c in $candidatos) {
+        $root = [System.IO.Path]::GetPathRoot($c)
+        try {
+            $di = New-Object System.IO.DriveInfo($root)
+            if (-not $di.IsReady) { continue }
+            $freeAfterMB = ($di.AvailableFreeSpace / 1MB) - $GzSizeMB
+            $minFolgaMB = [Math]::Max(2048, ($di.TotalSize / 1MB) * 0.10)
+            if ($root -eq $dbRoot -and $freeAfterMB -lt $minFolgaMB) {
+                Log-Message "Fail-safe: '$c' fica no mesmo disco do banco e ficaria com pouca folga ($([math]::Round($freeAfterMB)) MB). Disco ignorado para proteger o Firebird."
+                continue
+            }
+            if ($freeAfterMB -lt 512) { continue }
+            return $c
+        } catch {}
+    }
+    return $null
+}
+
+# Execucao de programa externo lendo stdout/stderr em paralelo (sem deadlock de
+# buffer cheio) e com credenciais Firebird por variavel de ambiente.
+function Invoke-ExternalTool {
+    param([string]$FilePath, [string]$Arguments, [hashtable]$Environment = @{}, [int]$TimeoutMs = 300000)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = $Arguments
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    foreach ($k in $Environment.Keys) { $psi.EnvironmentVariables[$k] = [string]$Environment[$k] }
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    $timedOut = $false
+    if (-not $p.WaitForExit($TimeoutMs)) {
+        $timedOut = $true
+        try { $p.Kill() } catch {}
+        $p.WaitForExit()
+    }
+    $result = [PSCustomObject]@{
+        ExitCode = $(if ($timedOut) { -1 } else { $p.ExitCode })
+        TimedOut = $timedOut
+        StdOut   = $outTask.Result
+        StdErr   = $errTask.Result
+    }
+    $p.Dispose()
+    return $result
+}
+
+# ==============================================================================
+# Modo biblioteca (testes Pester): carrega as funcoes e para aqui, sem executar nada.
+if ($env:MECSHIELD_LIBRARY_MODE -eq "1") { return }
+# ==============================================================================
+
+# INTERCEPTADOR: EXECUCAO DE AUDITORIA (-RunAuditOnly)
+# O servico chama com -ScheduledAudit (uma vez por dia, respeitando a data da ultima
+# auditoria). O botao da interface chama sem ele (sob demanda). Um mutex impede duas
+# auditorias ao mesmo tempo disputando a mesma sandbox.
 if ($RunAuditOnly) {
     Log-Message "======================================================"
-    Log-Message "SOLICITACAO RECEBIDA: Executando Diagnostico de Integridade Sob Demanda (-RunAuditOnly)..."
-    Invoke-DatabaseHealthAudit -TaskName $TaskName -Force:$ForceAudit
-    Log-Message "Diagnostico de integridade concluido com sucesso."
+    Log-Message "SOLICITACAO RECEBIDA: Executando Diagnostico de Integridade (-RunAuditOnly)..."
+    $global:configData = Read-ConfigData
+    if ($ScheduledAudit -and -not $ForceAudit) {
+        $pAud = if ($null -ne $global:configData) { $global:configData.Preferences } else { $null }
+        $auditOn = if ($null -ne $pAud -and $null -ne $pAud.EnableDailyAudit) { [bool]$pAud.EnableDailyAudit } else { $true }
+        if (-not $auditOn) {
+            Log-Message "Auditoria diaria desativada nas preferencias."
+            exit 0
+        }
+        if ((Get-AuditState).LastAuditDate -eq (Get-Date -Format "yyyy-MM-dd")) {
+            Log-Message "Auditoria diaria ja realizada hoje. Nada a fazer."
+            exit 0
+        }
+    }
+    $auditMutex = New-MecNamedMutex -Name "Audit"
+    if (-not (Enter-MecMutex -Mutex $auditMutex -TimeoutMs 0)) {
+        Log-Message "Outra auditoria ja esta em andamento. Esta solicitacao foi ignorada para nao disputar a sandbox."
+        exit 0
+    }
+    try {
+        $null = Invoke-DatabaseHealthAudit -TaskName $TaskName
+    } finally {
+        Exit-MecMutex $auditMutex
+    }
+    $resultadoAuditoria = $script:LastAuditVerdict
+    Log-Message "Diagnostico de integridade concluido. Resultado: $resultadoAuditoria"
     Log-Message "======================================================"
-    exit 0
+    if ($resultadoAuditoria -eq "OK") { exit 0 } else { exit 1 }
 }
 
 # INTERCEPTADOR: VERIFICACAO DE SAUDE DO BACKUP EXTERNO (-CheckExternalHealth)
@@ -2463,240 +3414,65 @@ if ($CheckExternalHealth) {
     # backup ter rodado ou nao. E ele que cobre o caso critico: servidor desligado,
     # servico parado ou rotina travada -- situacoes em que a rotina de backup nunca
     # chega a avaliar os destinos e, sem este monitor, ninguem seria avisado.
-    if ($null -eq $global:configData) {
-        if (Test-Path $configFile) {
-            try { $global:configData = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json }
-            catch { Log-Message "ERRO: config.json ilegivel: $_"; exit 1 }
-        }
-    }
+    $global:configData = Read-ConfigData
     if ($null -eq $global:configData -or $null -eq $global:configData.Tasks) {
-        Log-Message "ERRO: nenhuma tarefa configurada para monitorar."
+        Log-Message "ERRO: config.json ilegivel ou sem tarefas para monitorar."
         exit 1
     }
 
-    $checked = 0
-    foreach ($t in $global:configData.Tasks) {
-        if ($null -ne $t.Enabled -and [bool]$t.Enabled -eq $false) {
-            Log-Message "Tarefa '$($t.TaskName)' esta pausada. Monitoramento ignorado."
-            continue
+    # O monitor so observa: nunca derruba conexoes de rede (quem resolve o erro 1219
+    # e a rotina de backup, que tem a trava) e nunca segura a trava de backup durante
+    # as verificacoes (rede lenta faria a rotina seguinte desistir). Ele apenas
+    # confere, por um instante, se ha backup rodando para limpar um arquivo de lock
+    # orfao que a interface mostraria como "EXECUTANDO".
+    try {
+        $script:BackupMutex = New-MecNamedMutex -Name "Backup"
+        if (Enter-MecMutex -Mutex $script:BackupMutex -TimeoutMs 0) {
+            try {
+                if (Test-Path $lockFile) {
+                    Log-Message "Arquivo de lock orfao encontrado sem backup em execucao. Removendo: $lockFile"
+                    Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
+                }
+            } finally {
+                Exit-MecMutex $script:BackupMutex
+            }
         }
-        if ($null -eq $t.Destinations -or $t.Destinations.Count -eq 0) { continue }
+    } catch {}
 
-        # Respeita o liga/desliga por tarefa (checkbox na tela de Editar Tarefa).
-        # Ausente no config = ligado, para nao mudar o comportamento de quem ja esta instalado.
-        $alertarEsta = if ($null -ne $t.AlertOnMissingBackup) { [bool]$t.AlertOnMissingBackup } else { $true }
-        if (-not $alertarEsta) {
-            Log-Message "Tarefa '$($t.TaskName)': aviso de backup ausente DESLIGADO nas configuracoes da tarefa. Ignorada pelo monitor."
-            continue
+    try {
+        $checked = 0
+        foreach ($t in $global:configData.Tasks) {
+            if ($null -ne $t.Enabled -and [bool]$t.Enabled -eq $false) {
+                Log-Message "Tarefa '$($t.TaskName)' esta pausada. Monitoramento ignorado."
+                continue
+            }
+            if ($null -eq $t.Destinations -or @($t.Destinations).Count -eq 0) { continue }
+
+            # Respeita o liga/desliga por tarefa (checkbox na tela de Editar Tarefa).
+            # Ausente no config = ligado, para nao mudar o comportamento de quem ja esta instalado.
+            $alertarEsta = if ($null -ne $t.AlertOnMissingBackup) { [bool]$t.AlertOnMissingBackup } else { $true }
+            if (-not $alertarEsta) {
+                Log-Message "Tarefa '$($t.TaskName)': aviso de backup ausente DESLIGADO nas configuracoes da tarefa. Ignorada pelo monitor."
+                continue
+            }
+
+            # Resolve unidade mapeada (Z:\) para UNC, pois sob a conta SYSTEM ela nao existe
+            $dests = @()
+            foreach ($d in $t.Destinations) {
+                if ([string]::IsNullOrWhiteSpace($d)) { continue }
+                $dests += (Resolve-MappedDrivePath $d.Trim())
+            }
+            if ($dests.Count -eq 0) { continue }
+
+            Log-Message "Monitorando tarefa '$($t.TaskName)' -> $($dests -join ' | ')"
+            Test-ExternalDestinationsHealth -TaskName $t.TaskName -Destinations $dests
+            $checked++
         }
-
-        # Resolve unidade mapeada (Z:\) para UNC, pois sob a conta SYSTEM ela nao existe
-        $dests = @()
-        foreach ($d in $t.Destinations) {
-            if ([string]::IsNullOrWhiteSpace($d)) { continue }
-            $dests += (Resolve-MappedDrivePath $d.Trim())
-        }
-        if ($dests.Count -eq 0) { continue }
-
-        Log-Message "Monitorando tarefa '$($t.TaskName)' -> $($dests -join ' | ')"
-        Test-ExternalDestinationsHealth -TaskName $t.TaskName -Destinations $dests
-        $checked++
-    }
+    } finally {}
 
     Log-Message "Monitor concluido. $checked tarefa(s) verificada(s)."
     Log-Message "======================================================"
     exit 0
-}
-
-# ==============================================================================
-# CAMADA OFICIAL DE AUTO-UPDATE EM NUVEM (MEC LIVEUPDATE VIA GITHUB)
-# ==============================================================================
-function Invoke-MecLiveUpdate {
-    param (
-        [switch]$Force = $false
-    )
-    
-    $engineVersion = "2.2.15"
-    $webClient = $null
-    
-    try {
-        if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
-            if (Test-Path $configFile) {
-                try { $global:configData = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
-            }
-        }
-        $pref = if ($null -ne $global:configData) { $global:configData.Preferences } else { $null }
-        
-        $enableAutoUpdate = if ($null -ne $pref -and $null -ne $pref.AutoUpdateEnabled) { [bool]$pref.AutoUpdateEnabled } else { $true }
-        if (-not $enableAutoUpdate -and -not $Force) {
-            Log-Message "[LIVEUPDATE] Auto-Update desativado nas preferencias locais."
-            return
-        }
-        
-        $updateUrl = if ($null -ne $pref -and -not [string]::IsNullOrWhiteSpace($pref.AutoUpdateUrl)) {
-            $pref.AutoUpdateUrl
-        } else {
-            "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/version.json"
-        }
-        
-        $todayStr = Get-Date -Format "yyyy-MM-dd"
-        $fibsStateFile = Join-Path $scriptDir "fibs_state.json"
-        $fibsState = $null
-        if (Test-Path $fibsStateFile) {
-            try { $fibsState = Get-Content $fibsStateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
-        }
-        if ($null -eq $fibsState) {
-            $fibsState = [PSCustomObject]@{ WelcomeEmailSent = $false; LastUpdateCheck = "" }
-        }
-        # Garante as propriedades esperadas mesmo em arquivos gravados por versoes antigas
-        foreach ($prop in @("WelcomeEmailSent", "LastUpdateCheck")) {
-            if ($null -eq $fibsState.PSObject.Properties[$prop]) {
-                $valor = if ($prop -eq "WelcomeEmailSent") { $false } else { "" }
-                $fibsState | Add-Member -NotePropertyName $prop -NotePropertyValue $valor -Force
-            }
-        }
-        
-        $now = Get-Date
-        $lastCheckTime = [DateTime]::MinValue
-        if (-not [string]::IsNullOrWhiteSpace($fibsState.LastUpdateCheck)) {
-            [DateTime]::TryParse($fibsState.LastUpdateCheck, [ref]$lastCheckTime) | Out-Null
-        }
-        
-        # Se ja verificou ha menos de 2 horas e nao e Force, aguarda o proximo ciclo
-        if (-not $Force -and ($lastCheckTime -gt [DateTime]::MinValue) -and (($now - $lastCheckTime).TotalHours -lt 2)) {
-            return
-        }
-        
-        Log-Message "[LIVEUPDATE] Verificando atualizacoes online no canal oficial GitHub..."
-        
-        # Garante suporte a TLS 1.2 para comunicacao segura com o GitHub
-        try {
-            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
-        } catch {}
-        
-        $webClient = New-Object System.Net.WebClient
-        $webClient.Headers.Add("User-Agent", "MEC-Shield-LiveUpdate/$engineVersion")
-        
-        # Le manifesto remoto (version.json)
-        $manifestJson = $webClient.DownloadString($updateUrl)
-        $manifest = $manifestJson | ConvertFrom-Json
-        
-        try {
-            $fibsState.LastUpdateCheck = $now.ToString("yyyy-MM-dd HH:mm:ss")
-            $fibsState | ConvertTo-Json -Depth 5 | Set-Content $fibsStateFile -Encoding UTF8
-        } catch {
-            Log-Message "[LIVEUPDATE AVISO] Nao foi possivel gravar a data da verificacao: $_. A atualizacao continua."
-        }
-        
-        if ($null -eq $manifest -or [string]::IsNullOrWhiteSpace($manifest.version)) {
-            Log-Message "[LIVEUPDATE AVISO] Manifesto de versao invalido recebido do servidor."
-            return
-        }
-        
-        $remoteVer = [System.Version]$manifest.version
-        $localVer = [System.Version]$engineVersion
-        
-        $localExe = Join-Path $scriptDir "MEC_Shield.exe"
-        $exeVer = [System.Version]"0.0.0.0"
-        if (Test-Path $localExe) {
-            try {
-                $fvi = (Get-Item $localExe).VersionInfo.FileVersion
-                if (-not [string]::IsNullOrWhiteSpace($fvi)) { $exeVer = [System.Version]$fvi }
-            } catch {}
-        }
-        
-        $remoteVer3 = [System.Version]"$($remoteVer.Major).$($remoteVer.Minor).$($remoteVer.Build)"
-        $exeVer3 = [System.Version]"$($exeVer.Major).$($exeVer.Minor).$($exeVer.Build)"
-        $exeNeedsUpdate = ($exeVer.Major -eq 0) -or ($exeVer3 -lt $remoteVer3)
-        $engineNeedsUpdate = ($remoteVer -gt $localVer)
-        
-        if (-not $engineNeedsUpdate -and -not $exeNeedsUpdate -and -not $Force) {
-            Log-Message "[LIVEUPDATE] FIBS esta 100% atualizado (Motor: v$engineVersion, Interface: v$exeVer). Nenhuma acao necessaria."
-            return
-        }
-        
-        $statusDesc = if ($engineNeedsUpdate) { "Motor: v$engineVersion -> v$($manifest.version)" } else { "Interface defasada: v$exeVer -> v$($manifest.version)" }
-        Log-Message "[LIVEUPDATE] Atualizacao detectada no GitHub: v$($manifest.version) ($statusDesc)! Baixando..."
-        $downloadUrl = $manifest.downloadUrl
-        if ([string]::IsNullOrWhiteSpace($downloadUrl)) {
-            $downloadUrl = "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1"
-        }
-        
-        # Prepara pasta temporaria isolada
-        $tempDir = Join-Path $scriptDir "temp"
-        if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir -Force | Out-Null }
-
-        # Tenta atualizacao completa via instalador silencioso oficial (Setup)
-        $setupUrl = if ($null -ne $manifest.setupUrl -and -not [string]::IsNullOrWhiteSpace($manifest.setupUrl)) {
-            $manifest.setupUrl
-        } else {
-            "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe"
-        }
-        
-        $tempSetup = Join-Path $tempDir "MEC_Shield_Setup.exe"
-        try {
-            Log-Message "[LIVEUPDATE] Baixando instalador completo oficial v$($manifest.version)..."
-            if (Test-Path $tempSetup) { Remove-Item $tempSetup -Force -ErrorAction SilentlyContinue }
-            $webClient.DownloadFile($setupUrl, $tempSetup)
-            if ((Test-Path $tempSetup) -and (Get-Item $tempSetup).Length -gt 1MB) {
-                Log-Message "[LIVEUPDATE] Executando instalador oficial silencioso (/SP- /VERYSILENT)..."
-                $proc = Start-Process -FilePath $tempSetup -ArgumentList "/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait -PassThru
-                if ($proc.ExitCode -eq 0) {
-                    Log-Message "[LIVEUPDATE 100% SUCESSO] Pacote completo v$($manifest.version) (Interface, Servico e Motor) instalado com sucesso!"
-                    Remove-Item $tempSetup -Force -ErrorAction SilentlyContinue
-                    return
-                } else {
-                    Log-Message "[LIVEUPDATE AVISO] Instalador retornou codigo $($proc.ExitCode). Realizando fallback para atualizacao direta do motor..."
-                }
-            }
-        } catch {
-            Log-Message "[LIVEUPDATE AVISO] Falha ao executar instalador completo: $_. Prosseguindo com atualizacao direta do motor..."
-        }
-
-        $stageFile = Join-Path $tempDir "backup_engine_stage.ps1"
-        if (Test-Path $stageFile) { Remove-Item $stageFile -Force -ErrorAction SilentlyContinue }
-        
-        # Baixa o script da nova versao (Fallback Direto do Motor)
-        $webClient.DownloadFile($downloadUrl, $stageFile)
-        
-        if (-not (Test-Path $stageFile)) {
-            throw "Falha ao gravar arquivo temporario baixado em $stageFile"
-        }
-        
-        $stageItem = Get-Item $stageFile
-        if ($stageItem.Length -lt 50KB -or $stageItem.Length -gt 5MB) {
-            throw "Tamanho suspeito do arquivo baixado ($($stageItem.Length) bytes). Abortando para proteger instalacao."
-        }
-        
-        $stageContent = Get-Content $stageFile -Raw -Encoding UTF8
-        if (-not $stageContent.Contains("MEC Shield Enterprise") -or -not $stageContent.Contains("Invoke-TaskBackup")) {
-            throw "Assinatura essencial do FIBS ausente no arquivo baixado (possivel resposta HTTP de erro)."
-        }
-        
-        # GATE DE SEGURANCA: Analise lexica e sintatica do script baixado
-        $parseErrors = $null
-        $tokens = [System.Management.Automation.PSParser]::Tokenize($stageContent, [ref]$parseErrors)
-        if ($null -ne $parseErrors -and $parseErrors.Count -gt 0) {
-            throw "O arquivo baixado contem $($parseErrors.Count) erro(s) de sintaxe PowerShell. Abortando com seguranca."
-        }
-        
-        # Backup garantido do script atual (.bak)
-        $liveEngineFile = Join-Path $scriptDir "backup_engine.ps1"
-        $bakEngineFile = Join-Path $scriptDir "backup_engine.ps1.bak"
-        Copy-Item $liveEngineFile $bakEngineFile -Force
-        
-        # Swap atomico
-        Move-Item $stageFile $liveEngineFile -Force
-        
-        Log-Message "[LIVEUPDATE 100% SUCESSO] Motor FIBS atualizado com sucesso para a versao v$($manifest.version)!"
-        Log-Message "[LIVEUPDATE] Backup da versao anterior salvo em: $bakEngineFile"
-        Log-Message "[LIVEUPDATE] As proximas rotinas rodarao com o novo motor automaticamente."
-        
-    } catch {
-        Log-Message "[LIVEUPDATE] Checagem de atualizacoes concluida sem alteracao no sistema: $_"
-    } finally {
-        if ($null -ne $webClient) { $webClient.Dispose() }
-    }
 }
 
 # INTERCEPTADOR: VERIFICACAO DE ATUALIZACAO SOB DEMANDA (-CheckUpdateOnly)
@@ -2709,58 +3485,14 @@ if ($CheckUpdateOnly) {
     exit 0
 }
 
-# 2. SHIELD DE CONCORRENCIA: Arquivo de Lock para impedir duas rotinas concorrendo no banco
-$lockFile = Join-Path $scriptDir "backup_execution.lock"
-$lockAcquired = $false
-$maxLockWaitSec = 300 # Aguarda ate 5 minutos caso outra tarefa esteja terminando
-
-for ($w = 0; $w -lt $maxLockWaitSec; $w += 5) {
-    if (-not (Test-Path $lockFile)) {
-        try {
-            $lockContent = "$TaskName | PID:$PID | $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-            $fs = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockContent)
-            $fs.Write($bytes, 0, $bytes.Length)
-            $fs.Close()
-            $fs.Dispose()
-            $lockAcquired = $true
-            break
-        } catch {}
-    }
-
-    try {
-        $existingLock = Get-Content $lockFile -Raw -ErrorAction SilentlyContinue
-        $existingTask = ""
-        $ownerPid = 0
-        if ($existingLock -match '^(.*?)\s*\|\s*PID:(\d+)') {
-            $existingTask = $matches[1].Trim()
-            $ownerPid = [int]$matches[2]
-        }
-
-        if ($ownerPid -gt 0) {
-            $ownerProc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
-            if ($null -eq $ownerProc) {
-                Log-Message "Aviso: Lock orfao anterior detectado (PID $ownerPid inativo). Liberando lock..."
-                Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
-                continue
-            }
-
-            # Se o lock pertence A MESMA TAREFA e o processo esta ativo:
-            # Trata-se de um disparo duplo simultaneo (ex: MEC_Shield_Service e Windows Task Scheduler no mesmo segundo).
-            # Para rotinas agendadas (-not $Manual), encerra imediatamente sem travar nem reexecutar.
-            if (-not $Manual -and $existingTask -eq $TaskName) {
-                Log-Message "DISPARO CONCORRENTE IGNORADO: A rotina da tarefa '$TaskName' ja esta em andamento pelo processo PID $ownerPid. Execucao duplicada cancelada com seguranca."
-                exit 0
-            }
-        }
-    } catch {}
-
-    Log-Message "Aviso: Outra tarefa de backup em andamento ($existingLock). Aguardando liberacao ($w/$maxLockWaitSec s)..."
-    Start-Sleep -Seconds 5
+# 2. SHIELD DE CONCORRENCIA: mutex do Windows impede duas rotinas no banco ao mesmo tempo
+$lockResult = Enter-BackupLock -TaskName $TaskName -Manual:$Manual -MaxWaitSec 300
+if ($lockResult -eq "Duplicate") {
+    Log-Message "DISPARO CONCORRENTE IGNORADO: A rotina da tarefa '$TaskName' ja esta em andamento. Execucao duplicada cancelada com seguranca."
+    exit 0
 }
-
-if (-not $lockAcquired) {
-    Log-Message "ALERTA DE PROTECAO: Outra rotina de backup ainda estava em andamento apos 5 minutos. Para proteger o banco em producao, esta execucao foi ignorada com seguranca."
+if ($lockResult -ne "Acquired") {
+    Log-Message "ALERTA DE PROTECAO: Outra rotina de backup ainda estava em andamento apos 5 minutos. Para proteger o banco em producao, esta execucao foi ignorada (o monitor horario alerta se o atraso persistir)."
     exit 0
 }
 
@@ -2769,29 +3501,24 @@ trap {
     try {
         $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         $errLine = "[$timestamp] [$TaskName] ERRO CRITICO NAO TRATADO: $_"
-        Write-Output $errLine
+        Write-Host $errLine
         if ($null -ne $logFile) { Add-Content -Path $logFile -Value $errLine -Encoding UTF8 -ErrorAction SilentlyContinue }
-        Send-BackupNotification -Status "FALHA" -SubjectInfo "Erro Critico na Tarefa $TaskName" -BodyDetails $errLine
+        # Monitor, auditoria e atualizacao nao sao a rotina de backup: registram o erro
+        # sem mexer no estado de falha/alerta das tarefas.
+        if (-not ($CheckExternalHealth -or $RunAuditOnly -or $CheckUpdateOnly)) {
+            Send-BackupNotification -Status "FALHA" -SubjectInfo "Erro Critico na Tarefa $TaskName" -BodyDetails $errLine
+        }
     } catch {}
-    
+
     # Limpeza tolerante a nulo: numa falha precoce (ex.: banco inacessivel) estas
-    # variaveis ainda nao existem, e um Test-Path $null lancava excecao aqui dentro
-    # do proprio trap, impedindo o "exit 1" de ser alcancado e mascarando o codigo
-    # de saida que o startup_guard.ps1 registra.
-    foreach ($tmp in @($lockFile, $tempFbk, $tempGz, $gbakLog)) {
+    # variaveis ainda nao existem.
+    foreach ($tmp in @($tempFbk, $tempGz, $gbakLog)) {
         if (-not [string]::IsNullOrWhiteSpace($tmp)) {
             try { if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue } } catch {}
         }
     }
+    try { Exit-BackupLock } catch {}
     exit 1
-}
-
-# Rotacao de logs se o arquivo for maior que 5MB
-if ((Test-Path $logFile) -and (Get-Item $logFile).Length -gt 5MB) {
-    $archiveName = $logFile -replace '\.txt$', "_$(Get-Date -f 'yyyyMMdd_HHmmss').txt"
-    try {
-        Rename-Item -Path $logFile -NewName (Split-Path $archiveName -Leaf) -Force -ErrorAction SilentlyContinue
-    } catch {}
 }
 
 Log-Message "======================================================"
@@ -2804,24 +3531,22 @@ $gzSizeMB           = 0
 
 if (-not (Test-Path $configFile)) {
     Log-Message "ERRO: Arquivo config.json nao encontrado em: $configFile"
-    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
+    Exit-BackupLock
     exit 1
 }
 
-# Carrega as configuracoes
-try {
-    $global:configData = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json
-} catch {
-    Log-Message "ERRO ao decodificar config.json: $_"
-    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
+# Carrega as configuracoes (com fallback para a ultima copia valida config.json.bak)
+$global:configData = Read-ConfigData
+if ($null -eq $global:configData) {
+    Log-Message "ERRO: config.json ilegivel e sem copia de seguranca valida (config.json.bak)."
+    Exit-BackupLock
     exit 1
 }
 
 # Converte credenciais em texto puro para forma criptografada (uma unica vez por servidor)
 Convert-PlainPasswordsInConfig
-if (Test-Path $configFile) {
-    try { $global:configData = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
-}
+$cfgRecarregado = Read-ConfigData
+if ($null -ne $cfgRecarregado) { $global:configData = $cfgRecarregado }
 
 # --- ENVIO DO EMAIL DE BOAS VINDAS NA PRIMEIRA EXECUCAO ---
 $fibsStateFile = Join-Path $scriptDir "fibs_state.json"
@@ -2834,11 +3559,15 @@ if ($null -eq $fibsState) {
 }
 if (-not $fibsState.WelcomeEmailSent -and $null -ne $global:configData.Preferences) {
     $p = $global:configData.Preferences
-    if (-not [string]::IsNullOrWhiteSpace($p.SmtpServer) -and -not [string]::IsNullOrWhiteSpace($p.RecipientEmail)) {
+    $ultimaTentativa = if ($null -ne $fibsState.PSObject.Properties["WelcomeEmailLastAttempt"]) { $fibsState.WelcomeEmailLastAttempt } else { $null }
+    # Com o SMTP fora do ar, tenta de novo no maximo 1 vez por dia (nao atrasa cada rotina)
+    if (-not [string]::IsNullOrWhiteSpace($p.SmtpServer) -and -not [string]::IsNullOrWhiteSpace($p.RecipientEmail) -and -not (Test-WithinCooldown -Timestamp $ultimaTentativa -Hours 24)) {
         Log-Message "Primeira execucao detectada. Enviando e-mail de Boas-Vindas..."
+        $global:mailSent = $false
         Send-WelcomeEmail
-        $fibsState.WelcomeEmailSent = $true
-        try { $fibsState | ConvertTo-Json -Depth 5 | Set-Content $fibsStateFile -Encoding UTF8 } catch {}
+        if ($global:mailSent) { $fibsState.WelcomeEmailSent = $true }
+        $fibsState | Add-Member -NotePropertyName WelcomeEmailLastAttempt -NotePropertyValue (Get-Date).ToString("o") -Force
+        try { Save-JsonState -Path $fibsStateFile -Data $fibsState -Depth 5 } catch {}
     }
 }
 # -----------------------------------------------------------
@@ -2857,14 +3586,14 @@ if ($null -eq $task) {
     $errMsg = "ERRO CRITICO: Tarefa '$TaskName' nao configurada no config.json!"
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo "Tarefa Nao Encontrada ($TaskName)" -BodyDetails $errMsg
-    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
+    Exit-BackupLock
     exit 1
 }
 
 # Verificacao de Tarefa Desativada (Pausada)
 if ($null -ne $task.Enabled -and [bool]$task.Enabled -eq $false) {
     Log-Message "AVISO: A tarefa '$TaskName' esta DESATIVADA (Pausada) pelo usuario. Execucao cancelada com seguranca."
-    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
+    Exit-BackupLock
     exit 0
 }
 
@@ -2883,10 +3612,10 @@ if (-not $Manual) {
             $lastRuns = Get-Content $lastRunFile -Raw -Encoding UTF8 | ConvertFrom-Json
             $prev = $lastRuns.$TaskName
             if (-not [string]::IsNullOrWhiteSpace($prev)) {
-                $minutosDesde = ((Get-Date) - [DateTime]::Parse($prev)).TotalMinutes
+                $minutosDesde = ((Get-Date) - [DateTime]::Parse("$prev")).TotalMinutes
                 if ($minutosDesde -ge 0 -and $minutosDesde -lt $dedupeMinutes) {
                     Log-Message "DISPARO DUPLICADO IGNORADO: a tarefa '$TaskName' ja concluiu com sucesso ha $([Math]::Round($minutosDesde,1)) minuto(s) (janela de $dedupeMinutes min). Execucao redundante cancelada."
-                    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
+                    Exit-BackupLock
                     exit 0
                 }
             }
@@ -2902,6 +3631,14 @@ $dbPath              = $task.DatabasePath
 $dbUser              = if ([string]::IsNullOrWhiteSpace($task.DbUser)) { "SYSDBA" } else { $task.DbUser }
 $dbPassRaw          = if ([string]::IsNullOrWhiteSpace($task.DbPassword)) { "masterkey" } else { $task.DbPassword }
 $dbPassword          = Unprotect-String $dbPassRaw
+if ($null -eq $dbPassword) {
+    $errMsg = "ERRO DE CONFIGURACAO: a senha do banco (DbPassword) da tarefa '$TaskName' esta criptografada para OUTRO computador (DPAPI) e nao abre neste servidor. Redigite a senha do banco na tarefa pelo MEC Shield."
+    Log-Message $errMsg
+    Send-BackupNotification -Status "FALHA" -SubjectInfo "Senha do Banco Ilegivel ($TaskName)" -BodyDetails $errMsg
+    Exit-BackupLock
+    exit 1
+}
+$fbEnv               = Get-FirebirdEnvironment -User $dbUser -Password $dbPassword
 $destinations        = $task.Destinations
 $keepBackupsCount    = if ($task.KeepBackupsCount -gt 0) { [int]$task.KeepBackupsCount } else { 30 }
 $retryCount          = if ($task.RetryCount -gt 0) { [int]$task.RetryCount } else { 3 }
@@ -2913,7 +3650,12 @@ $runGfixValidate     = if ($null -ne $task.RunGfixValidate) { [bool]$task.RunGfi
 $networkUser         = $task.NetworkUser
 $networkPassword     = Unprotect-String $task.NetworkPassword
 $networkConfigFailureReason = ""
-if (-not [string]::IsNullOrWhiteSpace($networkUser) -and [string]::IsNullOrWhiteSpace($networkPassword)) {
+if (-not [string]::IsNullOrWhiteSpace($networkUser) -and $null -eq $networkPassword -and (Test-IsDpapiBlob $task.NetworkPassword)) {
+    # Blob DPAPI de outra maquina: antes era usado como se fosse a senha e o erro
+    # aparecia como "senha recusada", escondendo a causa real.
+    $networkConfigFailureReason = "Senha de rede ilegivel neste servidor (criptografada para outro computador via DPAPI). Redigite a senha da tarefa no MEC Shield."
+    Log-Message "ERRO DE CONFIGURACAO: $networkConfigFailureReason"
+} elseif (-not [string]::IsNullOrWhiteSpace($networkUser) -and [string]::IsNullOrWhiteSpace($networkPassword)) {
     $networkConfigFailureReason = "Senha de rede nao configurada (campo NetworkPassword vazio ou nulo no config.json para o usuario '$networkUser')."
     Log-Message "ERRO DE CONFIGURACAO: $networkConfigFailureReason O servico SYSTEM nao conseguira autenticar para gravacao em rede."
 }
@@ -2961,12 +3703,13 @@ if ($gbakPath -eq "" -or -not (Test-Path $gbakPath)) {
     $errMsg = "ERRO CRITICO: gbak.exe nao encontrado. Caminho configurado: '$gbakPath'. Tambem nao foi localizado nas pastas padrao do Firebird 2.5."
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo "gbak.exe Nao Encontrado ($TaskName)" -BodyDetails $errMsg
-    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
+    Exit-BackupLock
     exit 1
 }
 
 # 1.3 Aguarda disponibilidade do arquivo do Banco de Dados (com auto-deteccao entre C: e D:)
 $dbExists = $false
+$dbPathConfigurado = $dbPath
 for ($i = 1; $i -le 10; $i++) {
     if ($dbPath -ne "" -and (Test-Path $dbPath)) { $dbExists = $true; break }
     
@@ -3003,12 +3746,20 @@ if (-not $dbExists) {
     $errMsg = "ERRO CRITICO: Banco de dados inacessivel em: $dbPath (e alternativos em C: e D:) apos 10 tentativas."
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo "Banco Inacessivel ($TaskName)" -BodyDetails $errMsg
-    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
+    Exit-BackupLock
     exit 1
 }
 
 $dbSizeMB = [math]::Round(((Get-Item $dbPath).Length / 1MB), 2)
 Log-Message "Banco de dados pronto: $dbPath ($dbSizeMB MB)"
+
+# Banco achado FORA do caminho configurado: o backup segue (melhor que nenhum), mas
+# a equipe precisa saber -- pode ser uma copia antiga e nao o banco em producao.
+if ($dbPath -ne $dbPathConfigurado) {
+    $avisoBanco = "O banco configurado ('$dbPathConfigurado') nao foi encontrado. O backup foi feito do arquivo '$dbPath', encontrado automaticamente. Confirme se este e o banco em producao e corrija o caminho na tarefa '$TaskName'."
+    Log-Message "ATENCAO: $avisoBanco"
+    Send-BackupNotification -Status "AVISO" -SubjectInfo "Banco Fora do Caminho Configurado ($TaskName)" -BodyDetails $avisoBanco -DbPath $dbPath -DbSize "$dbSizeMB"
+}
 
 # 3. SHIELD DE PARTICIONAMENTO E I/O: Resolucao de destinos e isolamento de disco temporario
 $destList = @()
@@ -3059,15 +3810,6 @@ $dbDrive = [System.IO.Path]::GetPathRoot($dbPath)
 
 # Exige espaco para o FBK + GZ + margem de seguranca (ao menos 1.5x o tamanho do banco ativo)
 $minRequiredMB = [math]::Round($dbSizeMB * 1.5, 2)
-
-function Get-DriveFreeMB {
-    param([string]$Path)
-    try {
-        $r = [System.IO.Path]::GetPathRoot($Path)
-        $d = New-Object System.IO.DriveInfo($r)
-        return [math]::Round($d.AvailableFreeSpace / 1MB, 2)
-    } catch { return 0 }
-}
 
 # 1) Procura um destino local em particao diferente do banco para isolamento fisico de gravacao
 foreach ($candDest in $resolvedDestList) {
@@ -3131,11 +3873,21 @@ if ($null -eq $tempDir) {
     $errMsg = "ALERTA PREVENTIVO DE SEGURANCA: Nenhuma unidade possui os $minRequiredMB MB livres necessarios. Para proteger o banco Firebird e o sistema contra corrupcao por falta de espaco em disco, a rotina foi interrompida preventivamente com 100% de seguranca."
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo "Espaco em Disco Critico ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
-    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
+    Exit-BackupLock
     exit 1
 }
 
 Log-Message "Diretorio temporario de processamento I/O: $tempDir"
+
+# Sobras de rotinas interrompidas (queda de energia, gbak abortado) ocupariam o disco
+# para sempre dentro de uma pasta oculta. Com a trava em maos, e seguro limpar.
+$pastasTemp = @($tempDir, (Join-Path $scriptDir "temp_backup"))
+foreach ($candDest in $resolvedDestList) {
+    if (-not $candDest.StartsWith("\")) {
+        $pastasTemp += (Join-Path ([System.IO.Path]::GetPathRoot($candDest)) "FIBS_TEMP")
+    }
+}
+Clear-StaleBackupTemp -Directories $pastasTemp
 
 try {
     $tempRoot = [System.IO.Path]::GetPathRoot($tempDir)
@@ -3157,27 +3909,13 @@ if ($runGfixSweep -or $runGfixValidate) {
         if ($runGfixSweep) {
             Log-Message "Executando gfix.exe (-sweep) conforme configurado..."
             try {
-                $gfixSweepArgs = "-sweep -user $dbUser -password $dbPassword `"localhost:$dbPath`""
-                $pinfoSweep = New-Object System.Diagnostics.ProcessStartInfo
-                $pinfoSweep.FileName = $gfixPath
-                $pinfoSweep.Arguments = $gfixSweepArgs
-                $pinfoSweep.RedirectStandardOutput = $true
-                $pinfoSweep.RedirectStandardError = $true
-                $pinfoSweep.UseShellExecute = $false
-                $pinfoSweep.CreateNoWindow = $true
-
-                $procSweep = [System.Diagnostics.Process]::Start($pinfoSweep)
-                try { $procSweep.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
-                if ($procSweep.WaitForExit(300000)) {
-                    if ($procSweep.ExitCode -eq 0) {
-                        Log-Message "gfix -sweep concluido com sucesso."
-                    } else {
-                        $errOut = $procSweep.StandardError.ReadToEnd()
-                        Log-Message "Aviso: gfix -sweep retornou codigo $($procSweep.ExitCode): $errOut"
-                    }
-                } else {
-                    $procSweep.Kill()
+                $r = Invoke-ExternalTool -FilePath $gfixPath -Arguments "-sweep `"localhost:$dbPath`"" -Environment $fbEnv -TimeoutMs 300000
+                if ($r.TimedOut) {
                     Log-Message "Aviso: gfix -sweep atingiu timeout de 5 minutos."
+                } elseif ($r.ExitCode -eq 0) {
+                    Log-Message "gfix -sweep concluido com sucesso."
+                } else {
+                    Log-Message "Aviso: gfix -sweep retornou codigo $($r.ExitCode): $($r.StdErr)$($r.StdOut)"
                 }
             } catch {
                 Log-Message "Aviso ao rodar gfix sweep: $_"
@@ -3187,27 +3925,13 @@ if ($runGfixSweep -or $runGfixValidate) {
         if ($runGfixValidate) {
             Log-Message "Executando gfix.exe (-v) para verificacao de integridade..."
             try {
-                $gfixValArgs = "-v -user $dbUser -password $dbPassword `"localhost:$dbPath`""
-                $pinfoVal = New-Object System.Diagnostics.ProcessStartInfo
-                $pinfoVal.FileName = $gfixPath
-                $pinfoVal.Arguments = $gfixValArgs
-                $pinfoVal.RedirectStandardOutput = $true
-                $pinfoVal.RedirectStandardError = $true
-                $pinfoVal.UseShellExecute = $false
-                $pinfoVal.CreateNoWindow = $true
-
-                $procVal = [System.Diagnostics.Process]::Start($pinfoVal)
-                try { $procVal.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
-                if ($procVal.WaitForExit(300000)) {
-                    if ($procVal.ExitCode -eq 0) {
-                        Log-Message "gfix -v validacao concluida sem erros."
-                    } else {
-                        $errOut = $procVal.StandardError.ReadToEnd()
-                        Log-Message "Aviso: gfix validacao reportou possiveis anomalias: $errOut"
-                    }
-                } else {
-                    $procVal.Kill()
+                $r = Invoke-ExternalTool -FilePath $gfixPath -Arguments "-v `"localhost:$dbPath`"" -Environment $fbEnv -TimeoutMs 300000
+                if ($r.TimedOut) {
                     Log-Message "Aviso: gfix validacao atingiu timeout."
+                } elseif ($r.ExitCode -eq 0 -and [string]::IsNullOrWhiteSpace("$($r.StdErr)$($r.StdOut)")) {
+                    Log-Message "gfix -v validacao concluida sem erros."
+                } else {
+                    Log-Message "Aviso: gfix validacao reportou possiveis anomalias (codigo $($r.ExitCode)): $($r.StdErr)$($r.StdOut)"
                 }
             } catch {
                 Log-Message "Aviso ao rodar gfix validacao: $_"
@@ -3235,11 +3959,12 @@ $tempGz    = Join-Path $tempDir "$basePrefix-$seqStr.GZ"
 $gbakLog    = Join-Path $tempDir "gbak_$($TaskName)_log.txt"
 
 # Argumentos GBAK: -b (backup online), -t (transportavel), -g (SEM coleta de lixo / nao trava tabelas ativas)
+# Usuario/senha vao por ISC_USER/ISC_PASSWORD (variaveis de ambiente do processo
+# filho), nunca na linha de comando.
 $gbakArgs = "-b -t"
 if ($noGarbageCollection) { $gbakArgs += " -g" }
 if ($convertExternal)    { $gbakArgs += " -co" }
 $gbakArgs += " -y `"$gbakLog`""
-$gbakArgs += " -user $dbUser -password $dbPassword"
 $gbakArgs += " `"localhost:$dbPath`" `"$tempFbk`""
 
 $global:gbakTimer.Restart()
@@ -3252,42 +3977,23 @@ for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
         if (Test-Path $tempFbk) { Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue }
         if (Test-Path $gbakLog) { Remove-Item $gbakLog -Force -ErrorAction SilentlyContinue }
 
-        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-        $pinfo.FileName = $gbakPath
-        $pinfo.Arguments = $gbakArgs
-        $pinfo.RedirectStandardOutput = $true
-        $pinfo.RedirectStandardError = $true
-        $pinfo.UseShellExecute = $false
-        $pinfo.CreateNoWindow = $true
-
-        $process = New-Object System.Diagnostics.Process
-        $process.StartInfo = $pinfo
-        $process.Start() | Out-Null
-        
-        # 4. SHIELD DE CPU: Throttle da prioridade do GBAK
-        try {
-            # Baixa prioridade de CPU para nao competir com Firebird (mas sem limitar nucleos para ser rapido)
-            $process.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
-        } catch {}
-        
         # Timeout de 2 horas (7200000 ms)
-        if ($process.WaitForExit(7200000)) {
-            if ($process.ExitCode -eq 0 -and (Test-Path $tempFbk)) {
-                $gbakSuccess = $true
-                $global:gbakTimer.Stop()
-                $fbkSizeMB = [math]::Round(((Get-Item $tempFbk).Length / 1MB), 2)
-                $gbakElapsedStr = Format-DurationText $global:gbakTimer.Elapsed
-                Log-Message "gbak.exe concluido com sucesso! Arquivo FBK gerado ($fbkSizeMB MB) em $gbakElapsedStr."
-                break
-            } else {
-                $gbakError = "Sem detalhes no log."
-                if (Test-Path $gbakLog) { $gbakError = Get-Content $gbakLog -Tail 5 | Out-String }
-                Log-Message "Tentativa $attempt falhou. Codigo: $($process.ExitCode). Erro: $gbakError"
-            }
-        } else {
-            $process.Kill()
+        $r = Invoke-ExternalTool -FilePath $gbakPath -Arguments $gbakArgs -Environment $fbEnv -TimeoutMs 7200000
+        if ($r.TimedOut) {
             $gbakError = "gbak excedeu o limite de 2 horas e foi finalizado."
             Log-Message "Tentativa $attempt falhou: $gbakError"
+        } elseif ($r.ExitCode -eq 0 -and (Test-Path $tempFbk)) {
+            $gbakSuccess = $true
+            $global:gbakTimer.Stop()
+            $fbkSizeMB = [math]::Round(((Get-Item $tempFbk).Length / 1MB), 2)
+            $gbakElapsedStr = Format-DurationText $global:gbakTimer.Elapsed
+            Log-Message "gbak.exe concluido com sucesso! Arquivo FBK gerado ($fbkSizeMB MB) em $gbakElapsedStr."
+            break
+        } else {
+            $gbakError = "$($r.StdErr)".Trim()
+            if (Test-Path $gbakLog) { $gbakError = ((Get-Content $gbakLog -Tail 5) -join "`n") + "`n" + $gbakError }
+            if ([string]::IsNullOrWhiteSpace($gbakError)) { $gbakError = "Sem detalhes no log." }
+            Log-Message "Tentativa $attempt falhou. Codigo: $($r.ExitCode). Erro: $gbakError"
         }
     } catch {
         $gbakError = "$_"
@@ -3303,14 +4009,17 @@ for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
 if (-not $gbakSuccess) {
     $errMsg = "ERRO CRITICO: Falha no gbak em todas as $retryCount tentativas. Backup abortado. Detalhes: $gbakError"
     Log-Message $errMsg
+    # FBK parcial (gbak abortado/morto) nao pode ficar ocupando o disco
+    if (Test-Path $tempFbk) { Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $gbakLog) { Remove-Item $gbakLog -Force -ErrorAction SilentlyContinue }
     Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha no GBAK ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
-    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
 
     # Se a tarefa for externa, avaliar e alertar se a contingencia externa esta atrasada
     $isExternalTask = ($TaskName -match "EXTERN" -or $TaskName -eq "BKP_EXTERNO")
     if ($isExternalTask) {
-        Test-ExternalDestinationsHealth -TaskName $TaskName -Destinations $destList -FailureReason "Falha no gbak.exe (Erro no banco de dados Firebird)"
+        Test-ExternalDestinationsHealth -TaskName $TaskName -Destinations $resolvedDestList -FailureReason "Falha no gbak.exe (Erro no banco de dados Firebird)" -AllowDisconnect
     }
+    Exit-BackupLock
     exit 1
 }
 
@@ -3328,7 +4037,7 @@ if ([string]::IsNullOrWhiteSpace($fbkSha)) {
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha na Verificacao de Integridade ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
     if (Test-Path $tempFbk) { Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue }
-    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
+    Exit-BackupLock
     exit 1
 }
 Log-Message "Origem: $fbkEntryName | $([math]::Round($fbkSizeBytes/1MB,2)) MB | SHA-256 $($fbkSha.Substring(0,16))..."
@@ -3391,7 +4100,8 @@ try {
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha na Compactacao ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
     if (Test-Path $tempFbk) { Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue }
-    if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
+    Exit-BackupLock
     exit 1
 }
 
@@ -3401,6 +4111,8 @@ $localSuccessList = @()
 $networkSuccessList = @()
 $failedDestinations = @($missingLocalDests)
 $destinationFailureReasons = @{}
+# Todos os destinos configurados da tarefa (ja traduzidos para UNC quando mapeados)
+$allDestinations = @($resolvedDestList) + @($missingLocalDests)
 
 foreach ($destTrimmed in $resolvedDestList) {
     # Motivo de falha pertence somente a este destino. Nunca reutilizar uma falha
@@ -3408,66 +4120,34 @@ foreach ($destTrimmed in $resolvedDestList) {
     $destinationFailureReason = ""
     $isNetwork = $destTrimmed.StartsWith("\\")
     $destTypeTag = if ($isNetwork) { "[REDE UNC]" } else { "[LOCAL]" }
+    $finalPath = $null
     Log-Message "Gravando backup GZ no destino $($destTypeTag) - $destTrimmed"
 
     if ($isNetwork -and -not [string]::IsNullOrWhiteSpace($networkConfigFailureReason)) {
-        Log-Message "FALHA DE DESTINO: $networkConfigFailureReason Nenhuma tentativa de net use ou copia sera executada para '$destTrimmed'."
+        Log-Message "FALHA DE DESTINO: $networkConfigFailureReason Nenhuma tentativa de conexao ou copia sera executada para '$destTrimmed'."
         $destinationFailureReasons[$destTrimmed] = $networkConfigFailureReason
         if (-not ($failedDestinations -contains $destTrimmed)) {
             $failedDestinations += $destTrimmed
         }
         continue
     }
-    
+
     $destSuccess = $false
     for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
         try {
             # Se for caminho de rede UNC (\\servidor\compartilhamento ou \\servidor\c$\...)
-            if ($isNetwork) {
-                if (-not [string]::IsNullOrWhiteSpace($networkUser)) {
-                    $cleanPath = $destTrimmed.TrimStart('\')
-                    $parts = $cleanPath.Split('\')
-                    $uncHost = if ($parts.Length -ge 1) { $parts[0] } else { "" }
-                    $uncRoot = if ($parts.Length -ge 2) { "\\$($parts[0])\$($parts[1])" } else { $destTrimmed }
-                    
-                    # Normaliza usuario (remove barras extras e troca / por \)
-                    $normUser = $networkUser.Replace('/', '\')
-                    while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
-
-                    if ([string]::IsNullOrWhiteSpace($networkPassword)) {
-                        Log-Message "ERRO DE CONFIGURACAO: O usuario de rede '$normUser' esta configurado, mas a senha de rede (NetworkPassword) esta vazia ou nula no config.json. Abortando tentativa de net use com senha em branco."
-                    } else {
-                        if (-not [string]::IsNullOrWhiteSpace($uncHost)) {
-                            Disconnect-HostConnections $uncHost
-                        }
-
-                        Log-Message "Autenticando rede em $uncRoot com usuario '$normUser'..."
-                        try {
-                            $netOut = & net.exe use "`"$uncRoot`"" "`"$networkPassword`"" "/user:`"$normUser`"" /persistent:no 2>&1
-                            $netExit = $LASTEXITCODE
-                            $netErrMsg = ($netOut | Out-String).Trim() -replace '(?m)^net\.exe\s*:\s*', ''
-
-                            if ($netExit -ne 0 -and $normUser -notmatch '\\' -and -not [string]::IsNullOrWhiteSpace($uncHost)) {
-                                $hostUser = "$uncHost\$normUser"
-                                Log-Message "Tentando autenticacao com prefixo do computador: $hostUser..."
-                                Disconnect-HostConnections $uncHost
-                                $netOut = & net.exe use "`"$uncRoot`"" "`"$networkPassword`"" "/user:`"$hostUser`"" /persistent:no 2>&1
-                                $netExit = $LASTEXITCODE
-                                $netErrMsg = ($netOut | Out-String).Trim() -replace '(?m)^net\.exe\s*:\s*', ''
-                            }
-
-                            if ($netExit -ne 0) {
-                                $destinationFailureReason = "Autenticacao de rede recusada em $uncRoot (codigo $netExit): $netErrMsg"
-                                Log-Message "Aviso: net use falhou (codigo $netExit) para $uncRoot. Detalhes: $netErrMsg"
-                            } else {
-                                $destinationFailureReason = ""
-                                Log-Message "Autenticacao de rede em $uncRoot estabelecida com sucesso."
-                            }
-                        } catch {
-                            $destinationFailureReason = "Falha ao autenticar em $uncRoot`: $_"
-                            Log-Message "Aviso ao tentar autenticar rede: $_"
-                        }
-                    }
+            if ($isNetwork -and -not [string]::IsNullOrWhiteSpace($networkUser)) {
+                $parts = $destTrimmed.TrimStart('\').Split('\')
+                $uncRoot = if ($parts.Length -ge 2) { "\\$($parts[0])\$($parts[1])" } else { $destTrimmed }
+                Log-Message "Autenticando rede em $uncRoot com usuario '$networkUser'..."
+                # Com a trava de backup em maos, pode reorganizar conexoes em caso de 1219
+                $conn = Connect-NetworkShare -UncRoot $uncRoot -User $networkUser -Password $networkPassword -AllowDisconnect
+                if ($conn.Ok) {
+                    $destinationFailureReason = ""
+                    Log-Message "Autenticacao de rede em $uncRoot estabelecida com sucesso (usuario '$($conn.User)')."
+                } else {
+                    $destinationFailureReason = "Autenticacao de rede recusada em $uncRoot (codigo $($conn.Code)): $($conn.Message)"
+                    Log-Message "Aviso: $destinationFailureReason"
                 }
             }
 
@@ -3528,40 +4208,20 @@ foreach ($destTrimmed in $resolvedDestList) {
                 throw "COPIA CORROMPIDA em '$finalPath': SHA-256 nao confere com a origem (arquivo chegou alterado)."
             }
 
-            if ($true) {
-                $destSuccess = $true
-                if ($isNetwork) {
-                    $networkSuccessList += $finalPath
-                } else {
-                    $localSuccessList += $finalPath
-                }
-                Log-Message "Backup GZ gravado e CONFERIDO em: $finalPath (SHA-256 identico a origem)"
-
-                # Politica de Retencao (Expurgo dos mais antigos por tarefa / prefixo)
-                try {
-                    Log-Message "Aplicando politica de retencao em $destTrimmed (Manter ultimos $keepBackupsCount backups do prefixo '$basePrefix')..."
-                    $escapedPrefix = [regex]::Escape($basePrefix)
-                    $backupFiles = Get-ChildItem -Path $destTrimmed -File -ErrorAction SilentlyContinue | Where-Object {
-                        $_.Name -match "^${escapedPrefix}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.(GZ|zip)$"
-                    } | Sort-Object LastWriteTime -Descending
-                    
-                    if ($backupFiles.Count -gt $keepBackupsCount) {
-                        $filesToRemove = $backupFiles | Select-Object -Skip $keepBackupsCount
-                        foreach ($oldFile in $filesToRemove) {
-                            Log-Message "Excluindo backup excedente antigo: $($oldFile.Name)"
-                            Remove-Item $oldFile.FullName -Force -ErrorAction SilentlyContinue
-                        }
-                    }
-                } catch {
-                    Log-Message "Aviso na politica de retencao em $($destTrimmed): $_"
-                }
-
-                break
+            $destSuccess = $true
+            if ($isNetwork) {
+                $networkSuccessList += $finalPath
             } else {
-                throw "Arquivo de destino nao foi gravado ou esta vazio."
+                $localSuccessList += $finalPath
             }
+            Log-Message "Backup GZ gravado e CONFERIDO em: $finalPath (SHA-256 identico a origem)"
+
+            # Politica de Retencao (Expurgo dos mais antigos por tarefa / prefixo)
+            Invoke-RetentionPolicy -Directory $destClean -Prefix $basePrefix -Keep $keepBackupsCount
+            break
         } catch {
             Log-Message "Tentativa $attempt de copia para '$destTrimmed' falhou: $_"
+            if ([string]::IsNullOrWhiteSpace($destinationFailureReason)) { $destinationFailureReason = "$_" }
             # Nao deixar arquivo reprovado na pasta: ele seria contado como "backup
             # existente" pelo monitor e pela numeracao sequencial, mascarando a falha.
             try {
@@ -3581,8 +4241,7 @@ foreach ($destTrimmed in $resolvedDestList) {
     # Se a pasta compartilhada normal (\\terminal\pasta) falhou (descompartilhada ou sem permissao),
     # tenta automaticamente via compartilhamento administrativo (C$ ou D$) com as mesmas credenciais
     if (-not $destSuccess -and $isNetwork) {
-        $cleanPath = $destTrimmed.TrimStart('\')
-        $parts = $cleanPath.Split('\')
+        $parts = $destTrimmed.TrimStart('\').Split('\')
         if ($parts.Length -ge 2) {
             $uncHost = $parts[0]
             $shareName = $parts[1]
@@ -3593,32 +4252,21 @@ foreach ($destTrimmed in $resolvedDestList) {
 
             $altCandidates = @()
             if ($shareName -notmatch '^[A-Za-z]\$') {
-                $cPath = "\\$uncHost\c$\$shareName$subPartRest"
-                $dPath = "\\$uncHost\d$\$shareName$subPartRest"
-                $altCandidates += $cPath
-                $altCandidates += $dPath
-            } elseif ($shareName -match '^[A-Za-z]\$') {
-                if (-not [string]::IsNullOrWhiteSpace($subRest)) {
-                    $altCandidates += "\\$uncHost\$subRest"
-                }
+                $altCandidates += "\\$uncHost\c$\$shareName$subPartRest"
+                $altCandidates += "\\$uncHost\d$\$shareName$subPartRest"
+            } elseif (-not [string]::IsNullOrWhiteSpace($subRest)) {
+                $altCandidates += "\\$uncHost\$subRest"
             }
 
             foreach ($altDest in $altCandidates) {
                 Log-Message "REDE RESILIENTE: Destino principal falhou. Tentando variacao via compartilhamento administrativo: $altDest..."
+                $altParts = $altDest.TrimStart('\').Split('\')
+                $altRoot = "\\$($altParts[0])\$($altParts[1])"
+                $altConn = $null
+                $finalPathAlt = $null
                 try {
-                    $altParts = $altDest.TrimStart('\').Split('\')
-                    $altRoot = "\\$($altParts[0])\$($altParts[1])"
                     if (-not [string]::IsNullOrWhiteSpace($networkUser) -and -not [string]::IsNullOrWhiteSpace($networkPassword)) {
-                        $normUser = $networkUser.Replace('/', '\')
-                        while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
-                        Disconnect-HostConnections $altParts[0]
-                        $netOut = & net.exe use "`"$altRoot`"" "`"$networkPassword`"" "/user:`"$normUser`"" /persistent:no 2>&1
-                        $netExit = $LASTEXITCODE
-                        if ($netExit -ne 0 -and $normUser -notmatch '\\') {
-                            $hostUser = "$uncHost\$normUser"
-                            Disconnect-HostConnections $altParts[0]
-                            & net.exe use "`"$altRoot`"" "`"$networkPassword`"" "/user:`"$hostUser`"" /persistent:no 2>&1 | Out-Null
-                        }
+                        $altConn = Connect-NetworkShare -UncRoot $altRoot -User $networkUser -Password $networkPassword -AllowDisconnect
                     }
 
                     if (-not (Test-Path $altDest)) {
@@ -3634,33 +4282,18 @@ foreach ($destTrimmed in $resolvedDestList) {
                             $destSuccess = $true
                             $networkSuccessList += $finalPathAlt
                             Log-Message "SUCESSO no destino alternativo administrativo: $finalPathAlt (Copia gravada e SHA-256 conferido!)"
-
-                            # Aplica politica de retencao no destino alternativo
-                            try {
-                                Log-Message "Aplicando politica de retencao em $altDestClean (Manter ultimos $keepBackupsCount backups do prefixo '$basePrefix')..."
-                                $escapedPrefix = [regex]::Escape($basePrefix)
-                                $backupFilesAlt = Get-ChildItem -Path $altDestClean -File -ErrorAction SilentlyContinue | Where-Object {
-                                    $_.Name -match "^${escapedPrefix}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.(GZ|zip)$"
-                                } | Sort-Object LastWriteTime -Descending
-
-                                if ($backupFilesAlt.Count -gt $keepBackupsCount) {
-                                    $filesToRemove = $backupFilesAlt | Select-Object -Skip $keepBackupsCount
-                                    foreach ($oldFile in $filesToRemove) {
-                                        Log-Message "Excluindo backup excedente antigo: $($oldFile.Name)"
-                                        Remove-Item $oldFile.FullName -Force -ErrorAction SilentlyContinue
-                                    }
-                                }
-                            } catch {
-                                Log-Message "Aviso na politica de retencao em $($altDestClean): $_"
-                            }
-
+                            Invoke-RetentionPolicy -Directory $altDestClean -Prefix $basePrefix -Keep $keepBackupsCount
                             break
+                        } else {
+                            Remove-Item $finalPathAlt -Force -ErrorAction SilentlyContinue
+                            Log-Message "Copia reprovada (SHA-256 divergente) removida de $finalPathAlt"
                         }
                     }
                 } catch {
                     Log-Message "Tentativa no destino alternativo '$altDest' falhou: $_"
                 } finally {
-                    try { & net.exe use "`"$altRoot`"" /delete /yes 2>&1 | Out-Null } catch {}
+                    # So desconecta o que esta rotina conectou
+                    if ($null -ne $altConn -and $altConn.Ok -and $altConn.Code -eq 0) { Disconnect-NetworkShare $altRoot }
                 }
             }
         }
@@ -3681,35 +4314,43 @@ foreach ($destTrimmed in $resolvedDestList) {
     }
 }
 
-# GARANTIA DE FAIL-SAFE LOCAL: Se nenhum destino local foi gravado e todos os destinos externos/rede falharam
+# GARANTIA DE FAIL-SAFE LOCAL: Se nenhum destino foi gravado, grava uma copia de ultima
+# linha no servidor -- COM retencao e SEM encher o disco do banco de dados.
 if ($localSuccessList.Count -eq 0 -and $networkSuccessList.Count -eq 0) {
-    $localSafeDir = if (Test-Path "D:\") { "D:\BKP_SISMOTEL" } else { "C:\BKP_SISMOTEL" }
-    Log-Message "ESCUDO FAIL-SAFE ATIVADO: Todos os destinos configurados falharam ou estao indisponiveis. Gravando copia de seguranca garantida de ultima linha no servidor local em: $localSafeDir"
-    try {
-        if (-not (Test-Path $localSafeDir)) { New-Item -ItemType Directory -Path $localSafeDir -Force -ErrorAction Stop | Out-Null }
-        $safeFinalPath = Join-Path $localSafeDir $fileName
-        Copy-Item -Path $tempGz -Destination $safeFinalPath -Force -ErrorAction Stop
-        if (Test-Path $safeFinalPath) {
-            # A copia de ultima linha tambem passa pela conferencia: e justamente a que
-            # sera usada num desastre, entao nao pode ser aceita sem verificacao.
-            $safeSha = Get-Sha256OfFile -Path $safeFinalPath
-            if ($safeSha -eq $zipSha) {
-                $localSuccessList += $safeFinalPath
-                Log-Message "Copia de seguranca local gravada e CONFERIDA em: $safeFinalPath"
-            } else {
-                Log-Message "ERRO: a copia fail-safe em '$safeFinalPath' nao confere com a origem (SHA-256 divergente). Arquivo descartado."
-                Remove-Item $safeFinalPath -Force -ErrorAction SilentlyContinue
+    $localSafeDir = Select-FailSafeDirectory -DbPath $dbPath -GzSizeMB $gzSizeMB
+    if ($null -eq $localSafeDir) {
+        Log-Message "ESCUDO FAIL-SAFE: nenhum disco local tem folga segura para a copia de ultima linha. Copia nao gravada para proteger o Firebird."
+    } else {
+        Log-Message "ESCUDO FAIL-SAFE ATIVADO: Todos os destinos configurados falharam ou estao indisponiveis. Gravando copia de seguranca de ultima linha no servidor local em: $localSafeDir"
+        try {
+            if (-not (Test-Path $localSafeDir)) { New-Item -ItemType Directory -Path $localSafeDir -Force -ErrorAction Stop | Out-Null }
+            $safeFinalPath = Join-Path $localSafeDir $fileName
+            Copy-Item -Path $tempGz -Destination $safeFinalPath -Force -ErrorAction Stop
+            if (Test-Path $safeFinalPath) {
+                # A copia de ultima linha tambem passa pela conferencia: e justamente a que
+                # sera usada num desastre, entao nao pode ser aceita sem verificacao.
+                $safeSha = Get-Sha256OfFile -Path $safeFinalPath
+                if ($safeSha -eq $zipSha) {
+                    $localSuccessList += $safeFinalPath
+                    Log-Message "Copia de seguranca local gravada e CONFERIDA em: $safeFinalPath"
+                    Invoke-RetentionPolicy -Directory $localSafeDir -Prefix $basePrefix -Keep $keepBackupsCount
+                } else {
+                    Log-Message "ERRO: a copia fail-safe em '$safeFinalPath' nao confere com a origem (SHA-256 divergente). Arquivo descartado."
+                    Remove-Item $safeFinalPath -Force -ErrorAction SilentlyContinue
+                }
             }
+        } catch {
+            Log-Message "Aviso no escudo fail-safe local: $_"
         }
-    } catch {
-        Log-Message "Aviso no escudo fail-safe local: $_"
     }
 }
 
-# --- FASE 6: LIMPEZA FINAL DE ARQUIVOS TEMPORARIOS E LIBERACAO DO LOCK ---
+# --- FASE 6: LIMPEZA FINAL DE ARQUIVOS TEMPORARIOS ---
+# A trava de backup so e liberada no FIM (depois do monitor de destinos, e-mails e
+# LiveUpdate): antes ela era liberada aqui e essas etapas corriam em paralelo com a
+# rotina seguinte.
 if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
 if (Test-Path $gbakLog) { Remove-Item $gbakLog -Force -ErrorAction SilentlyContinue }
-if (Test-Path $lockFile) { Remove-Item $lockFile -Force -ErrorAction SilentlyContinue }
 
 if ($global:routineTimer.IsRunning) { $global:routineTimer.Stop() }
 $durationStr = Format-DurationText $global:routineTimer.Elapsed
@@ -3739,21 +4380,19 @@ try {
 
 # Verificacao de integridade final: ao menos 1 destino deve ter sido gravado com sucesso
 if ($localSuccessList.Count -eq 0 -and $networkSuccessList.Count -eq 0) {
-    $isNetTask = ($TaskName -match "EXTERN" -or $TaskName -eq "BKP_EXTERNO" -or ($allDestinations | Where-Object { $_ -match '^\\\\' }))
+    $isNetTask = ($TaskName -match "EXTERN" -or @($allDestinations | Where-Object { $_ -match '^\\\\' }).Count -gt 0)
     if ($isNetTask) {
         $subjectInfo = "Destino Externo Offline / Inacessivel ($TaskName)"
         $errMsg = @"
 AVISO DE CONECTIVIDADE / REDE EXTERNA:
-O backup do banco de dados foi extraido e compactado com 100% DE SUCESSO no servidor, porem nao foi possivel copiar para o computador de destino na rede ($($failedDestinations -join ', ')).
+O backup do banco de dados foi extraido e compactado com 100% DE SUCESSO no servidor, porem nao foi possivel copiar para o computador de destino na rede ($($failedDestinations -join ', ')) nem gravar a copia de ultima linha no servidor.
 
 Causas mais frequentes para verificar:
 1. Computador da Recepcao/Terminal desligado, hibernando ou fora da tomada/rede;
 2. Pasta descompartilhada, renomeada ou sem permissao no computador remoto;
 3. Usuario ou senha do Windows alterados na maquina de destino (problema de credenciais);
-4. Cabo de rede desconectado, oscilacao de Wi-Fi ou IP do terminal alterado.
-
-OBSERVACAO DE SEGURANCA:
-O banco de dados do Sismotel no servidor principal continua 100% integro, saudavel e seguro.
+4. Cabo de rede desconectado, oscilacao de Wi-Fi ou IP do terminal alterado;
+5. Discos locais do servidor sem espaco livre para a copia de seguranca.
 "@
     } else {
         $subjectInfo = "Falha ao Gravar nos Discos Locais ($TaskName)"
@@ -3761,8 +4400,18 @@ O banco de dados do Sismotel no servidor principal continua 100% integro, saudav
     }
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo $subjectInfo -BodyDetails $errMsg -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo
+    if ($TaskName -match "EXTERN" -or $isNetTask) {
+        foreach ($destToCheck in $failedDestinations) {
+            $motivo = if ($destinationFailureReasons.ContainsKey($destToCheck)) { $destinationFailureReasons[$destToCheck] } else { $networkConfigFailureReason }
+            Test-ExternalDestinationsHealth -TaskName $TaskName -Destinations @($destToCheck) -FailureReason $motivo -AllowDisconnect
+        }
+    }
+    Exit-BackupLock
     exit 1
 }
+
+# Numero de sequencia consumido apenas quando ha backup gravado
+Save-BackupSequenceNumber -Prefix $basePrefix -UsedNumber $seqNumber -SequenceFilePath $seqFile
 
 $allSuccessList = $localSuccessList + $networkSuccessList
 if ($failedDestinations.Count -gt 0) {
@@ -3771,18 +4420,21 @@ if ($failedDestinations.Count -gt 0) {
     Log-Message "Rotina de backup concluida com SUCESSO! ($($allSuccessList.Count) destino(s) gravado(s))."
 }
 
-# Carimba a conclusao para a guarda anti-duplicidade da proxima invocacao.
+# Carimba a conclusao para a guarda anti-duplicidade da proxima invocacao e para o
+# servico/startup guard decidirem se falta backup apos um reboot.
 # Gravado apenas em caso de sucesso: se a rotina falhar, um novo disparo deve poder tentar.
 try {
-    $runs = @{}
-    if (Test-Path $lastRunFile) {
-        $prevRuns = Get-Content $lastRunFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($null -ne $prevRuns) {
-            foreach ($prop in $prevRuns.psobject.Properties) { $runs[$prop.Name] = $prop.Value }
+    Invoke-WithMecLock -Name "State" -Script {
+        $runs = @{}
+        if (Test-Path $lastRunFile) {
+            $prevRuns = Get-Content $lastRunFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $prevRuns) {
+                foreach ($prop in $prevRuns.psobject.Properties) { $runs[$prop.Name] = "$($prop.Value)" }
+            }
         }
+        $runs[$TaskName] = (Get-Date).ToString("o")
+        Save-JsonState -Path $lastRunFile -Data $runs
     }
-    $runs[$TaskName] = (Get-Date).ToString("o")
-    $runs | ConvertTo-Json | Set-Content $lastRunFile -Encoding UTF8
 } catch {
     Log-Message "Aviso ao registrar a conclusao da tarefa: $_"
 }
@@ -3800,25 +4452,20 @@ Destinos Gravados com Sucesso:
 $($allSuccessList -join "`r`n")
 "@
 
-# Rastreamento e Monitoramento Continuo de Destinos Externos (Watchdog 24h)
-$networkTrackerFile = Join-Path $scriptDir "network_tracker.json"
+# Rastreamento e Monitoramento Continuo de Destinos (Watchdog 24h)
 $netTracker = @{}
-if (Test-Path $networkTrackerFile) {
-    try { $netTracker = ConvertTo-HashtableCompat (Get-Content $networkTrackerFile -Raw -Encoding UTF8 | ConvertFrom-Json) }
-    catch { Log-Message "Aviso: falha ao ler o rastreador de destinos: $_" }
-}
-
-# 1. Processa Sucessos (Renova o contador no arquivo real)
+$trackerKeys = @()
 foreach ($successPath in ($networkSuccessList + $localSuccessList)) {
     $destDir = Split-Path $successPath -Parent
-    if (-not $netTracker.ContainsKey($destDir)) { $netTracker[$destDir] = @{} }
-    $netTracker[$destDir].LastSuccess = (Get-Date).ToString("o")
-    $netTracker[$destDir].FirstFailure = $null
-    $netTracker[$destDir].LastAlert = $null
+    $netTracker[$destDir] = @{ LastSuccess = (Get-Date).ToString("o"); FirstFailure = $null; LastAlert = $null }
+    $trackerKeys += $destDir
 }
-try { $netTracker | ConvertTo-Json -Depth 10 | Set-Content $networkTrackerFile -Encoding UTF8 } catch {}
+if ($trackerKeys.Count -gt 0) {
+    # Preserva o historico existente dos demais destinos; so estes sao renovados
+    Save-NetworkTrackerEntries -Entries $netTracker -Keys $trackerKeys
+}
 
-# 2. Executa a Verificacao Blindada de Saude de Destinos Externos / Rede (24 Horas)
+# Verificacao Blindada de Saude de Destinos Externos / Rede (24 Horas)
 $isExternalTask = ($TaskName -match "EXTERN" -or $TaskName -eq "BKP_EXTERNO")
 if ($failedDestinations.Count -gt 0 -or $isExternalTask) {
     $destsToCheck = if ($failedDestinations.Count -gt 0) { $failedDestinations } else { $allDestinations }
@@ -3827,7 +4474,7 @@ if ($failedDestinations.Count -gt 0 -or $isExternalTask) {
         if ($destinationFailureReasons.ContainsKey($destToCheck)) {
             $failureReasonForDestination = $destinationFailureReasons[$destToCheck]
         }
-        Test-ExternalDestinationsHealth -TaskName $TaskName -Destinations @($destToCheck) -FailureReason $failureReasonForDestination
+        Test-ExternalDestinationsHealth -TaskName $TaskName -Destinations @($destToCheck) -FailureReason $failureReasonForDestination -AllowDisconnect
     }
 }
 
@@ -3843,37 +4490,17 @@ $($failedDestinations -join "`r`n")
     Send-BackupNotification -Status "SUCESSO" -SubjectInfo "Backup $TaskName Concluido com Sucesso ($gzSizeMB MB)" -BodyDetails $bodyReport -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo -SuccessDests $allSuccessList -WarningDests @()
 }
 
-# --- FASE 7: AUDITORIA PREVENTIVA DIARIA DE INTEGRIDADE (SANDBOX ISOLADA) ---
-try {
-    if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
-        if (Test-Path $configFile) {
-            try { $global:configData = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
-        }
-    }
-    if ($null -ne $global:configData -and $null -ne $global:configData.Preferences) {
-        $p = $global:configData.Preferences
-        $enableAudit = if ($null -ne $p.EnableDailyAudit) { [bool]$p.EnableDailyAudit } else { $true }
-        $auditHour = if ($null -ne $p.DailyAuditHour) { [int]$p.DailyAuditHour } else { 3 }
-        $currentHour = (Get-Date).Hour
-        $todayStr = Get-Date -Format "yyyy-MM-dd"
-        
-        if ($enableAudit -and ($currentHour -eq $auditHour) -and ($p.LastAuditDate -ne $todayStr)) {
-            Log-Message "Horario agendado da Auditoria Diaria alcancado ($auditHour:30h). Iniciando auditoria preventiva em sandbox..."
-            Update-ConfigAuditDate -NewDate $todayStr
-            Invoke-DatabaseHealthAudit -TaskName $TaskName
-        }
-    }
-} catch {
-    Log-Message "Aviso na chamada da auditoria diaria: $_"
-}
+# A auditoria diaria NAO roda mais dentro da rotina de backup: ela e disparada so
+# pelo servico (03:30, -RunAuditOnly -ScheduledAudit) com trava propria. Rodar nos
+# dois lugares gerava duas auditorias no mesmo dia disputando a mesma sandbox.
 
-# 11. CAMADA AUTO-UPDATE EM NUVEM (MEC LiveUpdate via GitHub)
+# CAMADA AUTO-UPDATE EM NUVEM (MEC LiveUpdate assinado)
 try {
     Invoke-MecLiveUpdate -Force:$ForceUpdate
 } catch {
     Log-Message "Aviso na verificacao de auto-update: $_"
 }
 
+Exit-BackupLock
 Log-Message "======================================================"
 exit 0
-
