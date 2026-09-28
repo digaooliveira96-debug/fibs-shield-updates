@@ -18,7 +18,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.24"
+$script:EngineVersion = "2.2.25"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -2203,40 +2203,6 @@ function Test-ExternalDestinationsHealth {
                     if ($existingGzs.Count -gt 0) {
                         $realLastBackupTime = $existingGzs[0].LastWriteTime
                     }
-                } elseif ($destTrim.StartsWith("\\") -and -not $isNetPasswordEmpty) {
-                    # Tenta compartilhamento administrativo (C$ ou D$) antes de dar como inacessivel
-                    $cleanP = $destTrim.TrimStart('\')
-                    $pParts = $cleanP.Split('\')
-                    if ($pParts.Length -ge 2 -and $pParts[1] -notmatch '^[A-Za-z]\$') {
-                        $uncH = $pParts[0]
-                        $sName = $pParts[1]
-                        $subR = if ($pParts.Length -gt 2) { ($pParts[2..($pParts.Length - 1)]) -join '\' } else { "" }
-                        foreach ($altDrive in @("c$", "d$")) {
-                            $altRoot = "\\$uncH\$altDrive"
-                            $altConn = $null
-                            if ($hasNetUser) {
-                                $altConn = Connect-NetworkShare -UncRoot $altRoot -User $tConf.NetworkUser -Password $senhaRede -AllowDisconnect:$AllowDisconnect
-                            }
-                            $subPartR = ""
-                            if (-not [string]::IsNullOrWhiteSpace($subR)) { $subPartR = "\$subR" }
-                            $checkPath = "\\$uncH\$altDrive\$sName$subPartR"
-                            $found = $false
-                            try {
-                                if (Test-Path $checkPath) {
-                                    $found = $true
-                                    $destAccessible = $true
-                                    $existingGzs = @(Get-ChildItem -Path "$checkPath\*" -Include "*.GZ", "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
-                                    if ($existingGzs.Count -gt 0) {
-                                        $realLastBackupTime = $existingGzs[0].LastWriteTime
-                                    }
-                                    Log-Message "Monitor de Destino: Destino '$destTrim' verificado com sucesso via compartilhamento alternativo: $checkPath"
-                                }
-                            } catch {}
-                            # So desconecta o que ESTE monitor conectou
-                            if ($null -ne $altConn -and $altConn.Ok -and $altConn.Code -eq 0) { Disconnect-NetworkShare $altRoot }
-                            if ($found) { break }
-                        }
-                    }
                 }
             } catch {}
 
@@ -3119,14 +3085,20 @@ function Invoke-MecLiveUpdate {
         try {
             [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
         } catch {}
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+        } catch {}
         # Nunca herdar um "aceitar qualquer certificado" de outro trecho do processo
         [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
 
         $webClient = New-Object System.Net.WebClient
         $webClient.Headers.Add("User-Agent", "MEC-Shield-LiveUpdate/$engineVersion")
 
-        # Le manifesto remoto (version.json)
-        $manifestJson = $webClient.DownloadString($updateUrl)
+        # Le manifesto remoto (version.json) com cache-buster para evitar retencao de CDN (Fastly 300s)
+        $cacheBuster = [Environment]::TickCount
+        $sep = if ($updateUrl.Contains("?")) { "&" } else { "?" }
+        $manifestFetchUrl = "$updateUrl${sep}t=$cacheBuster"
+        $manifestJson = $webClient.DownloadString($manifestFetchUrl)
         $manifest = $manifestJson | ConvertFrom-Json
 
         try {
@@ -3200,7 +3172,7 @@ function Invoke-MecLiveUpdate {
                     throw "SHA-256 do instalador baixado nao confere com o manifesto assinado."
                 }
                 Log-Message "[LIVEUPDATE] Instalador conferido (SHA-256 assinado). Executando em modo silencioso..."
-                $proc = Start-Process -FilePath $tempSetup -ArgumentList "/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -PassThru
+                $proc = Start-Process -FilePath $tempSetup -ArgumentList "/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$scriptDir`"" -PassThru
                 $null = $proc.Handle
                 if (-not $proc.WaitForExit(15 * 60 * 1000)) {
                     Log-Message "[LIVEUPDATE AVISO] O instalador passou de 15 minutos. Ele continua em segundo plano; esta rotina segue sem aguardar."
@@ -4243,66 +4215,6 @@ foreach ($destTrimmed in $resolvedDestList) {
 
         if ($attempt -lt $retryCount) {
             Start-Sleep -Seconds $retryInterval
-        }
-    }
-
-    # FALLBACK AUTOMATICO DE COMPARTILHAMENTO ADMINISTRATIVO:
-    # Se a pasta compartilhada normal (\\terminal\pasta) falhou (descompartilhada ou sem permissao),
-    # tenta automaticamente via compartilhamento administrativo (C$ ou D$) com as mesmas credenciais
-    if (-not $destSuccess -and $isNetwork) {
-        $parts = $destTrimmed.TrimStart('\').Split('\')
-        if ($parts.Length -ge 2) {
-            $uncHost = $parts[0]
-            $shareName = $parts[1]
-            $subRest = if ($parts.Length -gt 2) { ($parts[2..($parts.Length - 1)]) -join '\' } else { "" }
-
-            $subPartRest = ""
-            if (-not [string]::IsNullOrWhiteSpace($subRest)) { $subPartRest = "\$subRest" }
-
-            $altCandidates = @()
-            if ($shareName -notmatch '^[A-Za-z]\$') {
-                $altCandidates += "\\$uncHost\c$\$shareName$subPartRest"
-                $altCandidates += "\\$uncHost\d$\$shareName$subPartRest"
-            } elseif (-not [string]::IsNullOrWhiteSpace($subRest)) {
-                $altCandidates += "\\$uncHost\$subRest"
-            }
-
-            foreach ($altDest in $altCandidates) {
-                Log-Message "REDE RESILIENTE: Destino principal falhou. Tentando variacao via compartilhamento administrativo: $altDest..."
-                $altParts = $altDest.TrimStart('\').Split('\')
-                $altRoot = "\\$($altParts[0])\$($altParts[1])"
-                $altConn = $null
-                $finalPathAlt = $null
-                try {
-
-
-                    if (-not (Test-Path $altDest)) {
-                        try { [System.IO.Directory]::CreateDirectory($altDest) | Out-Null } catch {}
-                    }
-
-                    if (Test-Path $altDest) {
-                        $altDestClean = $altDest.Trim().Trim('"', "'").TrimEnd('\', '/')
-                        $finalPathAlt = "$altDestClean\$fileNameClean"
-                        Copy-Item -Path $tempGz -Destination $finalPathAlt -Force -ErrorAction Stop
-                        $destShaAlt = Get-Sha256OfFile -Path $finalPathAlt
-                        if ($destShaAlt -eq $zipSha) {
-                            $destSuccess = $true
-                            $networkSuccessList += $finalPathAlt
-                            Log-Message "SUCESSO no destino alternativo administrativo: $finalPathAlt (Copia gravada e SHA-256 conferido!)"
-                            Invoke-RetentionPolicy -Directory $altDestClean -Prefix $basePrefix -Keep $keepBackupsCount
-                            break
-                        } else {
-                            Remove-Item $finalPathAlt -Force -ErrorAction SilentlyContinue
-                            Log-Message "Copia reprovada (SHA-256 divergente) removida de $finalPathAlt"
-                        }
-                    }
-                } catch {
-                    Log-Message "Tentativa no destino alternativo '$altDest' falhou: $_"
-                } finally {
-                    # So desconecta o que esta rotina conectou
-                    if ($null -ne $altConn -and $altConn.Ok -and $altConn.Code -eq 0) { Disconnect-NetworkShare $altRoot }
-                }
-            }
         }
     }
 
