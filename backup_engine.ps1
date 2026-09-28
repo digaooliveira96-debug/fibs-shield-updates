@@ -443,7 +443,8 @@ function Test-IsSystemReservedDrive {
         if (-not (Test-Path "${driveLetter}\")) { return $false }
         $di = New-Object System.IO.DriveInfo($driveLetter)
         if (-not $di.IsReady) { return $false }
-        if ($di.TotalSize -lt 4GB) { return $true }
+        # 1. Checagem explicita do nome/rotulo da particao:
+        # Se estiver escrito 'Reservado pelo Sistema', 'System Reserved', etc., anula e nao mapeia!
         $vLabel = ($di.VolumeLabel + "").ToLower()
         if (($vLabel -like "*reservad*") -or `
             ($vLabel -like "*reserved*") -or `
@@ -454,6 +455,9 @@ function Test-IsSystemReservedDrive {
             ($vLabel -like "*esp*")) {
             return $true
         }
+
+        # 2. Particao minuscula (< 1 GB) tipica de particao de boot/WinRE oculta do Windows
+        if ($di.TotalSize -lt 1GB) { return $true }
     } catch {}
     return $false
 }
