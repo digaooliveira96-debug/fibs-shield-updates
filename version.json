@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.29",
+    "version":  "2.2.30",
     "releaseDate":  "2026-09-28",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Watchdog (a cada 2 min) e Startup Guard (no boot) passam a existir de verdade: o instalador antigo nunca conseguia registra-los; agora o servico os garante a cada inicio e o instalador usa schtasks direto.\\n2. Botao Parar do painel pausa o Watchdog; qualquer inicio ou reboot o reativa; Desinstalar remove as tarefas.\\n3. Inclui a v2.2.28 (instalador sem senha) e a v2.2.27 (credencial de rede opcional, protecao de disco).",
-    "setupSha256":  "637479C3BB150BA33AE67EF3FC41504E31A9F2F6017C71A0B4BB9A7406CF553D",
-    "engineSha256":  "3B917CB8EC7A510F7E07490F56A33605B981830107865249C16B216C20E6A336",
-    "signature":  "ZRH8QtJc0rL3sb6on7Aza6Bn5wT2SgxZgkw3LQdxwyMlzNmxlb9025nyJJ+4T8mQ3vwiKf2ylQshwpbYT5YxpxIoXU3oUlzjQjuqoIENX0qyKDXC/3VblNXJjZXx4GPlb7xUTHuVwj6QaPUOBc5BjTtJMfAfgEyMeha8w5px4nWAxpxyR6SlaU2CuhQuuFgGQrT2RFphuoSApKX7NS9T6+k6v0LpAyZGcSahxe7KmS+Qu0c61AKEqxqhobFrydM0E5VJQuEAjeZGjk8Q97TL09BzIsCuJzAErpCV83pxie61whn5GvusWBbeelYL7KbDa5JykF0ti0u6Fu1UsKDU1W9p83kBLCdI8DJLZO34HaddH0zenTuHzZxoKNwHUR0hpqBiDZx1v+z8Rs69kuezlmDL4bZoWRvRJ8QTnmh7X0Zg4MFvi0b2mc9ZQYlIRJgVNbntuhxIkxnLKo+6ZCwzQiAEwELMoiOdEd1PvJGfbSgSnsr0PAgNDHhwkI2UD4pJ"
+    "changelog":  "1. Painel: tarefa sem destino de rede nao guarda credencial de rede (sobras antigas passam a ser limpas ao salvar).\\n2. Inclui a v2.2.29 (Watchdog e Startup Guard garantidos pelo servico), a v2.2.28 (instalador sem senha) e a v2.2.27 (credencial de rede opcional com teste SYSTEM, protecao de disco).",
+    "setupSha256":  "75C43A9A85FF42D22F7FD1A8CCCD29437CE53A55A935E2EE8F3EBFD38CC0C937",
+    "engineSha256":  "EF2F64E576A049AEA4B4B4F31D61A4BCE5F1860868C95FC976A1D39F83C82524",
+    "signature":  "M+GEjSNXUmtciQIISWmswnYF0dalnCXEYBvA9Zmk6NHAY9rOlWfhj9Qs96G3szrw0TIjDf4bCNQHNsyABJNQRXRaOzymOcA6v0YHe7eRTgN8AbbU/hnL+8cBjS24lP0V5rBqsDAA/zRsykOsRuzeQKWCpS/yowo2EtoW8jbtNUAfGMzyTz8INFEE3jCunz5/wzLnQfZXFSToQcVy5KiRhCFD12cn6ajUZs1OB7KQaMhbsIp5YlxEU0/UaSCpCp/AZXHJfuxzDWkWXReYw2d+vBbz4DcoPwrdk4HXnhbVIE8hNNd9k9Qr84KooDvxVyN1Cu3J5RCncqxDBtH8QSLPCbMecbjBm1BYx7K90r3UPQAxz6p+c57zjg1icv3ekGjaCMIGsxAFuWzmosnbACSFscxe2XosR+kKs/KEUPuFOPc2WiWxnP852Ule8IwUiZlBFqinfMooIfzY4e1zsqGeo5gtWyi8jy8TNgKC7cKx2K5Gfo3xbkKpGPkZOiV0qoAo"
 }
