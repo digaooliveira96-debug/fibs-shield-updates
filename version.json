@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.28",
+    "version":  "2.2.29",
     "releaseDate":  "2026-09-28",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Instalador sem nenhuma senha: e-mail e senha SMTP sao configurados no painel (Preferencias) e preservados em reinstalacoes.\\n2. Inclui tudo da v2.2.27: credencial de rede opcional com teste como SYSTEM, protecao real de disco, particoes por rotulo exato e instalador na pasta existente.",
-    "setupSha256":  "9674E48865AD4EFCAA97A59F6DBFDC2BE36A6682F06D3B52B2DB1A57D8CE2B2A",
-    "engineSha256":  "D0984AFB0870CAB3489A9EF9E2D0B157393C557B7712E3FEFE124868DD4EB330",
-    "signature":  "sKTQvg5FQN7fYdxxGI5C30f+xtYvDQoewbcofAbCmiew23IVR/JPzgUvqOj14w7o9XwTWipiSVrrvOyjZ8hrcWiMWqY27F5iyHgcxqCuxvUJVGuK+RDFygq8H2i16sVsckhYun1+AUiTaBfnj59YrG7JGvm6fm65mrLcvdO2ec1T16WaRyWY4v6gPdNmjHUBsk0v6z77IPbfYV0QG99VfNxdTnbJ1dM6WGLdTRl8iBN+mhqgE/o3/1RH04kq7Ps4ybtF924de5IWWIqwtRHZ+AhZf/2Yd4i0QvjHcunbHe3MDcR79P3IckU0LzeDqwdJu3IN6/l4ukwAXWFHmDrjbA82oAxXD96aJaDmpbkEmsWE2PvdhVysedL1cWA7CRiOqV1olZQOnjkOY4PO2cLGbWF5b4C0TO48TXB3wb6F5timlvibPVatfzwVMD2pMCNyPMrFU8MV6O1NY5Wb0bFrOaFbgZL1OWgwr7J7iqMtRxIwlCljp7kOcRZ8O+MdSlTA"
+    "changelog":  "1. Watchdog (a cada 2 min) e Startup Guard (no boot) passam a existir de verdade: o instalador antigo nunca conseguia registra-los; agora o servico os garante a cada inicio e o instalador usa schtasks direto.\\n2. Botao Parar do painel pausa o Watchdog; qualquer inicio ou reboot o reativa; Desinstalar remove as tarefas.\\n3. Inclui a v2.2.28 (instalador sem senha) e a v2.2.27 (credencial de rede opcional, protecao de disco).",
+    "setupSha256":  "637479C3BB150BA33AE67EF3FC41504E31A9F2F6017C71A0B4BB9A7406CF553D",
+    "engineSha256":  "3B917CB8EC7A510F7E07490F56A33605B981830107865249C16B216C20E6A336",
+    "signature":  "ZRH8QtJc0rL3sb6on7Aza6Bn5wT2SgxZgkw3LQdxwyMlzNmxlb9025nyJJ+4T8mQ3vwiKf2ylQshwpbYT5YxpxIoXU3oUlzjQjuqoIENX0qyKDXC/3VblNXJjZXx4GPlb7xUTHuVwj6QaPUOBc5BjTtJMfAfgEyMeha8w5px4nWAxpxyR6SlaU2CuhQuuFgGQrT2RFphuoSApKX7NS9T6+k6v0LpAyZGcSahxe7KmS+Qu0c61AKEqxqhobFrydM0E5VJQuEAjeZGjk8Q97TL09BzIsCuJzAErpCV83pxie61whn5GvusWBbeelYL7KbDa5JykF0ti0u6Fu1UsKDU1W9p83kBLCdI8DJLZO34HaddH0zenTuHzZxoKNwHUR0hpqBiDZx1v+z8Rs69kuezlmDL4bZoWRvRJ8QTnmh7X0Zg4MFvi0b2mc9ZQYlIRJgVNbntuhxIkxnLKo+6ZCwzQiAEwELMoiOdEd1PvJGfbSgSnsr0PAgNDHhwkI2UD4pJ"
 }

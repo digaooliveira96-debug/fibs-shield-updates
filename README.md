@@ -1,6 +1,6 @@
 # MEC Shield Enterprise — Canal Oficial de Atualização
 
-![Versão](https://img.shields.io/badge/vers%C3%A3o-2.2.28-2563eb) ![Assinatura](https://img.shields.io/badge/manifesto-RSA--3072%20%2B%20SHA--256-16a34a) ![Plataforma](https://img.shields.io/badge/Windows-7%20a%20Server%202025-0ea5e9)
+![Versão](https://img.shields.io/badge/vers%C3%A3o-2.2.29-2563eb) ![Assinatura](https://img.shields.io/badge/manifesto-RSA--3072%20%2B%20SHA--256-16a34a) ![Plataforma](https://img.shields.io/badge/Windows-7%20a%20Server%202025-0ea5e9)
 
 Canal de distribuição do **MEC Shield Enterprise**, sistema de backup contínuo 24/7 para bancos Firebird do Sismotel.
 
