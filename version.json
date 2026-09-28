@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.27",
+    "version":  "2.2.28",
     "releaseDate":  "2026-09-28",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Backup em rede: usuario e senha de rede OPCIONAIS e botao \u0027Testar Acesso como SYSTEM\u0027 (grava de verdade pela conta do backup automatico).\\n2. Protecao de disco real: abre espaco apagando os backups mais antigos (preserva os 3 mais recentes) ou recusa a copia; folga de max(2 GB, 10%) no disco do banco.\\n3. Auditoria exige 2.5x o banco livre; temporario do gbak respeita a folga do disco do banco.\\n4. Particoes reservadas so por rotulo exato ou \u003c 1 GB (discos como \u0027ESPELHO\u0027 voltam a valer); destino invalido gera alerta.\\n5. Instalador atualiza na pasta existente, reconfigura o servico sem apaga-lo e pausa o watchdog durante a instalacao.",
-    "setupSha256":  "36F69A17F7E281457E3203D60C2FC87CB241EC23DE28CBD677AD424AF86D2D65",
-    "engineSha256":  "1F69620F83ED4CF1B35947ED1915B0A6059008A0034431FF17DCFD3662D89CE7",
-    "signature":  "k6k3f+Emy8CkfXN/LeajcnkMA2RJI4zKEIiM3qp+F17GdHfjhqdw9f3hSL3TOap0BUP3Jd9f3S5MAtwUP2YyFQHL8mZsmf+FeGjFQrIZAVpvDEAaEnkab8NZjIZtiuCgnRrDbG/deLfFSiSMhnOczuzllmxIzLNJDRL354YN84zNLj60jc8FaTJtCGvmnr6bVyX3JL0tYEqP1Xw0u0cOoaJ/keRUCMZpS1Qs/j0+/hHkNP5rajnISqaWz3gsWY2yE5o0a7BRC44CWrTJhzWEA3vKzYC0WiPbgxbrzLsLxWyjE8rqTM5vU+/Ua6GbViTbg8zmgbI2JfkVPmdc5ppy86X7OkbJMq1urxe89aLSrF4iUlFVDaa/st0jtUoSHQzpNLLWOvrMdrjA0ofxYml4OGLqumW8lhtUNQnt0ilXx73CU0ofTp6Fk68btDrOCCPKpAjomRY6E1Q+nx1i5qdCPMpDju4elzCc5cuCop0BEENyXwPRDY4qaBlNUPmjir9n"
+    "changelog":  "1. Instalador sem nenhuma senha: e-mail e senha SMTP sao configurados no painel (Preferencias) e preservados em reinstalacoes.\\n2. Inclui tudo da v2.2.27: credencial de rede opcional com teste como SYSTEM, protecao real de disco, particoes por rotulo exato e instalador na pasta existente.",
+    "setupSha256":  "9674E48865AD4EFCAA97A59F6DBFDC2BE36A6682F06D3B52B2DB1A57D8CE2B2A",
+    "engineSha256":  "D0984AFB0870CAB3489A9EF9E2D0B157393C557B7712E3FEFE124868DD4EB330",
+    "signature":  "sKTQvg5FQN7fYdxxGI5C30f+xtYvDQoewbcofAbCmiew23IVR/JPzgUvqOj14w7o9XwTWipiSVrrvOyjZ8hrcWiMWqY27F5iyHgcxqCuxvUJVGuK+RDFygq8H2i16sVsckhYun1+AUiTaBfnj59YrG7JGvm6fm65mrLcvdO2ec1T16WaRyWY4v6gPdNmjHUBsk0v6z77IPbfYV0QG99VfNxdTnbJ1dM6WGLdTRl8iBN+mhqgE/o3/1RH04kq7Ps4ybtF924de5IWWIqwtRHZ+AhZf/2Yd4i0QvjHcunbHe3MDcR79P3IckU0LzeDqwdJu3IN6/l4ukwAXWFHmDrjbA82oAxXD96aJaDmpbkEmsWE2PvdhVysedL1cWA7CRiOqV1olZQOnjkOY4PO2cLGbWF5b4C0TO48TXB3wb6F5timlvibPVatfzwVMD2pMCNyPMrFU8MV6O1NY5Wb0bFrOaFbgZL1OWgwr7J7iqMtRxIwlCljp7kOcRZ8O+MdSlTA"
 }
