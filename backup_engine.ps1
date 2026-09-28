@@ -18,7 +18,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.22"
+$script:EngineVersion = "2.2.23"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -2191,29 +2191,20 @@ function Test-ExternalDestinationsHealth {
             $touchedKeys += $destTrim
             $detectedReason = $FailureReason
 
-            # Autenticacao proativa se for UNC de rede e houver credenciais
+            # Autenticacao proativa se for UNC de rede e houver credenciais completas
             $senhaRede = Unprotect-String $tConf.NetworkPassword
             $hasNetUser = -not [string]::IsNullOrWhiteSpace($tConf.NetworkUser)
-            $dpapiIlegivel = ($null -eq $senhaRede -and (Test-IsDpapiBlob $tConf.NetworkPassword))
-            $isNetPasswordEmpty = [string]::IsNullOrWhiteSpace($senhaRede)
+            $hasNetPass = -not [string]::IsNullOrWhiteSpace($senhaRede)
 
             $authFailureReason = ""
-            if ($destTrim.StartsWith("\\") -and $hasNetUser) {
+            if ($destTrim.StartsWith("\\") -and $hasNetUser -and $hasNetPass) {
                 $uncParts = $destTrim -split '\\'
                 if ($uncParts.Count -ge 4) {
                     $uncRoot = "\\$($uncParts[2])\$($uncParts[3])"
-                    if ($dpapiIlegivel) {
-                        Log-Message "Aviso: a senha de rede de '$($tConf.NetworkUser)' esta ilegivel neste servidor (DPAPI de outra maquina). Tentando checagem direta..."
-                        $authFailureReason = "Senha de rede ilegivel neste servidor (criptografia DPAPI de outra maquina). Redigite a senha da tarefa no MEC Shield."
-                    } elseif (-not $isNetPasswordEmpty) {
-                        $conn = Connect-NetworkShare -UncRoot $uncRoot -User $tConf.NetworkUser -Password $senhaRede -AllowDisconnect:$AllowDisconnect
-                        if (-not $conn.Ok) {
-                            Log-Message "Monitor: autenticacao em $uncRoot falhou (codigo $($conn.Code)): $($conn.Message)"
-                            $authFailureReason = "Autenticacao de rede recusada em $uncRoot (codigo $($conn.Code)): $($conn.Message)"
-                        }
-                    } else {
-                        Log-Message "Aviso: Senha de rede em branco para usuario '$($tConf.NetworkUser)' ao verificar saude de $uncRoot. Tentando checagem direta..."
-                        $authFailureReason = "Senha de rede nao configurada para o usuario '$($tConf.NetworkUser)'."
+                    $conn = Connect-NetworkShare -UncRoot $uncRoot -User $tConf.NetworkUser -Password $senhaRede -AllowDisconnect:$AllowDisconnect
+                    if (-not $conn.Ok) {
+                        Log-Message "Monitor: autenticacao em $uncRoot falhou (codigo $($conn.Code)): $($conn.Message)"
+                        $authFailureReason = "Autenticacao de rede recusada em $uncRoot (codigo $($conn.Code)): $($conn.Message)"
                     }
                 }
             }
@@ -3693,13 +3684,7 @@ $networkUser         = $task.NetworkUser
 $networkPassword     = Unprotect-String $task.NetworkPassword
 $networkConfigFailureReason = ""
 if (-not [string]::IsNullOrWhiteSpace($networkUser) -and $null -eq $networkPassword -and (Test-IsDpapiBlob $task.NetworkPassword)) {
-    # Blob DPAPI de outra maquina: antes era usado como se fosse a senha e o erro
-    # aparecia como "senha recusada", escondendo a causa real.
-    $networkConfigFailureReason = "Senha de rede ilegivel neste servidor (criptografada para outro computador via DPAPI)."
-    Log-Message "AVISO DE CONFIGURACAO: $networkConfigFailureReason Tentando acesso direto a rede."
-} elseif (-not [string]::IsNullOrWhiteSpace($networkUser) -and [string]::IsNullOrWhiteSpace($networkPassword)) {
-    $networkConfigFailureReason = "Senha de rede em branco no config.json para o usuario '$networkUser'."
-    Log-Message "AVISO DE CONFIGURACAO: $networkConfigFailureReason Tentando gravacao com acesso direto a rede."
+    Log-Message "Aviso: Senha de rede ilegivel neste servidor (DPAPI de outra maquina). Prosseguindo com permissao nativa do Windows..."
 }
 
 # --- FASE 1: AUTO-RECUPERACAO E ESPERA DE PRONTIDAO NO BOOT ---
@@ -4189,10 +4174,8 @@ foreach ($destTrimmed in $resolvedDestList) {
                     $destinationFailureReason = ""
                     Log-Message "Autenticacao de rede em $uncRoot estabelecida com sucesso (usuario '$($conn.User)')."
                 } else {
-                    Log-Message "Aviso: Autenticacao de rede recusada em $uncRoot (codigo $($conn.Code)): $($conn.Message). Tentando gravacao direta caso haja sessao ativa..."
+                    Log-Message "Aviso: Autenticacao de rede em $uncRoot retornou codigo $($conn.Code). Prosseguindo com permissao nativa do Windows..."
                 }
-            } elseif ($isNetwork -and -not [string]::IsNullOrWhiteSpace($networkUser)) {
-                Log-Message "Aviso: Senha de rede em branco para '$networkUser'. Tentando acesso direto ao destino de rede..."
             }
 
             # Normalizacao e limpeza do caminho de destino
@@ -4463,6 +4446,13 @@ Causas mais frequentes para verificar:
             $motivo = if ($destinationFailureReasons.ContainsKey($destToCheck)) { $destinationFailureReasons[$destToCheck] } else { $networkConfigFailureReason }
             Test-ExternalDestinationsHealth -TaskName $TaskName -Destinations @($destToCheck) -FailureReason $motivo -AllowDisconnect
         }
+    }
+    # CAMADA AUTO-UPDATE RESILIENTE: Mesmo com falha nos destinos, verifica atualizacao na nuvem
+    # para que o cliente receba correcoes e melhorias sem ficar travado em versoes antigas.
+    try {
+        Invoke-MecLiveUpdate -Force:$ForceUpdate
+    } catch {
+        Log-Message "Aviso na verificacao de auto-update: $_"
     }
     Exit-BackupLock
     exit 1
