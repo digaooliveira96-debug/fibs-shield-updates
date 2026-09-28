@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.21",
+    "version":  "2.2.22",
     "releaseDate":  "2026-09-28",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
     "changelog":  "1. Auditoria diaria alerta backup nao restauravel, corrupcao e falha persistente de validacao (sem falso \u0027integro\u0027).\\n2. LiveUpdate com manifesto assinado (RSA/SHA-256), hashes conferidos e sem reinstalacao em loop.\\n3. Trava de backup por mutex do Windows, fail-safe com retencao e protecao do disco do banco.\\n4. Senhas fora da linha de comando (WNetAddConnection2 e ISC_USER/ISC_PASSWORD), SMTP com STARTTLS.\\n5. config.json gravado de forma atomica com copia .bak; servico com agendamento resiliente.",
-    "setupSha256":  "951AEDE43AED5B2EFEE79B77BB640DE580995924E65CF155E64FA0C97CD071AE",
-    "engineSha256":  "83671FAED4520C4D5E3C42AB6E5ED9C38C3610341ED2C2B196D5262C0B2F5C08",
-    "signature":  "ta0DysWdLf9bcRdPonI4bQLOHrK2xEOQZmtgvjdK86yh08k5ghTMETVmSxUF5s2KrzA/J2IKPrTJGDw9FHu02JcAqrGlmwjIcYBrtzUlIn47D2vHBIbVXd7Td7QsutD76DvXTpQM8tYcJutttL7VrqdIByC1Tx9A5UIxGl6tHK2fpnu/01s6hdXMCArI8ri78iJ5NCxmkXeLtsqdDwBnDwcDxxQTuQAczSwVY/dzWbbktRsC0EiSqYSiF/Zf4OiK2VYJgdD2NubLtFUQHVcza+vF+mQJO5rTAdytzlaGMK+mj+tfOJDclpagDSIxQe3bSOclSDDCIJgdm1g28rkAm/vrcQMlVjA2YVDEgXIonj/EDthS/3RkOeS2vgqZVbRk1qAJfYd8/Xy+bszyh97s3O13tV6F6IkAQpPk1lWfakfxWdkTsL35k9H2O91dIO+ZUwevgNfC8EQDsxXWqiMDGuTbyhCocvUleCe5YTIvtxISDJnydu9pTeCQR54iYrIS"
+    "setupSha256":  "AC79DFC8B7963A3305F287C2B67E2CD83E735A84C97E94807C61566943C55C48",
+    "engineSha256":  "8321F0326F1DCA403CF9E27B5AF44EF613DD935D7F39B45F6B7C2F011246A3A1",
+    "signature":  "V12Z1g/GyB8kEaT0KqMZoB19Q9Q1dKLYcOrS6K9AumyQ890zuEuaSQpFbFxbJfOdFb0pq+i9rY9d4GTIx2iMr0HvBs9QdRm43mJVTDrbVbAb6SaVXZpjYpYtfVgtqWBeCeN26wJeIiTpJdRQpTgZbXODWEZI/uOVYwt89NDK7sFkasAmpnq5JAjU0LXX4DJOgOCRz7vfafC5sfFF0ToupN6BjexfR3lqEPsBBHVNgM6xI4ImbCKMNGg1kqtkkBZHUmrKwYwjpWsLqDkO5jmpxoXIZ4cb/KYZsW5Md9AxLcePpWlRdIl3OBC3PpEKfUV7V9jnpJljOtPhMQtLVWetZ3O0bnTylUpNxqtA2aRW1ANDZ0RD6pZ2EiIJpHoBN7KvquL4lsUHY1tJVVWkb4qv2/qPQ3chLQkI1YKtRQVg3jecaFHkdLPjEo52tPZnw3L+Hr9I6xMxzBbpLe1RKOqQjJbYM81CyPNoY7VpLE6/dbgAVe2c3Kdz9ro1uedfewzp"
 }

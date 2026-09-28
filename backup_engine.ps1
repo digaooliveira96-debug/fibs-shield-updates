@@ -18,7 +18,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.21"
+$script:EngineVersion = "2.2.22"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -430,6 +430,34 @@ function Resolve-MappedDrivePath {
     return $p
 }
 
+# Identifica se uma unidade ou caminho pertence a uma particao reservada do sistema
+# (ex: 'Reservado pelo Sistema', EFI, WinRE ou capacidade menor que 4 GB) para que
+# nunca seja selecionada ou usada como destino de backup.
+function Test-IsSystemReservedDrive {
+    param ([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path.StartsWith("\\")) { return $false }
+    try {
+        $root = [System.IO.Path]::GetPathRoot($Path)
+        if ([string]::IsNullOrWhiteSpace($root)) { return $false }
+        $driveLetter = $root.TrimEnd('\', '/')
+        if (-not (Test-Path "${driveLetter}\")) { return $false }
+        $di = New-Object System.IO.DriveInfo($driveLetter)
+        if (-not $di.IsReady) { return $false }
+        if ($di.TotalSize -lt 4GB) { return $true }
+        $vLabel = ($di.VolumeLabel + "").ToLower()
+        if (($vLabel -like "*reservad*") -or `
+            ($vLabel -like "*reserved*") -or `
+            ($vLabel -like "*recovery*") -or `
+            ($vLabel -like "*recupera*") -or `
+            ($vLabel -like "*efi*") -or `
+            ($vLabel -like "*boot*") -or `
+            ($vLabel -like "*esp*")) {
+            return $true
+        }
+    } catch {}
+    return $false
+}
+
 function Disconnect-HostConnections {
     param([string]$HostName)
     if ([string]::IsNullOrWhiteSpace($HostName)) { return }
@@ -813,10 +841,13 @@ function Send-MailWithRetry {
     # senha nao trafegar em texto puro. So cai para texto puro se o servidor declarar
     # que NAO suporta TLS (nao por erro de certificado).
     $useTls = $UseSsl -or ($Port -eq 587 -and $null -ne $smtpPassword)
-    # Certificado invalido so e aceito com opt-in explicito (SmtpAllowInvalidCertificate)
+    # Certificado invalido e tolerado por padrao para evitar falha em relays locais/webmail
     # e apenas durante este envio -- antes a validacao ficava desligada no processo
     # inteiro, inclusive para o download do LiveUpdate.
-    $allowInvalidCert = ($null -ne $Pref.SmtpAllowInvalidCertificate -and [bool]$Pref.SmtpAllowInvalidCertificate)
+    $allowInvalidCert = $true
+    if ($null -ne $Pref.SmtpAllowInvalidCertificate) {
+        $allowInvalidCert = [bool]$Pref.SmtpAllowInvalidCertificate
+    }
     $previousCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
 
     try {
@@ -2144,6 +2175,7 @@ function Test-ExternalDestinationsHealth {
         foreach ($dest in $destsToCheck) {
             $destTrim = $dest.TrimEnd('\', '/')
             if ([string]::IsNullOrWhiteSpace($destTrim)) { continue }
+            if (Test-IsSystemReservedDrive -Path $destTrim) { continue }
 
             # Traducao automatica de unidade mapeada (ex: Z:\... -> \\servidor\pasta\...) para servicos Windows (SYSTEM)
             $destResolved = Resolve-MappedDrivePath $destTrim
@@ -2161,28 +2193,23 @@ function Test-ExternalDestinationsHealth {
             $dpapiIlegivel = ($null -eq $senhaRede -and (Test-IsDpapiBlob $tConf.NetworkPassword))
             $isNetPasswordEmpty = [string]::IsNullOrWhiteSpace($senhaRede)
 
+            $authFailureReason = ""
             if ($destTrim.StartsWith("\\") -and $hasNetUser) {
                 $uncParts = $destTrim -split '\\'
                 if ($uncParts.Count -ge 4) {
                     $uncRoot = "\\$($uncParts[2])\$($uncParts[3])"
                     if ($dpapiIlegivel) {
-                        Log-Message "ERRO DE CONFIGURACAO: a senha de rede de '$($tConf.NetworkUser)' esta criptografada para OUTRO computador (DPAPI) e nao abre neste servidor."
-                        if ([string]::IsNullOrWhiteSpace($detectedReason)) {
-                            $detectedReason = "Senha de rede ilegivel neste servidor (criptografia DPAPI de outra maquina). Redigite a senha da tarefa no MEC Shield."
-                        }
+                        Log-Message "Aviso: a senha de rede de '$($tConf.NetworkUser)' esta ilegivel neste servidor (DPAPI de outra maquina). Tentando checagem direta..."
+                        $authFailureReason = "Senha de rede ilegivel neste servidor (criptografia DPAPI de outra maquina). Redigite a senha da tarefa no MEC Shield."
                     } elseif (-not $isNetPasswordEmpty) {
                         $conn = Connect-NetworkShare -UncRoot $uncRoot -User $tConf.NetworkUser -Password $senhaRede -AllowDisconnect:$AllowDisconnect
                         if (-not $conn.Ok) {
                             Log-Message "Monitor: autenticacao em $uncRoot falhou (codigo $($conn.Code)): $($conn.Message)"
-                            if ([string]::IsNullOrWhiteSpace($detectedReason)) {
-                                $detectedReason = "Autenticacao de rede recusada em $uncRoot (codigo $($conn.Code)): $($conn.Message)"
-                            }
+                            $authFailureReason = "Autenticacao de rede recusada em $uncRoot (codigo $($conn.Code)): $($conn.Message)"
                         }
                     } else {
-                        Log-Message "Aviso: Senha de rede em branco para usuario '$($tConf.NetworkUser)' ao verificar saude de $uncRoot."
-                        if ([string]::IsNullOrWhiteSpace($detectedReason)) {
-                            $detectedReason = "Senha de rede nao configurada (campo NetworkPassword vazio ou nulo no config.json para o usuario '$($tConf.NetworkUser)')."
-                        }
+                        Log-Message "Aviso: Senha de rede em branco para usuario '$($tConf.NetworkUser)' ao verificar saude de $uncRoot. Tentando checagem direta..."
+                        $authFailureReason = "Senha de rede nao configurada para o usuario '$($tConf.NetworkUser)'."
                     }
                 }
             }
@@ -2270,7 +2297,7 @@ function Test-ExternalDestinationsHealth {
                 $firstFail = [DateTime]::Parse($netTracker[$destTrim].FirstFailure)
                 $hoursSince = ((Get-Date) - $firstFail).TotalHours
                 if ([string]::IsNullOrWhiteSpace($detectedReason)) {
-                    $detectedReason = "Terminal offline, pasta descompartilhada ou credenciais de rede recusadas."
+                    $detectedReason = if (-not [string]::IsNullOrWhiteSpace($authFailureReason)) { $authFailureReason } else { "Terminal offline, pasta descompartilhada ou credenciais de rede recusadas." }
                 }
             }
 
@@ -2322,7 +2349,7 @@ function Get-OptimalSandboxDir {
         }
     }
     
-    $drives = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and ($_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable') }
+    $drives = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and ($_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable') -and -not (Test-IsSystemReservedDrive -Path $_.Name) }
     
     # Prioridade 1: Disco INTERNO (Fixed) diferente do disco do banco (ex: D: quando banco esta em C:)
     foreach ($d in ($drives | Where-Object { $_.DriveType -eq 'Fixed' -and $_.Name -ne $dbDrive })) {
@@ -3322,9 +3349,10 @@ function Select-FailSafeDirectory {
     param([string]$DbPath, [double]$GzSizeMB)
     $dbRoot = [System.IO.Path]::GetPathRoot($DbPath)
     $candidatos = @()
-    if (Test-Path "D:\") { $candidatos += "D:\BKP_SISMOTEL" }
-    $candidatos += "C:\BKP_SISMOTEL"
+    if ((Test-Path "D:\") -and -not (Test-IsSystemReservedDrive -Path "D:\")) { $candidatos += "D:\BKP_SISMOTEL" }
+    if (-not (Test-IsSystemReservedDrive -Path "C:\")) { $candidatos += "C:\BKP_SISMOTEL" }
     foreach ($c in $candidatos) {
+        if (Test-IsSystemReservedDrive -Path $c) { continue }
         $root = [System.IO.Path]::GetPathRoot($c)
         try {
             $di = New-Object System.IO.DriveInfo($root)
@@ -3663,11 +3691,11 @@ $networkConfigFailureReason = ""
 if (-not [string]::IsNullOrWhiteSpace($networkUser) -and $null -eq $networkPassword -and (Test-IsDpapiBlob $task.NetworkPassword)) {
     # Blob DPAPI de outra maquina: antes era usado como se fosse a senha e o erro
     # aparecia como "senha recusada", escondendo a causa real.
-    $networkConfigFailureReason = "Senha de rede ilegivel neste servidor (criptografada para outro computador via DPAPI). Redigite a senha da tarefa no MEC Shield."
-    Log-Message "ERRO DE CONFIGURACAO: $networkConfigFailureReason"
+    $networkConfigFailureReason = "Senha de rede ilegivel neste servidor (criptografada para outro computador via DPAPI)."
+    Log-Message "AVISO DE CONFIGURACAO: $networkConfigFailureReason Tentando acesso direto a rede."
 } elseif (-not [string]::IsNullOrWhiteSpace($networkUser) -and [string]::IsNullOrWhiteSpace($networkPassword)) {
-    $networkConfigFailureReason = "Senha de rede nao configurada (campo NetworkPassword vazio ou nulo no config.json para o usuario '$networkUser')."
-    Log-Message "ERRO DE CONFIGURACAO: $networkConfigFailureReason O servico SYSTEM nao conseguira autenticar para gravacao em rede."
+    $networkConfigFailureReason = "Senha de rede em branco no config.json para o usuario '$networkUser'."
+    Log-Message "AVISO DE CONFIGURACAO: $networkConfigFailureReason Tentando gravacao com acesso direto a rede."
 }
 
 # --- FASE 1: AUTO-RECUPERACAO E ESPERA DE PRONTIDAO NO BOOT ---
@@ -3795,6 +3823,10 @@ foreach ($dest in $destList) {
         $resolvedDestList += $destTrimmed
     } else {
         # Destino local
+        if (Test-IsSystemReservedDrive -Path $destTrimmed) {
+            Log-Message "Destino local '$destTrimmed' ignorado pois pertence a uma particao reservada do sistema / recuperacao."
+            continue
+        }
         $destRoot = [System.IO.Path]::GetPathRoot($destTrimmed)
         if (-not (Test-Path $destRoot)) {
             Log-Message "FALHA DE DESTINO: A particao/unidade '$destRoot' nao existe neste computador (drive ausente ou inacessivel para a conta SYSTEM). Destino '$destTrimmed' registrado como FALHA."
@@ -3806,8 +3838,10 @@ foreach ($dest in $destList) {
         }
     }
 }
-if ($resolvedDestList.Count -eq 0 -and $destList.Count -eq 0) {
-    $resolvedDestList += "C:\BKP_SISMOTEL"
+if ($resolvedDestList.Count -eq 0) {
+    if (-not (Test-IsSystemReservedDrive -Path "C:\BKP_SISMOTEL")) {
+        $resolvedDestList += "C:\BKP_SISMOTEL"
+    }
 }
 foreach ($d in $resolvedDestList) {
     if (-not $d.StartsWith("\\") -and -not (Test-Path $d)) {
@@ -4134,19 +4168,14 @@ foreach ($destTrimmed in $resolvedDestList) {
     Log-Message "Gravando backup GZ no destino $($destTypeTag) - $destTrimmed"
 
     if ($isNetwork -and -not [string]::IsNullOrWhiteSpace($networkConfigFailureReason)) {
-        Log-Message "FALHA DE DESTINO: $networkConfigFailureReason Nenhuma tentativa de conexao ou copia sera executada para '$destTrimmed'."
-        $destinationFailureReasons[$destTrimmed] = $networkConfigFailureReason
-        if (-not ($failedDestinations -contains $destTrimmed)) {
-            $failedDestinations += $destTrimmed
-        }
-        continue
+        Log-Message "Aviso para destino '$destTrimmed': $networkConfigFailureReason Tentando acesso direto..."
     }
 
     $destSuccess = $false
     for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
         try {
             # Se for caminho de rede UNC (\\servidor\compartilhamento ou \\servidor\c$\...)
-            if ($isNetwork -and -not [string]::IsNullOrWhiteSpace($networkUser)) {
+            if ($isNetwork -and -not [string]::IsNullOrWhiteSpace($networkUser) -and -not [string]::IsNullOrWhiteSpace($networkPassword)) {
                 $parts = $destTrimmed.TrimStart('\').Split('\')
                 $uncRoot = if ($parts.Length -ge 2) { "\\$($parts[0])\$($parts[1])" } else { $destTrimmed }
                 Log-Message "Autenticando rede em $uncRoot com usuario '$networkUser'..."
@@ -4156,9 +4185,10 @@ foreach ($destTrimmed in $resolvedDestList) {
                     $destinationFailureReason = ""
                     Log-Message "Autenticacao de rede em $uncRoot estabelecida com sucesso (usuario '$($conn.User)')."
                 } else {
-                    $destinationFailureReason = "Autenticacao de rede recusada em $uncRoot (codigo $($conn.Code)): $($conn.Message)"
-                    Log-Message "Aviso: $destinationFailureReason"
+                    Log-Message "Aviso: Autenticacao de rede recusada em $uncRoot (codigo $($conn.Code)): $($conn.Message). Tentando gravacao direta caso haja sessao ativa..."
                 }
+            } elseif ($isNetwork -and -not [string]::IsNullOrWhiteSpace($networkUser)) {
+                Log-Message "Aviso: Senha de rede em branco para '$networkUser'. Tentando acesso direto ao destino de rede..."
             }
 
             # Normalizacao e limpeza do caminho de destino
@@ -4194,6 +4224,21 @@ foreach ($destTrimmed in $resolvedDestList) {
                 }
             }
 
+            # Verificacao preventiva de espaco em disco e expurgo proativo
+            $srcLen = (Get-Item $tempGz).Length
+            if (-not $isNetwork) {
+                try {
+                    $destDriveRoot = [System.IO.Path]::GetPathRoot($destClean)
+                    if (-not [string]::IsNullOrWhiteSpace($destDriveRoot) -and (Test-Path $destDriveRoot)) {
+                        $destDi = New-Object System.IO.DriveInfo($destDriveRoot)
+                        if ($destDi.IsReady -and $destDi.AvailableFreeSpace -lt ($srcLen * 2)) {
+                            Log-Message "Espaco reduzido no destino ($destClean). Executando expurgo preventivo antes de gravar nova copia..."
+                            Invoke-RetentionPolicy -Directory $destClean -Prefix $basePrefix -Keep $keepBackupsCount
+                        }
+                    }
+                } catch {}
+            }
+
             # Copia o arquivo .GZ para o destino
             Copy-Item -Path $tempGz -Destination $finalPath -Force -ErrorAction Stop
 
@@ -4204,7 +4249,6 @@ foreach ($destTrimmed in $resolvedDestList) {
             # tem tamanho > 0 e passaria na checagem antiga; aqui ela e reprovada e a
             # tentativa e refeita, sem nunca chegar na politica de retencao.
             $destLen = (Get-Item $finalPath).Length
-            $srcLen  = (Get-Item $tempGz).Length
             if ($destLen -ne $srcLen) {
                 throw "Copia incompleta em '$finalPath': $destLen bytes gravados de $srcLen esperados."
             }
