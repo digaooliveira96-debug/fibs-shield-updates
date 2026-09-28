@@ -6,8 +6,10 @@ Canal de distribuição do **MEC Shield Enterprise**, sistema de backup contínu
 
 Este repositório contém **apenas os arquivos publicados** que o módulo **MEC LiveUpdate** baixa nos servidores. Aqui não há credencial, configuração de cliente nem dado operacional.
 
-## Versão atual: 2.2.28 (28/09/2026)
+## Versão atual: 2.2.29 (28/09/2026)
 
+- **Três camadas ativas de verdade:** o serviço do Windows, o **Watchdog** (a cada 2 minutos) e o **Startup Guard** (no boot) são garantidos a cada início do serviço. Antes, o Watchdog e o Startup Guard nunca chegavam a ser registrados.
+- O botão **Parar** do painel pausa o Watchdog. Qualquer início ou reboot o reativa.
 - O instalador não pede nem grava senha. E-mail e senha de alertas são configurados no painel, em **Preferências**.
 - Credencial de rede **opcional** por tarefa, com o botão **Testar Acesso como SYSTEM**, que faz uma gravação real pela conta do backup automático.
 - Proteção de disco: abre espaço apagando os backups mais antigos (sempre preserva os 3 mais recentes) ou recusa a cópia, sem nunca lotar o disco do banco.
