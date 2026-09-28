@@ -18,7 +18,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.23"
+$script:EngineVersion = "2.2.24"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -2191,23 +2191,7 @@ function Test-ExternalDestinationsHealth {
             $touchedKeys += $destTrim
             $detectedReason = $FailureReason
 
-            # Autenticacao proativa se for UNC de rede e houver credenciais completas
-            $senhaRede = Unprotect-String $tConf.NetworkPassword
-            $hasNetUser = -not [string]::IsNullOrWhiteSpace($tConf.NetworkUser)
-            $hasNetPass = -not [string]::IsNullOrWhiteSpace($senhaRede)
-
             $authFailureReason = ""
-            if ($destTrim.StartsWith("\\") -and $hasNetUser -and $hasNetPass) {
-                $uncParts = $destTrim -split '\\'
-                if ($uncParts.Count -ge 4) {
-                    $uncRoot = "\\$($uncParts[2])\$($uncParts[3])"
-                    $conn = Connect-NetworkShare -UncRoot $uncRoot -User $tConf.NetworkUser -Password $senhaRede -AllowDisconnect:$AllowDisconnect
-                    if (-not $conn.Ok) {
-                        Log-Message "Monitor: autenticacao em $uncRoot falhou (codigo $($conn.Code)): $($conn.Message)"
-                        $authFailureReason = "Autenticacao de rede recusada em $uncRoot (codigo $($conn.Code)): $($conn.Message)"
-                    }
-                }
-            }
 
             # Checagem Fisica Real de Arquivos .GZ no destino
             $realLastBackupTime = $null
@@ -3680,12 +3664,9 @@ $noGarbageCollection = if ($null -ne $task.NoGarbageCollection) { [bool]$task.No
 $convertExternal     = if ($null -ne $task.ConvertExternal) { [bool]$task.ConvertExternal } else { $true }
 $runGfixSweep        = if ($null -ne $task.RunGfixSweep) { [bool]$task.RunGfixSweep } else { $false }
 $runGfixValidate     = if ($null -ne $task.RunGfixValidate) { [bool]$task.RunGfixValidate } else { $false }
-$networkUser         = $task.NetworkUser
-$networkPassword     = Unprotect-String $task.NetworkPassword
+$networkUser         = ""
+$networkPassword     = ""
 $networkConfigFailureReason = ""
-if (-not [string]::IsNullOrWhiteSpace($networkUser) -and $null -eq $networkPassword -and (Test-IsDpapiBlob $task.NetworkPassword)) {
-    Log-Message "Aviso: Senha de rede ilegivel neste servidor (DPAPI de outra maquina). Prosseguindo com permissao nativa do Windows..."
-}
 
 # --- FASE 1: AUTO-RECUPERACAO E ESPERA DE PRONTIDAO NO BOOT ---
 $maxBootWaitSec = 45
@@ -4163,20 +4144,7 @@ foreach ($destTrimmed in $resolvedDestList) {
     $destSuccess = $false
     for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
         try {
-            # Se for caminho de rede UNC (\\servidor\compartilhamento ou \\servidor\c$\...)
-            if ($isNetwork -and -not [string]::IsNullOrWhiteSpace($networkUser) -and -not [string]::IsNullOrWhiteSpace($networkPassword)) {
-                $parts = $destTrimmed.TrimStart('\').Split('\')
-                $uncRoot = if ($parts.Length -ge 2) { "\\$($parts[0])\$($parts[1])" } else { $destTrimmed }
-                Log-Message "Autenticando rede em $uncRoot com usuario '$networkUser'..."
-                # Com a trava de backup em maos, pode reorganizar conexoes em caso de 1219
-                $conn = Connect-NetworkShare -UncRoot $uncRoot -User $networkUser -Password $networkPassword -AllowDisconnect
-                if ($conn.Ok) {
-                    $destinationFailureReason = ""
-                    Log-Message "Autenticacao de rede em $uncRoot estabelecida com sucesso (usuario '$($conn.User)')."
-                } else {
-                    Log-Message "Aviso: Autenticacao de rede em $uncRoot retornou codigo $($conn.Code). Prosseguindo com permissao nativa do Windows..."
-                }
-            }
+
 
             # Normalizacao e limpeza do caminho de destino
             $destClean = $destTrimmed.Trim().Trim('"', "'").TrimEnd('\', '/')
@@ -4306,9 +4274,7 @@ foreach ($destTrimmed in $resolvedDestList) {
                 $altConn = $null
                 $finalPathAlt = $null
                 try {
-                    if (-not [string]::IsNullOrWhiteSpace($networkUser) -and -not [string]::IsNullOrWhiteSpace($networkPassword)) {
-                        $altConn = Connect-NetworkShare -UncRoot $altRoot -User $networkUser -Password $networkPassword -AllowDisconnect
-                    }
+
 
                     if (-not (Test-Path $altDest)) {
                         try { [System.IO.Directory]::CreateDirectory($altDest) | Out-Null } catch {}
