@@ -12,13 +12,14 @@ param (
     [switch]$ForceUpdate,
     [switch]$CheckExternalHealth,
     [switch]$Manual,
-    [switch]$ScheduledAudit
+    [switch]$ScheduledAudit,
+    [switch]$TestNetworkAccess
 )
 
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.26"
+$script:EngineVersion = "2.2.27"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -299,6 +300,7 @@ if (-not (Test-Path $logDir)) {
 $logName = if ($CheckExternalHealth) { "monitor_backup_log.txt" }
            elseif ($RunAuditOnly)    { "auditoria_log.txt" }
            elseif ($CheckUpdateOnly) { "liveupdate_log.txt" }
+           elseif ($TestNetworkAccess) { "teste_rede_log.txt" }
            else                      { "backup_$($TaskName)_log.txt" }
 $logFile = Join-Path $logDir $logName
 
@@ -433,6 +435,16 @@ function Resolve-MappedDrivePath {
 # Identifica se uma unidade ou caminho pertence a uma particao reservada do sistema
 # (ex: 'Reservado pelo Sistema', EFI, WinRE ou capacidade menor que 4 GB) para que
 # nunca seja selecionada ou usada como destino de backup.
+# Particao do sistema pelo ROTULO EXATO ou pelo tamanho (< 1 GB). Antes o rotulo era
+# comparado por trecho (*esp*, *efi*, *boot*, *recupera*...) e discos de dados como
+# "ESPELHO", "DESPESAS" ou "BKP_RECUPERACAO" eram descartados sem nenhum alerta.
+function Test-IsReservedVolume {
+    param([string]$Label, [double]$TotalBytes)
+    if ($TotalBytes -gt 0 -and $TotalBytes -lt 1GB) { return $true }
+    $l = "$Label".Trim().ToLowerInvariant()
+    return ($l -match '^(system reserved|reservado pelo sistema|sistema reservado|recovery|recupera.{1,3}o|efi|esp|boot|winre|windows re tools|hp_recovery|lenovo_recovery)$')
+}
+
 function Test-IsSystemReservedDrive {
     param ([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path.StartsWith("\\")) { return $false }
@@ -443,21 +455,7 @@ function Test-IsSystemReservedDrive {
         if (-not (Test-Path "${driveLetter}\")) { return $false }
         $di = New-Object System.IO.DriveInfo($driveLetter)
         if (-not $di.IsReady) { return $false }
-        # 1. Checagem explicita do nome/rotulo da particao:
-        # Se estiver escrito 'Reservado pelo Sistema', 'System Reserved', etc., anula e nao mapeia!
-        $vLabel = ($di.VolumeLabel + "").ToLower()
-        if (($vLabel -like "*reservad*") -or `
-            ($vLabel -like "*reserved*") -or `
-            ($vLabel -like "*recovery*") -or `
-            ($vLabel -like "*recupera*") -or `
-            ($vLabel -like "*efi*") -or `
-            ($vLabel -like "*boot*") -or `
-            ($vLabel -like "*esp*")) {
-            return $true
-        }
-
-        # 2. Particao minuscula (< 1 GB) tipica de particao de boot/WinRE oculta do Windows
-        if ($di.TotalSize -lt 1GB) { return $true }
+        return (Test-IsReservedVolume -Label $di.VolumeLabel -TotalBytes $di.TotalSize)
     } catch {}
     return $false
 }
@@ -571,6 +569,104 @@ function Connect-NetworkShare {
 function Disconnect-NetworkShare {
     param([string]$UncRoot)
     try { Initialize-MecNetApi; [void][MecShield.NetApi]::Disconnect($UncRoot) } catch {}
+}
+
+# Credencial de rede OPCIONAL da tarefa. Sem usuario = acesso direto com a identidade
+# da conta SYSTEM (conta do computador no dominio; anonimo em grupo de trabalho).
+# Com usuario = autentica antes da copia. Password $null significa blob DPAPI de
+# outro computador (config copiado): nao serve como senha.
+function Get-TaskNetworkCredential {
+    param($Task)
+    if ($null -eq $Task) { return $null }
+    $user = "$($Task.NetworkUser)".Trim()
+    if ([string]::IsNullOrWhiteSpace($user)) { return $null }
+    $raw = if ($null -eq $Task.NetworkPassword) { "" } else { "$($Task.NetworkPassword)" }
+    return [PSCustomObject]@{ User = $user; Password = (Unprotect-String $raw) }
+}
+
+# Autentica no compartilhamento do destino quando ha credencial. Nunca bloqueia a
+# copia: se a autenticacao falhar, o chamador ainda tenta o acesso direto e guarda
+# o motivo para o log/alerta.
+function Connect-UncDestination {
+    # $Password sem tipo: [string] converteria $null (senha ilegivel) em "" e o motor
+    # tentaria autenticar com senha vazia em vez de explicar o problema.
+    param([string]$Path, [string]$User, $Password, [switch]$AllowDisconnect)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not $Path.StartsWith("\\") -or [string]::IsNullOrWhiteSpace($User)) {
+        return [PSCustomObject]@{ Ok = $true; Mode = "Direto"; Code = 0; Message = "Acesso direto (sem credencial configurada)" }
+    }
+    $parts = @($Path.TrimStart('\').Split('\') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($parts.Count -lt 2) {
+        return [PSCustomObject]@{ Ok = $false; Mode = "Credencial"; Code = -1; Message = "Caminho de rede incompleto ('$Path'): use \\computador\pasta." }
+    }
+    if ($null -eq $Password) {
+        return [PSCustomObject]@{ Ok = $false; Mode = "Credencial"; Code = -1; Message = "A senha de rede salva nao abre neste servidor (cifrada em outro computador). Redigite a senha na tarefa." }
+    }
+    $root = "\\$($parts[0])\$($parts[1])"
+    $r = Connect-NetworkShare -UncRoot $root -User $User -Password $Password -AllowDisconnect:$AllowDisconnect
+    if ($r.Ok) {
+        return [PSCustomObject]@{ Ok = $true; Mode = "Credencial"; Code = $r.Code; Message = "Autenticado em $root como '$($r.User)'" }
+    }
+    return [PSCustomObject]@{ Ok = $false; Mode = "Credencial"; Code = $r.Code; Message = "Autenticacao em $root como '$($r.User)' recusada: $($r.Message) (codigo $($r.Code))" }
+}
+
+# Teste de gravacao real no destino, executado pela interface como SYSTEM (tarefa
+# agendada temporaria). Antes o botao testava no usuario logado e so conferia se a
+# pasta existia: dava "OK" para uma pasta que o backup automatico nao conseguia gravar.
+function Invoke-NetworkAccessTest {
+    param([string[]]$Destinations, [string]$User, $Password)
+    $results = @()
+    foreach ($d in $Destinations) {
+        if ([string]::IsNullOrWhiteSpace($d)) { continue }
+        $dest = (Resolve-MappedDrivePath $d.Trim()).TrimEnd('\', '/')
+        $auth = Connect-UncDestination -Path $dest -User $User -Password $Password
+        $prefixo = if ($auth.Mode -eq "Credencial") { "$($auth.Message). " } else { "" }
+        $probe = Join-Path $dest (".mecshield_teste_{0}.tmp" -f ([Guid]::NewGuid().ToString("N")))
+        try {
+            if (-not (Test-Path $dest)) { throw "pasta inacessivel ou inexistente para esta conta" }
+            [System.IO.File]::WriteAllText($probe, "MEC Shield - teste de gravacao $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+            $lido = [System.IO.File]::ReadAllText($probe)
+            if ($lido -notmatch '^MEC Shield - teste de gravacao') { throw "arquivo de teste lido com conteudo diferente" }
+            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "${prefixo}Gravacao, leitura e exclusao OK." }
+        } catch {
+            $motivo = "$($_.Exception.Message)".Trim()
+            if ([string]::IsNullOrWhiteSpace($motivo)) { $motivo = "$_" }
+            $results += [PSCustomObject]@{ Destination = $dest; Ok = $false; Message = "${prefixo}Falha: $motivo" }
+        } finally {
+            try { if (Test-Path $probe) { Remove-Item $probe -Force -ErrorAction SilentlyContinue } } catch {}
+        }
+    }
+    return $results
+}
+
+# Pedido/resposta do teste em arquivos texto (TAB) na pasta temp da instalacao, que so
+# SYSTEM e Administradores gravam. A senha chega cifrada (DPAPI da maquina).
+function Invoke-NetworkAccessTestFromRequest {
+    param([string]$RequestFile, [string]$ResultFile)
+    $user = ""; $passRaw = ""; $dests = @()
+    if (Test-Path $RequestFile) {
+        foreach ($line in (Get-Content $RequestFile -Encoding UTF8)) {
+            $p = $line.Split("`t", 2)
+            if ($p.Count -lt 2) { continue }
+            switch ($p[0]) {
+                "USER" { $user = $p[1].Trim() }
+                "PASS" { $passRaw = $p[1] }
+                "DEST" { $dests += $p[1].Trim() }
+            }
+        }
+        Remove-Item $RequestFile -Force -ErrorAction SilentlyContinue
+    }
+    $ident = try { [System.Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { "desconhecida" }
+    $out = @("IDENT`t$ident")
+    if ($dests.Count -eq 0) {
+        $out += "FALHA`t-`tPedido de teste vazio ou ilegivel."
+    } else {
+        $pass = if ([string]::IsNullOrWhiteSpace($user)) { "" } else { Unprotect-String $passRaw }
+        foreach ($r in (Invoke-NetworkAccessTest -Destinations $dests -User $user -Password $pass)) {
+            $status = if ($r.Ok) { "OK" } else { "FALHA" }
+            $out += "$status`t$($r.Destination)`t$(($r.Message -replace '[\r\n\t]+', ' '))"
+        }
+    }
+    Write-TextFileAtomic -Path $ResultFile -Content ($out -join "`r`n")
 }
 
 # ==============================================================================
@@ -718,15 +814,22 @@ function Save-BackupSequenceNumber {
 # Politica de retencao: mantem os $Keep arquivos mais recentes do prefixo na pasta.
 # Usada nos destinos configurados, no destino alternativo e no fail-safe (antes o
 # fail-safe nao tinha retencao e enchia o disco do banco de dados).
+# Backups do prefixo na pasta, do mais recente para o mais antigo. Outros prefixos e
+# arquivos que nao sao backup nunca entram na lista (nunca sao apagados).
+function Get-PrefixBackupFiles {
+    param([string]$Directory, [string]$Prefix)
+    $escapedPrefix = [regex]::Escape($Prefix)
+    return @(Get-ChildItem -Path $Directory -File -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match "^${escapedPrefix}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.(GZ|zip)$"
+    } | Sort-Object LastWriteTime -Descending)
+}
+
 function Invoke-RetentionPolicy {
     param([string]$Directory, [string]$Prefix, [int]$Keep)
     if ($Keep -lt 1) { $Keep = 1 }
     try {
         Log-Message "Aplicando politica de retencao em $Directory (Manter ultimos $Keep backups do prefixo '$Prefix')..."
-        $escapedPrefix = [regex]::Escape($Prefix)
-        $backupFiles = @(Get-ChildItem -Path $Directory -File -ErrorAction SilentlyContinue | Where-Object {
-            $_.Name -match "^${escapedPrefix}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.(GZ|zip)$"
-        } | Sort-Object LastWriteTime -Descending)
+        $backupFiles = @(Get-PrefixBackupFiles -Directory $Directory -Prefix $Prefix)
 
         if ($backupFiles.Count -gt $Keep) {
             foreach ($oldFile in ($backupFiles | Select-Object -Skip $Keep)) {
@@ -1165,7 +1268,7 @@ function Send-BackupNotification {
               <strong>2. Compartilhamento do Windows:</strong> Confirmar se a pasta de backup continua compartilhada na rede e acess&iacute;vel.
             </div>
             <div style='margin-bottom:8px;'>
-              <strong>3. Usu&aacute;rio e Senha (Credenciais):</strong> Verificar se a senha do Windows do terminal foi alterada recentemente.
+              <strong>3. Permiss&atilde;o de Grava&ccedil;&atilde;o:</strong> A pasta precisa aceitar grava&ccedil;&atilde;o da conta do servidor (servi&ccedil;o SYSTEM). Se a tarefa usa usu&aacute;rio/senha de rede opcional, verificar se a senha foi alterada. Use o bot&atilde;o &quot;Testar Acesso como SYSTEM&quot; na tarefa.
             </div>
             <div>
               <strong>4. Banco de Dados Local:</strong> Nenhuma a&ccedil;&atilde;o necess&aacute;ria no banco Firebird (o banco est&aacute; 100% &iacute;ntegro e seguro no servidor).
@@ -1371,7 +1474,7 @@ function Send-BackupNotification {
                   <ul style='margin:6px 0 0 18px; padding:0; color:#fde68a;'>
                     <li style='margin-bottom:4px;'><strong>Terminal da Recep&ccedil;&atilde;o Desligado:</strong> O computador ou switch de rede pode estar sem energia ou em suspens&atilde;o/hiberna&ccedil;&atilde;o.</li>
                     <li style='margin-bottom:4px;'><strong>Formata&ccedil;&atilde;o ou Troca de Terminal:</strong> O computador pode ter sido formatado recentemente ou substitu&iacute;do na recep&ccedil;&atilde;o.</li>
-                    <li style='margin-bottom:4px;'><strong>Credenciais de Rede Alteradas:</strong> O usu&aacute;rio ou senha do Windows na recep&ccedil;&atilde;o foram alterados ou expiraram.</li>
+                    <li style='margin-bottom:4px;'><strong>Permiss&atilde;o ou Credencial:</strong> A pasta n&atilde;o aceita grava&ccedil;&atilde;o da conta do servidor (SYSTEM), ou a senha de rede opcional configurada na tarefa foi alterada/expirou.</li>
                     <li><strong>Mudan&ccedil;a de IP ou Cabo Solto:</strong> O endere&ccedil;o IP do terminal variou pelo roteador ou o cabo de rede foi desconectado.</li>
                   </ul>
                 </div>
@@ -2192,6 +2295,14 @@ function Test-ExternalDestinationsHealth {
             $detectedReason = $FailureReason
 
             $authFailureReason = ""
+            # Credencial opcional da tarefa: autentica antes de olhar a pasta
+            if ($destTrim.StartsWith("\\")) {
+                $monCred = Get-TaskNetworkCredential -Task $tConf
+                if ($null -ne $monCred) {
+                    $monAuth = Connect-UncDestination -Path $destTrim -User $monCred.User -Password $monCred.Password -AllowDisconnect:$AllowDisconnect
+                    if (-not $monAuth.Ok) { $authFailureReason = $monAuth.Message }
+                }
+            }
 
             # Checagem Fisica Real de Arquivos .GZ no destino
             $realLastBackupTime = $null
@@ -2280,8 +2391,10 @@ function Get-OptimalSandboxDir {
         [string[]]$ConfiguredDestinations
     )
     
-    # Exige espaco livre minimo de 1.5x o tamanho do banco ou 4096 MB (o que for maior)
-    $minRequiredMB = [math]::Max(4096, [math]::Round($DbSizeMB * 1.5, 0))
+    # A restauracao de teste tem ao mesmo tempo o FBK extraido e o FDB restaurado:
+    # exige 2.5x o banco (minimo 4096 MB). No disco do banco soma a folga do Firebird
+    # (antes 1.5x, e a auditoria das 03:30 podia zerar o disco do banco).
+    $minRequiredMB = Get-RequiredFreeMB -DbSizeMB $DbSizeMB -Factor 2.5 -MinMB 4096
     $dbDrive = [System.IO.Path]::GetPathRoot($DbPath)
     
     $candidates = @()
@@ -2315,9 +2428,10 @@ function Get-OptimalSandboxDir {
     $sameDrive = $drives | Where-Object { $_.Name -eq $dbDrive }
     if ($null -ne $sameDrive) {
         $freeMB = [math]::Round($sameDrive.AvailableFreeSpace / 1MB, 0)
-        if ($freeMB -ge $minRequiredMB) {
+        $reqDbDrive = Get-RequiredFreeMB -DbSizeMB $DbSizeMB -Factor 2.5 -MinMB 4096 -DriveTotalMB ($sameDrive.TotalSize / 1MB) -IsDbDrive $true
+        if ($freeMB -ge $reqDbDrive) {
             $sandboxPath = Join-Path $scriptDir "_temp_audit"
-            return [PSCustomObject]@{ Path = $sandboxPath; Drive = $sameDrive.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" }
+            return [PSCustomObject]@{ Path = $sandboxPath; Drive = $sameDrive.Name; FreeMB = $freeMB; RequiredMB = $reqDbDrive; Status = "OK" }
         }
     }
     
@@ -3278,6 +3392,92 @@ function Get-DriveFreeMB {
     } catch { return 0 }
 }
 
+# ------------------------------------------------------------------------------
+# PROTECAO DE DISCO
+# O disco do banco precisa de folga para o Firebird crescer o .FDB e gravar arquivos
+# de ordenacao; se ele zerar, o Sismotel para. Toda gravacao do MEC Shield nesse disco
+# (copia, temporario do gbak, sandbox da auditoria, fail-safe) deixa essa folga livre.
+# ------------------------------------------------------------------------------
+function Get-DiskReserveMB {
+    param([double]$TotalMB, [bool]$IsDbDrive)
+    if ($IsDbDrive) { return [math]::Round([Math]::Max(2048, $TotalMB * 0.10), 0) }
+    return 512
+}
+
+# Espaco para processar o banco num disco: Factor x banco (no minimo MinMB) e, no
+# disco do banco, mais a folga do Firebird.
+function Get-RequiredFreeMB {
+    param([double]$DbSizeMB, [double]$Factor, [double]$MinMB = 0, [double]$DriveTotalMB = 0, [bool]$IsDbDrive = $false)
+    $base = [Math]::Max($MinMB, $DbSizeMB * $Factor)
+    $reserve = if ($IsDbDrive) { Get-DiskReserveMB -TotalMB $DriveTotalMB -IsDbDrive $true } else { 0 }
+    return [math]::Round($base + $reserve, 0)
+}
+
+function Get-DriveSpaceInfo {
+    param([string]$Path)
+    try {
+        $d = New-Object System.IO.DriveInfo([System.IO.Path]::GetPathRoot($Path))
+        if (-not $d.IsReady) { return $null }
+        return [PSCustomObject]@{ FreeMB = $d.AvailableFreeSpace / 1MB; TotalMB = $d.TotalSize / 1MB }
+    } catch { return $null }
+}
+
+# Espaco exigido num disco para os temporarios (Factor 1.5: FBK + GZ) ou para a sandbox
+# da auditoria (Factor 2.5: FBK extraido + FDB restaurado), com a folga do disco do banco.
+function Get-ProcessingRequiredMB {
+    param([string]$Path, [string]$DbDrive, [double]$DbSizeMB, [double]$Factor, [double]$MinMB = 0)
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    $info = Get-DriveSpaceInfo -Path $root
+    $total = if ($null -ne $info) { $info.TotalMB } else { 0 }
+    return Get-RequiredFreeMB -DbSizeMB $DbSizeMB -Factor $Factor -MinMB $MinMB -DriveTotalMB $total -IsDbDrive ($root -eq $DbDrive)
+}
+
+# Abre espaco para a nova copia ANTES de gravar num destino local: remove os backups
+# mais antigos do prefixo (sempre preservando os MinKeep mais recentes) ate sobrar
+# copia + folga. Se nem assim couber, a copia NAO e gravada. O "expurgo preventivo"
+# anterior so reaplicava a retencao normal, que ja tinha rodado: nao liberava nada.
+function Invoke-DestinationSpaceGuard {
+    param(
+        [string]$Directory,
+        [string]$Prefix,
+        [double]$IncomingMB,
+        [bool]$IsDbDrive,
+        [int]$MinKeep = 3,
+        [scriptblock]$SpaceProvider = { param($p) Get-DriveSpaceInfo -Path $p }
+    )
+    $info = & $SpaceProvider $Directory
+    if ($null -eq $info) {
+        return [PSCustomObject]@{ Ok = $true; Removed = 0; FreeMB = -1; RequiredMB = 0; Message = "Espaco livre nao informado pelo Windows; copia segue." }
+    }
+    $required = [math]::Round($IncomingMB + (Get-DiskReserveMB -TotalMB $info.TotalMB -IsDbDrive $IsDbDrive), 0)
+    $removed = 0
+    if ($info.FreeMB -lt $required) {
+        $antigos = @(Get-PrefixBackupFiles -Directory $Directory -Prefix $Prefix | Select-Object -Skip ([Math]::Max(0, $MinKeep)))
+        [array]::Reverse($antigos)   # do mais antigo para o mais recente
+        foreach ($f in $antigos) {
+            if ($info.FreeMB -ge $required) { break }
+            try {
+                Remove-Item $f.FullName -Force -ErrorAction Stop
+                $removed++
+                Log-Message "PROTECAO DE DISCO: backup antigo removido para liberar espaco: $($f.Name) ($([math]::Round($f.Length / 1MB, 2)) MB)"
+            } catch {
+                Log-Message "PROTECAO DE DISCO: nao foi possivel remover $($f.Name): $_"
+            }
+            $info = & $SpaceProvider $Directory
+            if ($null -eq $info) { break }
+        }
+    }
+    if ($null -eq $info) {
+        return [PSCustomObject]@{ Ok = $true; Removed = $removed; FreeMB = -1; RequiredMB = $required; Message = "Espaco livre nao informado pelo Windows; copia segue." }
+    }
+    $free = [math]::Round($info.FreeMB, 0)
+    if ($info.FreeMB -ge $required) {
+        return [PSCustomObject]@{ Ok = $true; Removed = $removed; FreeMB = $free; RequiredMB = $required; Message = "Espaco OK ($free MB livres, exigido $required MB)." }
+    }
+    $folga = if ($IsDbDrive) { "folga do disco do banco" } else { "folga minima" }
+    return [PSCustomObject]@{ Ok = $false; Removed = $removed; FreeMB = $free; RequiredMB = $required; Message = "Espaco insuficiente em '$Directory': $free MB livres, exigido $required MB (copia de $([math]::Round($IncomingMB, 0)) MB + $folga). Copia nao gravada para proteger o disco." }
+}
+
 # Remove sobras de rotinas interrompidas (FBK/GZ parciais) das pastas temporarias
 # exclusivas do MEC Shield. So e chamada com a trava de backup em maos.
 function Clear-StaleBackupTemp {
@@ -3309,7 +3509,7 @@ function Select-FailSafeDirectory {
             $di = New-Object System.IO.DriveInfo($root)
             if (-not $di.IsReady) { continue }
             $freeAfterMB = ($di.AvailableFreeSpace / 1MB) - $GzSizeMB
-            $minFolgaMB = [Math]::Max(2048, ($di.TotalSize / 1MB) * 0.10)
+            $minFolgaMB = Get-DiskReserveMB -TotalMB ($di.TotalSize / 1MB) -IsDbDrive $true
             if ($root -eq $dbRoot -and $freeAfterMB -lt $minFolgaMB) {
                 Log-Message "Fail-safe: '$c' fica no mesmo disco do banco e ficaria com pouca folga ($([math]::Round($freeAfterMB)) MB). Disco ignorado para proteger o Firebird."
                 continue
@@ -3461,6 +3661,19 @@ if ($CheckExternalHealth) {
 
     Log-Message "Monitor concluido. $checked tarefa(s) verificada(s)."
     Log-Message "======================================================"
+    exit 0
+}
+
+# INTERCEPTADOR: TESTE DE ACESSO A REDE COMO SYSTEM (-TestNetworkAccess, botao da interface)
+if ($TestNetworkAccess) {
+    Log-Message "Teste de acesso a rede solicitado pela interface (conta: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name))."
+    $testDir = Join-Path $scriptDir "temp"
+    try {
+        Invoke-NetworkAccessTestFromRequest -RequestFile (Join-Path $testDir "network_test_request.txt") -ResultFile (Join-Path $testDir "network_test_result.txt")
+        Log-Message "Teste de acesso a rede concluido."
+    } catch {
+        Log-Message "Falha no teste de acesso a rede: $_"
+    }
     exit 0
 }
 
@@ -3636,9 +3849,13 @@ $noGarbageCollection = if ($null -ne $task.NoGarbageCollection) { [bool]$task.No
 $convertExternal     = if ($null -ne $task.ConvertExternal) { [bool]$task.ConvertExternal } else { $true }
 $runGfixSweep        = if ($null -ne $task.RunGfixSweep) { [bool]$task.RunGfixSweep } else { $false }
 $runGfixValidate     = if ($null -ne $task.RunGfixValidate) { [bool]$task.RunGfixValidate } else { $false }
-$networkUser         = ""
-$networkPassword     = ""
+# Credencial de rede opcional (ver Get-TaskNetworkCredential)
+$netCred             = Get-TaskNetworkCredential -Task $task
 $networkConfigFailureReason = ""
+if ($null -ne $netCred -and $null -eq $netCred.Password) {
+    $networkConfigFailureReason = "A senha de rede salva na tarefa '$TaskName' nao abre neste servidor (cifrada em outro computador). Redigite a senha na tarefa."
+    Log-Message "AVISO DE CONFIGURACAO: $networkConfigFailureReason"
+}
 
 # --- FASE 1: AUTO-RECUPERACAO E ESPERA DE PRONTIDAO NO BOOT ---
 $maxBootWaitSec = 45
@@ -3766,7 +3983,9 @@ foreach ($dest in $destList) {
     } else {
         # Destino local
         if (Test-IsSystemReservedDrive -Path $destTrimmed) {
-            Log-Message "Destino local '$destTrimmed' ignorado pois pertence a uma particao reservada do sistema / recuperacao."
+            # Nunca some em silencio: vira FALHA do destino e entra no alerta
+            Log-Message "FALHA DE DESTINO: '$destTrimmed' esta numa particao reservada do sistema (rotulo de sistema ou menor que 1 GB). Nada foi gravado nela; corrija o destino na tarefa '$TaskName'."
+            if (-not ($missingLocalDests -contains $destTrimmed)) { $missingLocalDests += $destTrimmed }
             continue
         }
         $destRoot = [System.IO.Path]::GetPathRoot($destTrimmed)
@@ -3794,7 +4013,8 @@ foreach ($d in $resolvedDestList) {
 $tempDir = $null
 $dbDrive = [System.IO.Path]::GetPathRoot($dbPath)
 
-# Exige espaco para o FBK + GZ + margem de seguranca (ao menos 1.5x o tamanho do banco ativo)
+# Exige espaco para o FBK + GZ (1.5x o banco). No disco do banco soma a folga do
+# Firebird (Get-ProcessingRequiredMB): antes 1.5x bastava e o gbak podia zerar o disco.
 $minRequiredMB = [math]::Round($dbSizeMB * 1.5, 2)
 
 # 1) Procura um destino local em particao diferente do banco para isolamento fisico de gravacao
@@ -3802,7 +4022,7 @@ foreach ($candDest in $resolvedDestList) {
     if ($candDest.StartsWith("\")) { continue } # NUNCA usar rede para temporario
     $candDrive = [System.IO.Path]::GetPathRoot($candDest)
     if ((Test-Path $candDrive) -and ($candDrive -ne $dbDrive)) {
-        if ((Get-DriveFreeMB -Path $candDrive) -ge $minRequiredMB) {
+        if ((Get-DriveFreeMB -Path $candDrive) -ge (Get-ProcessingRequiredMB -Path $candDrive -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5)) {
             $candidateTemp = Join-Path $candDrive "FIBS_TEMP"
             try {
                 if (-not (Test-Path $candidateTemp)) { New-Item -ItemType Directory -Path $candidateTemp -Force | Out-Null }
@@ -3825,7 +4045,7 @@ if ($null -eq $tempDir) {
         if ($candDest.StartsWith("\")) { continue }
         $candDrive = [System.IO.Path]::GetPathRoot($candDest)
         if (Test-Path $candDrive) {
-            if ((Get-DriveFreeMB -Path $candDrive) -ge $minRequiredMB) {
+            if ((Get-DriveFreeMB -Path $candDrive) -ge (Get-ProcessingRequiredMB -Path $candDrive -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5)) {
                 $candidateTemp = Join-Path $candDrive "FIBS_TEMP"
                 try {
                     if (-not (Test-Path $candidateTemp)) { New-Item -ItemType Directory -Path $candidateTemp -Force | Out-Null }
@@ -3846,7 +4066,7 @@ if ($null -eq $tempDir) {
 # 3) Fallback final: a propria pasta do script FIBS
 if ($null -eq $tempDir) {
     $fallbackTemp = Join-Path $scriptDir "temp_backup"
-    if ((Get-DriveFreeMB -Path $fallbackTemp) -ge $minRequiredMB) {
+    if ((Get-DriveFreeMB -Path $fallbackTemp) -ge (Get-ProcessingRequiredMB -Path $fallbackTemp -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5)) {
         try {
             if (-not (Test-Path $fallbackTemp)) { New-Item -ItemType Directory -Path $fallbackTemp -Force | Out-Null }
             $tempDir = $fallbackTemp
@@ -3856,7 +4076,7 @@ if ($null -eq $tempDir) {
 
 if ($null -eq $tempDir) {
     # Nenhuma unidade possui espaco suficiente!
-    $errMsg = "ALERTA PREVENTIVO DE SEGURANCA: Nenhuma unidade possui os $minRequiredMB MB livres necessarios. Para proteger o banco Firebird e o sistema contra corrupcao por falta de espaco em disco, a rotina foi interrompida preventivamente com 100% de seguranca."
+    $errMsg = "ALERTA PREVENTIVO DE SEGURANCA: Nenhuma unidade possui os $minRequiredMB MB livres necessarios (no disco do banco, somados a folga de max(2 GB, 10%) reservada ao Firebird). Para proteger o banco Firebird e o sistema contra corrupcao por falta de espaco em disco, a rotina foi interrompida preventivamente com 100% de seguranca."
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo "Espaco em Disco Critico ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
     Exit-BackupLock
@@ -4109,8 +4329,15 @@ foreach ($destTrimmed in $resolvedDestList) {
     $finalPath = $null
     Log-Message "Gravando backup GZ no destino $($destTypeTag) - $destTrimmed"
 
-    if ($isNetwork -and -not [string]::IsNullOrWhiteSpace($networkConfigFailureReason)) {
-        Log-Message "Aviso para destino '$destTrimmed': $networkConfigFailureReason Tentando acesso direto..."
+    if ($isNetwork -and $null -ne $netCred) {
+        # Com a trava de backup em maos e seguro derrubar conexao conflitante (erro 1219)
+        $auth = Connect-UncDestination -Path $destTrimmed -User $netCred.User -Password $netCred.Password -AllowDisconnect
+        if ($auth.Ok) {
+            Log-Message "Rede: $($auth.Message)."
+        } else {
+            $destinationFailureReason = $auth.Message
+            Log-Message "Aviso para destino '$destTrimmed': $($auth.Message). Tentando acesso direto com a permissao da conta do servidor..."
+        }
     }
 
     $destSuccess = $false
@@ -4151,19 +4378,17 @@ foreach ($destTrimmed in $resolvedDestList) {
                 }
             }
 
-            # Verificacao preventiva de espaco em disco e expurgo proativo
+            # PROTECAO DE DISCO: abre espaco (remove os backups mais antigos do prefixo,
+            # preservando os 3 mais recentes) ou desiste da copia, sem nunca zerar o disco.
             $srcLen = (Get-Item $tempGz).Length
             if (-not $isNetwork) {
-                try {
-                    $destDriveRoot = [System.IO.Path]::GetPathRoot($destClean)
-                    if (-not [string]::IsNullOrWhiteSpace($destDriveRoot) -and (Test-Path $destDriveRoot)) {
-                        $destDi = New-Object System.IO.DriveInfo($destDriveRoot)
-                        if ($destDi.IsReady -and $destDi.AvailableFreeSpace -lt ($srcLen * 2)) {
-                            Log-Message "Espaco reduzido no destino ($destClean). Executando expurgo preventivo antes de gravar nova copia..."
-                            Invoke-RetentionPolicy -Directory $destClean -Prefix $basePrefix -Keep $keepBackupsCount
-                        }
-                    }
-                } catch {}
+                $destIsDbDrive = ([System.IO.Path]::GetPathRoot($destClean) -eq $dbDrive)
+                $guard = Invoke-DestinationSpaceGuard -Directory $destClean -Prefix $basePrefix -IncomingMB ($srcLen / 1MB) -IsDbDrive $destIsDbDrive
+                if (-not $guard.Ok) {
+                    $destinationFailureReason = $guard.Message
+                    Log-Message "PROTECAO DE DISCO: $($guard.Message)"
+                    break
+                }
             }
 
             # Copia o arquivo .GZ para o destino
@@ -4309,7 +4534,7 @@ O backup do banco de dados foi extraido e compactado com 100% DE SUCESSO no serv
 Causas mais frequentes para verificar:
 1. Computador da Recepcao/Terminal desligado, hibernando ou fora da tomada/rede;
 2. Pasta descompartilhada, renomeada ou sem permissao no computador remoto;
-3. Usuario ou senha do Windows alterados na maquina de destino (problema de credenciais);
+3. Pasta sem permissao de gravacao para a conta do servidor (SYSTEM) ou senha de rede opcional da tarefa alterada (teste pelo botao 'Testar Acesso como SYSTEM');
 4. Cabo de rede desconectado, oscilacao de Wi-Fi ou IP do terminal alterado;
 5. Discos locais do servidor sem espaco livre para a copia de seguranca.
 "@

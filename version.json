@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.26",
+    "version":  "2.2.27",
     "releaseDate":  "2026-09-28",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Auditoria diaria alerta backup nao restauravel, corrupcao e falha persistente de validacao (sem falso \u0027integro\u0027).\\n2. LiveUpdate com manifesto assinado (RSA/SHA-256), hashes conferidos e sem reinstalacao em loop.\\n3. Trava de backup por mutex do Windows, fail-safe com retencao e protecao do disco do banco.\\n4. Senhas fora da linha de comando (WNetAddConnection2 e ISC_USER/ISC_PASSWORD), SMTP com STARTTLS.\\n5. config.json gravado de forma atomica com copia .bak; servico com agendamento resiliente.",
-    "setupSha256":  "923DDF91D88B211D772707EC842BD5B3561E6F7FBD1926BD2572A466A594CB59",
-    "engineSha256":  "FB5D6B958E80A55F093CDAE3AAA7F1CE38CF34AA8CB1EFEF1481B02511B93016",
-    "signature":  "vqEl+bO7BIV9exjnCtq/qRC1aaRyfyucTDA7J7GYl2LlS+x8R+BP9NAk/KBrlRsgX/M8nWIKTC8puzZVjD322PwThqte+GvYaEzjxzOlUOyvE1irtb/TKHTTI42CfEdU0OdsKehJcK+3XO0wI9pfn/+B5k1hOxgfj2MdFhx4aKZK4meMIaPHxhPsVfa5UcT+96n5AUIdv9AN3hOv3wpmg8GEQL5EcbWMY6bST4170jF/hmFJEMX2eBP6YJn2CRDnYcLt+u29IalZtQuqMa8ER0VrD8eX+Urkkcwewdjs+RP2oS9Qm2dvZQcAF8XFohZti2STr2OJX1PSXmV6DelaQK6t1ip6nuGCKdPKGPlBPYix5EHJMbTqjPSLwkiN7EcJECYRrvRhkYxgapkvmUiXy7bICEaRhXLysNfJ2R2ESTBe6p4EFtDnUnONCxt4M1gEQrqYzzo8fYKN6ch6Yt/wauiRC4rzZU++/SHeSzI0C4eug5RzhCnBstQSdjZ//pyr"
+    "changelog":  "1. Backup em rede: usuario e senha de rede OPCIONAIS e botao \u0027Testar Acesso como SYSTEM\u0027 (grava de verdade pela conta do backup automatico).\\n2. Protecao de disco real: abre espaco apagando os backups mais antigos (preserva os 3 mais recentes) ou recusa a copia; folga de max(2 GB, 10%) no disco do banco.\\n3. Auditoria exige 2.5x o banco livre; temporario do gbak respeita a folga do disco do banco.\\n4. Particoes reservadas so por rotulo exato ou \u003c 1 GB (discos como \u0027ESPELHO\u0027 voltam a valer); destino invalido gera alerta.\\n5. Instalador atualiza na pasta existente, reconfigura o servico sem apaga-lo e pausa o watchdog durante a instalacao.",
+    "setupSha256":  "36F69A17F7E281457E3203D60C2FC87CB241EC23DE28CBD677AD424AF86D2D65",
+    "engineSha256":  "1F69620F83ED4CF1B35947ED1915B0A6059008A0034431FF17DCFD3662D89CE7",
+    "signature":  "k6k3f+Emy8CkfXN/LeajcnkMA2RJI4zKEIiM3qp+F17GdHfjhqdw9f3hSL3TOap0BUP3Jd9f3S5MAtwUP2YyFQHL8mZsmf+FeGjFQrIZAVpvDEAaEnkab8NZjIZtiuCgnRrDbG/deLfFSiSMhnOczuzllmxIzLNJDRL354YN84zNLj60jc8FaTJtCGvmnr6bVyX3JL0tYEqP1Xw0u0cOoaJ/keRUCMZpS1Qs/j0+/hHkNP5rajnISqaWz3gsWY2yE5o0a7BRC44CWrTJhzWEA3vKzYC0WiPbgxbrzLsLxWyjE8rqTM5vU+/Ua6GbViTbg8zmgbI2JfkVPmdc5ppy86X7OkbJMq1urxe89aLSrF4iUlFVDaa/st0jtUoSHQzpNLLWOvrMdrjA0ofxYml4OGLqumW8lhtUNQnt0ilXx73CU0ofTp6Fk68btDrOCCPKpAjomRY6E1Q+nx1i5qdCPMpDju4elzCc5cuCop0BEENyXwPRDY4qaBlNUPmjir9n"
 }
