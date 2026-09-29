@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.30",
+    "version":  "2.2.31",
     "releaseDate":  "2026-09-28",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Painel: tarefa sem destino de rede nao guarda credencial de rede (sobras antigas passam a ser limpas ao salvar).\\n2. Inclui a v2.2.29 (Watchdog e Startup Guard garantidos pelo servico), a v2.2.28 (instalador sem senha) e a v2.2.27 (credencial de rede opcional com teste SYSTEM, protecao de disco).",
-    "setupSha256":  "75C43A9A85FF42D22F7FD1A8CCCD29437CE53A55A935E2EE8F3EBFD38CC0C937",
-    "engineSha256":  "EF2F64E576A049AEA4B4B4F31D61A4BCE5F1860868C95FC976A1D39F83C82524",
-    "signature":  "M+GEjSNXUmtciQIISWmswnYF0dalnCXEYBvA9Zmk6NHAY9rOlWfhj9Qs96G3szrw0TIjDf4bCNQHNsyABJNQRXRaOzymOcA6v0YHe7eRTgN8AbbU/hnL+8cBjS24lP0V5rBqsDAA/zRsykOsRuzeQKWCpS/yowo2EtoW8jbtNUAfGMzyTz8INFEE3jCunz5/wzLnQfZXFSToQcVy5KiRhCFD12cn6ajUZs1OB7KQaMhbsIp5YlxEU0/UaSCpCp/AZXHJfuxzDWkWXReYw2d+vBbz4DcoPwrdk4HXnhbVIE8hNNd9k9Qr84KooDvxVyN1Cu3J5RCncqxDBtH8QSLPCbMecbjBm1BYx7K90r3UPQAxz6p+c57zjg1icv3ekGjaCMIGsxAFuWzmosnbACSFscxe2XosR+kKs/KEUPuFOPc2WiWxnP852Ule8IwUiZlBFqinfMooIfzY4e1zsqGeo5gtWyi8jy8TNgKC7cKx2K5Gfo3xbkKpGPkZOiV0qoAo"
+    "changelog":  "1. Backup em rede sem usuario nem senha: copia direta para o caminho compartilhado (\\\\computador\\\\pasta). Campos de credencial removidos do painel e do motor; credenciais antigas sao ignoradas.\\n2. A pasta de destino precisa liberar gravacao nas abas Compartilhamento e Seguranca (ex.: Todos); confirme com \u0027Testar Acesso como SYSTEM\u0027.\\n3. Inclui a v2.2.30 e anteriores (Watchdog e Startup Guard garantidos, protecao de disco, instalador sem senha).",
+    "setupSha256":  "774ED813B98C31116FC8C9D410A68D9D34C04F9589D7E786A16D0B767F09AD96",
+    "engineSha256":  "A4B402D8AFF1545D9AEAF6900B636AF1E170D03B45E77C2B6EB5D74BC4EB26E0",
+    "signature":  "YBt2gImXS4SqoL1iIalgOIZkSmR3xlGt34TaQP4age0a7Xydh7126qTAoQCQojp8muz5ayxA0YVYnCHO8qk2aE4SxAztaT7RaZc0YVDRXYBXZ1RZT2ajHOxhCnWXzyegHfv7SqPl0dcMtfllNzDMvBa5lSV8OwTgwarcy2p+U4uiunID9tOm42BB9Ea6kHNAfGB1OkS1ipPom31oF4SO/B000nHMLCadOh553fbS3vFD/Xmxk9/cD15UY9nxhqIIpQt2u61UyRZT6amQIDHbU98vjBRtGkcW3kqdRuqYM2ATvlu/Owfu4mmO8guE7m1ufRXS1Zd36BcS9pg7uZNnQoox5E0qZJcmD/PuCY7dWINiokQclFGVNKJJnAelSpiW3myafywZIyLHiX2fqTSzZKta3Ev1CSCxMFCIwz2fUrjbOiZ/J61cMKadaTwcRncGscbgoFVbpIzfE4lih6EJywQK5UJTGGUf6FSuU+TTukScH95PqjFLlYPkZ9DBVQJO"
 }

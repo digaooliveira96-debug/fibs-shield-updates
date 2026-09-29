@@ -19,7 +19,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.30"
+$script:EngineVersion = "2.2.31"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -460,177 +460,32 @@ function Test-IsSystemReservedDrive {
     return $false
 }
 
-function Disconnect-HostConnections {
-    param([string]$HostName)
-    if ([string]::IsNullOrWhiteSpace($HostName)) { return }
-    $cleanHost = $HostName.TrimStart('\').Split('\')[0]
-    if ([string]::IsNullOrWhiteSpace($cleanHost)) { return }
-    try {
-        $netOut = & net.exe use 2>&1
-        $pattern = "\\\\" + [regex]::Escape($cleanHost) + "\\[^\s]+"
-        foreach ($line in $netOut) {
-            if ($line -match $pattern) {
-                $remotePath = $matches[0].TrimEnd(':', '.')
-                try { & net.exe use "`"$remotePath`"" /delete /yes 2>&1 | Out-Null } catch {}
-            }
-        }
-    } catch {}
-}
-
-# Conexao SMB via WNetAddConnection2 (mpr.dll). Diferente do "net use", a senha
-# nao aparece na linha de comando de nenhum processo (logs de auditoria 4688/EDR)
-# e o codigo de erro do Windows volta direto (53, 67, 86, 1219, 1326...).
-function Initialize-MecNetApi {
-    if ($null -ne ("MecShield.NetApi" -as [type])) { return }
-    Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-namespace MecShield {
-    public static class NetApi {
-        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-        public class NETRESOURCE {
-            public int dwScope = 0;
-            public int dwType = 1; // RESOURCETYPE_DISK
-            public int dwDisplayType = 0;
-            public int dwUsage = 0;
-            public string lpLocalName = null;
-            public string lpRemoteName;
-            public string lpComment = null;
-            public string lpProvider = null;
-        }
-        [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
-        private static extern int WNetAddConnection2(NETRESOURCE netResource, string password, string username, int flags);
-        [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
-        private static extern int WNetCancelConnection2(string name, int flags, bool force);
-        public static int Connect(string remote, string user, string password) {
-            NETRESOURCE nr = new NETRESOURCE();
-            nr.lpRemoteName = remote;
-            return WNetAddConnection2(nr, password, user, 0);
-        }
-        public static int Disconnect(string remote) {
-            return WNetCancelConnection2(remote, 0, true);
-        }
-    }
-}
-"@
-}
-
-function Invoke-SmbConnect {
-    param([string]$UncRoot, [string]$User, [string]$Password)
-    Initialize-MecNetApi
-    return [MecShield.NetApi]::Connect($UncRoot, $User, $Password)
-}
-
-function Get-Win32ErrorText {
-    param([int]$Code)
-    try { return (New-Object System.ComponentModel.Win32Exception($Code)).Message } catch { return "erro $Code" }
-}
-
-# Autentica em \\host\compartilhamento. Derruba conexoes anteriores com o mesmo host
-# SOMENTE quando o Windows responde 1219 (credenciais conflitantes) e o chamador
-# permitir: derrubar sempre cortava copias em andamento de outros processos SYSTEM
-# (as conexoes de rede sao compartilhadas por toda a conta SYSTEM).
-function Connect-NetworkShare {
-    param(
-        [string]$UncRoot,
-        [string]$User,
-        [string]$Password,
-        [switch]$AllowDisconnect
-    )
-    $uncHost = $UncRoot.TrimStart('\').Split('\')[0]
-    $normUser = $User.Replace('/', '\')
-    while ($normUser.Contains('\\')) { $normUser = $normUser.Replace('\\', '\') }
-
-    $users = @($normUser)
-    if ($normUser -notmatch '\\' -and $normUser -notmatch '@' -and -not [string]::IsNullOrWhiteSpace($uncHost)) {
-        $users += "$uncHost\$normUser"
-    }
-
-    $code = -1
-    foreach ($u in $users) {
-        try { $code = Invoke-SmbConnect -UncRoot $UncRoot -User $u -Password $Password }
-        catch { return [PSCustomObject]@{ Ok = $false; Code = -1; User = $u; Message = "Falha ao chamar WNetAddConnection2: $($_.Exception.Message)" } }
-
-        if ($code -eq 1219 -and $AllowDisconnect) {
-            Log-Message "Conexao anterior com '$uncHost' usa outra credencial (erro 1219). Encerrando conexoes antigas deste host e repetindo..."
-            Disconnect-HostConnections $uncHost
-            try { $code = Invoke-SmbConnect -UncRoot $UncRoot -User $u -Password $Password } catch { $code = -1 }
-        }
-        # 0 = conectado; 85/1202 = ja existe conexao valida para este recurso
-        if ($code -eq 0 -or $code -eq 85 -or $code -eq 1202) {
-            return [PSCustomObject]@{ Ok = $true; Code = $code; User = $u; Message = "OK" }
-        }
-        # Credencial recusada com o nome sem dominio: tenta NOMEDOPC\usuario
-        if ($code -ne 1326 -and $code -ne 86 -and $code -ne 2202) { break }
-    }
-    return [PSCustomObject]@{ Ok = $false; Code = $code; User = $normUser; Message = (Get-Win32ErrorText $code) }
-}
-
-function Disconnect-NetworkShare {
-    param([string]$UncRoot)
-    try { Initialize-MecNetApi; [void][MecShield.NetApi]::Disconnect($UncRoot) } catch {}
-}
-
-# Credencial de rede OPCIONAL da tarefa. Sem usuario = acesso direto com a identidade
-# da conta SYSTEM (conta do computador no dominio; anonimo em grupo de trabalho).
-# Com usuario = autentica antes da copia. Password $null significa blob DPAPI de
-# outro computador (config copiado): nao serve como senha.
-function Get-TaskNetworkCredential {
-    param($Task)
-    if ($null -eq $Task) { return $null }
-    $user = "$($Task.NetworkUser)".Trim()
-    if ([string]::IsNullOrWhiteSpace($user)) { return $null }
-    $raw = if ($null -eq $Task.NetworkPassword) { "" } else { "$($Task.NetworkPassword)" }
-    return [PSCustomObject]@{ User = $user; Password = (Unprotect-String $raw) }
-}
-
-# Autentica no compartilhamento do destino quando ha credencial. Nunca bloqueia a
-# copia: se a autenticacao falhar, o chamador ainda tenta o acesso direto e guarda
-# o motivo para o log/alerta.
-function Connect-UncDestination {
-    # $Password sem tipo: [string] converteria $null (senha ilegivel) em "" e o motor
-    # tentaria autenticar com senha vazia em vez de explicar o problema.
-    param([string]$Path, [string]$User, $Password, [switch]$AllowDisconnect)
-    if ([string]::IsNullOrWhiteSpace($Path) -or -not $Path.StartsWith("\\") -or [string]::IsNullOrWhiteSpace($User)) {
-        return [PSCustomObject]@{ Ok = $true; Mode = "Direto"; Code = 0; Message = "Acesso direto (sem credencial configurada)" }
-    }
-    $parts = @($Path.TrimStart('\').Split('\') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if ($parts.Count -lt 2) {
-        return [PSCustomObject]@{ Ok = $false; Mode = "Credencial"; Code = -1; Message = "Caminho de rede incompleto ('$Path'): use \\computador\pasta." }
-    }
-    if ($null -eq $Password) {
-        return [PSCustomObject]@{ Ok = $false; Mode = "Credencial"; Code = -1; Message = "A senha de rede salva nao abre neste servidor (cifrada em outro computador). Redigite a senha na tarefa." }
-    }
-    $root = "\\$($parts[0])\$($parts[1])"
-    $r = Connect-NetworkShare -UncRoot $root -User $User -Password $Password -AllowDisconnect:$AllowDisconnect
-    if ($r.Ok) {
-        return [PSCustomObject]@{ Ok = $true; Mode = "Credencial"; Code = $r.Code; Message = "Autenticado em $root como '$($r.User)'" }
-    }
-    return [PSCustomObject]@{ Ok = $false; Mode = "Credencial"; Code = $r.Code; Message = "Autenticacao em $root como '$($r.User)' recusada: $($r.Message) (codigo $($r.Code))" }
-}
+# ==============================================================================
+# BACKUP EM REDE: copia direta para o caminho compartilhado (\\computador\pasta),
+# sem usuario nem senha. Quem grava e a conta do servidor (servico SYSTEM), entao a
+# pasta precisa liberar gravacao para ela nas DUAS abas do Windows: Compartilhamento
+# e Seguranca (ex.: Todos/Everyone com Modificar).
+# ==============================================================================
 
 # Teste de gravacao real no destino, executado pela interface como SYSTEM (tarefa
-# agendada temporaria). Antes o botao testava no usuario logado e so conferia se a
-# pasta existia: dava "OK" para uma pasta que o backup automatico nao conseguia gravar.
+# agendada temporaria): a mesma conta do backup automatico.
 function Invoke-NetworkAccessTest {
-    param([string[]]$Destinations, [string]$User, $Password)
+    param([string[]]$Destinations)
     $results = @()
     foreach ($d in $Destinations) {
         if ([string]::IsNullOrWhiteSpace($d)) { continue }
         $dest = (Resolve-MappedDrivePath $d.Trim()).TrimEnd('\', '/')
-        $auth = Connect-UncDestination -Path $dest -User $User -Password $Password
-        $prefixo = if ($auth.Mode -eq "Credencial") { "$($auth.Message). " } else { "" }
         $probe = Join-Path $dest (".mecshield_teste_{0}.tmp" -f ([Guid]::NewGuid().ToString("N")))
         try {
-            if (-not (Test-Path $dest)) { throw "pasta inacessivel ou inexistente para esta conta" }
+            if (-not (Test-Path $dest)) { throw "pasta inacessivel ou inexistente para a conta do servidor" }
             [System.IO.File]::WriteAllText($probe, "MEC Shield - teste de gravacao $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
             $lido = [System.IO.File]::ReadAllText($probe)
             if ($lido -notmatch '^MEC Shield - teste de gravacao') { throw "arquivo de teste lido com conteudo diferente" }
-            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "${prefixo}Gravacao, leitura e exclusao OK." }
+            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Gravacao, leitura e exclusao OK." }
         } catch {
             $motivo = "$($_.Exception.Message)".Trim()
             if ([string]::IsNullOrWhiteSpace($motivo)) { $motivo = "$_" }
-            $results += [PSCustomObject]@{ Destination = $dest; Ok = $false; Message = "${prefixo}Falha: $motivo" }
+            $results += [PSCustomObject]@{ Destination = $dest; Ok = $false; Message = "Falha: $motivo" }
         } finally {
             try { if (Test-Path $probe) { Remove-Item $probe -Force -ErrorAction SilentlyContinue } } catch {}
         }
@@ -639,19 +494,14 @@ function Invoke-NetworkAccessTest {
 }
 
 # Pedido/resposta do teste em arquivos texto (TAB) na pasta temp da instalacao, que so
-# SYSTEM e Administradores gravam. A senha chega cifrada (DPAPI da maquina).
+# SYSTEM e Administradores gravam.
 function Invoke-NetworkAccessTestFromRequest {
     param([string]$RequestFile, [string]$ResultFile)
-    $user = ""; $passRaw = ""; $dests = @()
+    $dests = @()
     if (Test-Path $RequestFile) {
         foreach ($line in (Get-Content $RequestFile -Encoding UTF8)) {
             $p = $line.Split("`t", 2)
-            if ($p.Count -lt 2) { continue }
-            switch ($p[0]) {
-                "USER" { $user = $p[1].Trim() }
-                "PASS" { $passRaw = $p[1] }
-                "DEST" { $dests += $p[1].Trim() }
-            }
+            if ($p.Count -eq 2 -and $p[0] -eq "DEST") { $dests += $p[1].Trim() }
         }
         Remove-Item $RequestFile -Force -ErrorAction SilentlyContinue
     }
@@ -660,8 +510,7 @@ function Invoke-NetworkAccessTestFromRequest {
     if ($dests.Count -eq 0) {
         $out += "FALHA`t-`tPedido de teste vazio ou ilegivel."
     } else {
-        $pass = if ([string]::IsNullOrWhiteSpace($user)) { "" } else { Unprotect-String $passRaw }
-        foreach ($r in (Invoke-NetworkAccessTest -Destinations $dests -User $user -Password $pass)) {
+        foreach ($r in (Invoke-NetworkAccessTest -Destinations $dests)) {
             $status = if ($r.Ok) { "OK" } else { "FALHA" }
             $out += "$status`t$($r.Destination)`t$(($r.Message -replace '[\r\n\t]+', ' '))"
         }
@@ -1268,7 +1117,7 @@ function Send-BackupNotification {
               <strong>2. Compartilhamento do Windows:</strong> Confirmar se a pasta de backup continua compartilhada na rede e acess&iacute;vel.
             </div>
             <div style='margin-bottom:8px;'>
-              <strong>3. Permiss&atilde;o de Grava&ccedil;&atilde;o:</strong> A pasta precisa aceitar grava&ccedil;&atilde;o da conta do servidor (servi&ccedil;o SYSTEM). Se a tarefa usa usu&aacute;rio/senha de rede opcional, verificar se a senha foi alterada. Use o bot&atilde;o &quot;Testar Acesso como SYSTEM&quot; na tarefa.
+              <strong>3. Permiss&atilde;o de Grava&ccedil;&atilde;o:</strong> A pasta precisa aceitar grava&ccedil;&atilde;o da conta do servidor (servi&ccedil;o SYSTEM). Na pasta do terminal, as abas Compartilhamento e Seguran&ccedil;a precisam liberar grava&ccedil;&atilde;o (ex.: Todos). Use o bot&atilde;o &quot;Testar Acesso como SYSTEM&quot; na tarefa.
             </div>
             <div>
               <strong>4. Banco de Dados Local:</strong> Nenhuma a&ccedil;&atilde;o necess&aacute;ria no banco Firebird (o banco est&aacute; 100% &iacute;ntegro e seguro no servidor).
@@ -1474,7 +1323,7 @@ function Send-BackupNotification {
                   <ul style='margin:6px 0 0 18px; padding:0; color:#fde68a;'>
                     <li style='margin-bottom:4px;'><strong>Terminal da Recep&ccedil;&atilde;o Desligado:</strong> O computador ou switch de rede pode estar sem energia ou em suspens&atilde;o/hiberna&ccedil;&atilde;o.</li>
                     <li style='margin-bottom:4px;'><strong>Formata&ccedil;&atilde;o ou Troca de Terminal:</strong> O computador pode ter sido formatado recentemente ou substitu&iacute;do na recep&ccedil;&atilde;o.</li>
-                    <li style='margin-bottom:4px;'><strong>Permiss&atilde;o ou Credencial:</strong> A pasta n&atilde;o aceita grava&ccedil;&atilde;o da conta do servidor (SYSTEM), ou a senha de rede opcional configurada na tarefa foi alterada/expirou.</li>
+                    <li style='margin-bottom:4px;'><strong>Permiss&atilde;o:</strong> A pasta n&atilde;o aceita grava&ccedil;&atilde;o do servidor. Libere nas abas Compartilhamento e Seguran&ccedil;a da pasta (ex.: Todos com Modificar).</li>
                     <li><strong>Mudan&ccedil;a de IP ou Cabo Solto:</strong> O endere&ccedil;o IP do terminal variou pelo roteador ou o cabo de rede foi desconectado.</li>
                   </ul>
                 </div>
@@ -2295,14 +2144,6 @@ function Test-ExternalDestinationsHealth {
             $detectedReason = $FailureReason
 
             $authFailureReason = ""
-            # Credencial opcional da tarefa: autentica antes de olhar a pasta
-            if ($destTrim.StartsWith("\\")) {
-                $monCred = Get-TaskNetworkCredential -Task $tConf
-                if ($null -ne $monCred) {
-                    $monAuth = Connect-UncDestination -Path $destTrim -User $monCred.User -Password $monCred.Password -AllowDisconnect:$AllowDisconnect
-                    if (-not $monAuth.Ok) { $authFailureReason = $monAuth.Message }
-                }
-            }
 
             # Checagem Fisica Real de Arquivos .GZ no destino
             $realLastBackupTime = $null
@@ -2353,7 +2194,7 @@ function Test-ExternalDestinationsHealth {
                 $firstFail = [DateTime]::Parse($netTracker[$destTrim].FirstFailure)
                 $hoursSince = ((Get-Date) - $firstFail).TotalHours
                 if ([string]::IsNullOrWhiteSpace($detectedReason)) {
-                    $detectedReason = if (-not [string]::IsNullOrWhiteSpace($authFailureReason)) { $authFailureReason } else { "Terminal offline, pasta descompartilhada ou credenciais de rede recusadas." }
+                    $detectedReason = if (-not [string]::IsNullOrWhiteSpace($authFailureReason)) { $authFailureReason } else { "Terminal offline, pasta descompartilhada ou sem permissao de gravacao para o servidor." }
                 }
             }
 
@@ -3849,13 +3690,7 @@ $noGarbageCollection = if ($null -ne $task.NoGarbageCollection) { [bool]$task.No
 $convertExternal     = if ($null -ne $task.ConvertExternal) { [bool]$task.ConvertExternal } else { $true }
 $runGfixSweep        = if ($null -ne $task.RunGfixSweep) { [bool]$task.RunGfixSweep } else { $false }
 $runGfixValidate     = if ($null -ne $task.RunGfixValidate) { [bool]$task.RunGfixValidate } else { $false }
-# Credencial de rede opcional (ver Get-TaskNetworkCredential)
-$netCred             = Get-TaskNetworkCredential -Task $task
 $networkConfigFailureReason = ""
-if ($null -ne $netCred -and $null -eq $netCred.Password) {
-    $networkConfigFailureReason = "A senha de rede salva na tarefa '$TaskName' nao abre neste servidor (cifrada em outro computador). Redigite a senha na tarefa."
-    Log-Message "AVISO DE CONFIGURACAO: $networkConfigFailureReason"
-}
 
 # --- FASE 1: AUTO-RECUPERACAO E ESPERA DE PRONTIDAO NO BOOT ---
 $maxBootWaitSec = 45
@@ -4329,17 +4164,6 @@ foreach ($destTrimmed in $resolvedDestList) {
     $finalPath = $null
     Log-Message "Gravando backup GZ no destino $($destTypeTag) - $destTrimmed"
 
-    if ($isNetwork -and $null -ne $netCred) {
-        # Com a trava de backup em maos e seguro derrubar conexao conflitante (erro 1219)
-        $auth = Connect-UncDestination -Path $destTrimmed -User $netCred.User -Password $netCred.Password -AllowDisconnect
-        if ($auth.Ok) {
-            Log-Message "Rede: $($auth.Message)."
-        } else {
-            $destinationFailureReason = $auth.Message
-            Log-Message "Aviso para destino '$destTrimmed': $($auth.Message). Tentando acesso direto com a permissao da conta do servidor..."
-        }
-    }
-
     $destSuccess = $false
     for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
         try {
@@ -4534,7 +4358,7 @@ O backup do banco de dados foi extraido e compactado com 100% DE SUCESSO no serv
 Causas mais frequentes para verificar:
 1. Computador da Recepcao/Terminal desligado, hibernando ou fora da tomada/rede;
 2. Pasta descompartilhada, renomeada ou sem permissao no computador remoto;
-3. Pasta sem permissao de gravacao para a conta do servidor (SYSTEM) ou senha de rede opcional da tarefa alterada (teste pelo botao 'Testar Acesso como SYSTEM');
+3. Pasta sem permissao de gravacao para o servidor nas abas Compartilhamento e Seguranca (teste pelo botao 'Testar Acesso como SYSTEM');
 4. Cabo de rede desconectado, oscilacao de Wi-Fi ou IP do terminal alterado;
 5. Discos locais do servidor sem espaco livre para a copia de seguranca.
 "@
