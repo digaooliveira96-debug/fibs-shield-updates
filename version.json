@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.31",
+    "version":  "2.2.32",
     "releaseDate":  "2026-09-28",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Backup em rede sem usuario nem senha: copia direta para o caminho compartilhado (\\\\computador\\\\pasta). Campos de credencial removidos do painel e do motor; credenciais antigas sao ignoradas.\\n2. A pasta de destino precisa liberar gravacao nas abas Compartilhamento e Seguranca (ex.: Todos); confirme com \u0027Testar Acesso como SYSTEM\u0027.\\n3. Inclui a v2.2.30 e anteriores (Watchdog e Startup Guard garantidos, protecao de disco, instalador sem senha).",
-    "setupSha256":  "774ED813B98C31116FC8C9D410A68D9D34C04F9589D7E786A16D0B767F09AD96",
-    "engineSha256":  "A4B402D8AFF1545D9AEAF6900B636AF1E170D03B45E77C2B6EB5D74BC4EB26E0",
-    "signature":  "YBt2gImXS4SqoL1iIalgOIZkSmR3xlGt34TaQP4age0a7Xydh7126qTAoQCQojp8muz5ayxA0YVYnCHO8qk2aE4SxAztaT7RaZc0YVDRXYBXZ1RZT2ajHOxhCnWXzyegHfv7SqPl0dcMtfllNzDMvBa5lSV8OwTgwarcy2p+U4uiunID9tOm42BB9Ea6kHNAfGB1OkS1ipPom31oF4SO/B000nHMLCadOh553fbS3vFD/Xmxk9/cD15UY9nxhqIIpQt2u61UyRZT6amQIDHbU98vjBRtGkcW3kqdRuqYM2ATvlu/Owfu4mmO8guE7m1ufRXS1Zd36BcS9pg7uZNnQoox5E0qZJcmD/PuCY7dWINiokQclFGVNKJJnAelSpiW3myafywZIyLHiX2fqTSzZKta3Ev1CSCxMFCIwz2fUrjbOiZ/J61cMKadaTwcRncGscbgoFVbpIzfE4lih6EJywQK5UJTGGUf6FSuU+TTukScH95PqjFLlYPkZ9DBVQJO"
+    "changelog":  "1. Copia de rede igual ao FIBS original: o servico tenta gravar direto; se a pasta recusar, a copia e feita pelo usuario logado no servidor (mesmo acesso do Explorer), sem usuario nem senha.\\n2. Backup local continua 24h pelo servico; sem ninguem logado, a copia de rede aguarda e o monitor alerta apos o prazo.\\n3. Botao Testar Acesso como SYSTEM usa a mesma logica e informa se grava direto ou pelo usuario logado.",
+    "setupSha256":  "46361C48C92137ADEAA879F81BB7B56E51896CBBCF283B3C643D1D3F41EFB4D9",
+    "engineSha256":  "B2F111B543D523ED4AB22F83C40FC05BE76EA1D690A96BC8D05259E708DCBECE",
+    "signature":  "vDRBFBVysOOo72DBWqw/A9mFk7oG0i63EERkqjyv/uYOza/N0XGD57xtjhJVB/SY6vcKyVMtkY+9g80fwaOPJaiOwcc91soHOszdHJD9MtuQlXNSrw4EbVhttJkLljiGIWcP2mFxibQIKMHwWDZTexopbfxWYBv56RmKHOX1s88NMl3D9o5o+L+jRRx7feR8WnfDRdp/ndh9/e60fDB/ZMp6EHZEBBrLEIbRCg+HUSNBjS/zVOSEX4Md4CYC4t/b/GtUNOURwpT2DXnAh2e19nxHU4vUnt8e3jmdobJLXdt9+H9ozbijw16wckPehFxZXbCTcxbkjF3+mPybatM/5zO3FdtErMFCwrkqFOSxID6rviFr4sjto5JHUKtGXjOPC/X0q2u7W6ruX9QHofPP2ULVReo5yvZz40POYOAgul+IKd6RrSj5FkPgFYZ9Sp4wn7nvBt7lpyOFPB+FEcYTMqgW70e52cxa/oWn/7mgKTWQdIBspH6NbGeRmaXgQ5Em"
 }

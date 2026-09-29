@@ -19,7 +19,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.31"
+$script:EngineVersion = "2.2.32"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -461,14 +461,169 @@ function Test-IsSystemReservedDrive {
 }
 
 # ==============================================================================
-# BACKUP EM REDE: copia direta para o caminho compartilhado (\\computador\pasta),
-# sem usuario nem senha. Quem grava e a conta do servidor (servico SYSTEM), entao a
-# pasta precisa liberar gravacao para ela nas DUAS abas do Windows: Compartilhamento
-# e Seguranca (ex.: Todos/Everyone com Modificar).
+# BACKUP EM REDE SEM SENHA (igual ao FIBS 2.0.2 original)
+# O FIBS rodava como programa aberto NO USUARIO LOGADO e gravava na pasta de rede com
+# o login dele. O MEC Shield roda como servico (conta do servidor): primeiro tenta
+# gravar direto; se a pasta nao aceitar a conta do servidor, entrega a copia ao
+# usuario logado no servidor, que grava com o mesmo acesso do Explorer.
+# Nenhum usuario ou senha e pedido, guardado ou enviado.
 # ==============================================================================
+function Test-IsSystemAccount {
+    try { return [System.Security.Principal.WindowsIdentity]::GetCurrent().IsSystem } catch { return $false }
+}
+
+# Falta de permissao (e nao rede fora do ar): repetir com a mesma conta nao adianta.
+function Test-IsAccessDeniedError {
+    param($ErrorRecord)
+    $ex = $ErrorRecord.Exception
+    if ($ex -is [System.UnauthorizedAccessException]) { return $true }
+    $msg = "$($ex.Message) $($ex.InnerException.Message)"
+    return ($msg -match '(?i)access.*denied|acesso.*negado')
+}
+
+# Usuarios com sessao aberta no servidor (donos do explorer.exe), sem repetir.
+function Get-LoggedOnUsers {
+    $users = @()
+    try {
+        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
+            try {
+                $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
+                if ($o.ReturnValue -eq 0 -and -not [string]::IsNullOrWhiteSpace($o.User)) {
+                    $u = if ([string]::IsNullOrWhiteSpace($o.Domain)) { "$($o.User)" } else { "$($o.Domain)\$($o.User)" }
+                    if ($users -notcontains $u) { $users += $u }
+                }
+            } catch {}
+        }
+    } catch {}
+    # Sem virgula: ",@()" viraria "1 usuario vazio" em @(Get-LoggedOnUsers)
+    return $users
+}
+
+# Script que roda NA SESSAO DO USUARIO: copia, confere SHA-256 e aplica a retencao do
+# prefixo no destino (a conta do servidor pode nao ter permissao de apagar la). MODE=PROBE
+# so grava, le e apaga um arquivo de teste. Resposta: OK|FALHA <TAB> usuario <TAB> ...
+function Get-UserSessionCopyScript {
+    return @'
+param([string]$JobFile)
+$res = $null
+$quem = try { [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { "?" }
+$r = "FALHA`t$quem`tpedido ilegivel"
+try {
+    $job = @{}
+    foreach ($l in (Get-Content -LiteralPath $JobFile -Encoding UTF8)) { $p = $l.Split("`t", 2); if ($p.Count -eq 2) { $job[$p[0]] = $p[1] } }
+    $res = $job["RESULT"]
+    $dest = $job["DESTDIR"]
+    if (-not (Test-Path -LiteralPath $dest)) { New-Item -ItemType Directory -Path $dest -Force -ErrorAction Stop | Out-Null }
+    if ($job["MODE"] -eq "PROBE") {
+        $probe = Join-Path $dest (".mecshield_teste_{0}.tmp" -f [Guid]::NewGuid().ToString("N"))
+        try {
+            [IO.File]::WriteAllText($probe, "MEC Shield")
+            if ([IO.File]::ReadAllText($probe) -ne "MEC Shield") { throw "arquivo de teste lido com conteudo diferente" }
+        } finally { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
+        $r = "OK`t$quem`t`t0"
+    } else {
+        $final = Join-Path $dest (Split-Path $job["SRC"] -Leaf)
+        Copy-Item -LiteralPath $job["SRC"] -Destination $final -Force -ErrorAction Stop
+        $sha = (Get-FileHash -LiteralPath $final -Algorithm SHA256).Hash
+        if ($sha -ne $job["SHA"]) {
+            Remove-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue
+            throw "SHA-256 da copia nao confere com a origem (arquivo chegou alterado)"
+        }
+        $pfx = [regex]::Escape($job["PREFIX"])
+        $keep = 30; [void][int]::TryParse($job["KEEP"], [ref]$keep); if ($keep -lt 1) { $keep = 1 }
+        $velhos = @(Get-ChildItem -LiteralPath $dest -File -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match "^${pfx}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${pfx}[-_]\d{8}_\d{6}\.(GZ|zip)$"
+        } | Sort-Object LastWriteTime -Descending | Select-Object -Skip $keep)
+        foreach ($f in $velhos) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
+        $r = "OK`t$quem`t$final`t$($velhos.Count)"
+    }
+} catch {
+    $r = "FALHA`t$quem`t$(($_.Exception.Message -replace '[\r\n\t]+', ' '))"
+}
+if ($res) {
+    [IO.File]::WriteAllText("$res.tmp", $r)
+    Move-Item -LiteralPath "$res.tmp" -Destination $res -Force
+}
+'@
+}
+
+# Roda o script na sessao do usuario por uma tarefa agendada temporaria ("somente
+# quando o usuario estiver logado": o Windows nao pede senha) e espera a resposta.
+function Invoke-AsLoggedOnUser {
+    param([string]$User, [string]$HelperFile, [string]$JobFile, [string]$ResultFile, [int]$TimeoutSec = 900)
+    $nome = "Copia_Rede_" + [Guid]::NewGuid().ToString("N").Substring(0, 12)
+    try {
+        $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ("-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"{0}`" -JobFile `"{1}`"" -f $HelperFile, $JobFile)
+        $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds ($TimeoutSec + 120))
+        try {
+            $prn = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
+            Register-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Action $act -Principal $prn -Settings $set -Force -ErrorAction Stop | Out-Null
+        } catch {
+            # Privilegio maximo recusado para este usuario: roda no nivel normal dele
+            $prn = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
+            Register-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Action $act -Principal $prn -Settings $set -Force -ErrorAction Stop | Out-Null
+        }
+        Start-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -ErrorAction Stop
+        $limite = (Get-Date).AddSeconds($TimeoutSec)
+        while ((Get-Date) -lt $limite -and -not (Test-Path $ResultFile)) { Start-Sleep -Seconds 2 }
+    } finally {
+        try { Unregister-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    }
+}
+
+# Copia (ou testa, com -Probe) um destino de rede pela sessao de cada usuario logado,
+# ate um conseguir. Devolve Ok, User, FinalPath, Removed e Message.
+function Copy-ViaLoggedOnUser {
+    param(
+        [string]$DestDir,
+        [string]$SourceFile = "",
+        [string]$Prefix = "BKP_SISMOTEL",
+        [int]$Keep = 30,
+        [string]$ExpectedSha = "",
+        [switch]$Probe,
+        [int]$TimeoutSec = 900,
+        [string]$WorkRoot = ""
+    )
+    $users = @(Get-LoggedOnUsers)
+    if ($users.Count -eq 0) {
+        return [PSCustomObject]@{ Ok = $false; User = ""; FinalPath = ""; Removed = 0; Message = "nenhum usuario logado no servidor para fazer a copia pela sessao dele" }
+    }
+    $base = if ([string]::IsNullOrWhiteSpace($WorkRoot)) { Join-Path $env:ProgramData "MEC_Shield\rede" } else { $WorkRoot }
+    $falhas = @()
+    foreach ($u in $users) {
+        $jobDir = Join-Path $base ([Guid]::NewGuid().ToString("N"))
+        try {
+            New-Item -ItemType Directory -Path $jobDir -Force -ErrorAction Stop | Out-Null
+            & icacls.exe $jobDir /grant "${u}:(OI)(CI)M" /Q 2>&1 | Out-Null
+            if (-not $Probe) { & icacls.exe $SourceFile /grant "${u}:(R)" /Q 2>&1 | Out-Null }
+            $helper = Join-Path $jobDir "copia_rede.ps1"
+            [System.IO.File]::WriteAllText($helper, (Get-UserSessionCopyScript), [System.Text.Encoding]::ASCII)
+            $jobFile = Join-Path $jobDir "pedido.txt"
+            $resFile = Join-Path $jobDir "resposta.txt"
+            $modo = if ($Probe) { "PROBE" } else { "COPY" }
+            $linhas = @("MODE`t$modo", "DESTDIR`t$DestDir", "SRC`t$SourceFile", "PREFIX`t$Prefix", "KEEP`t$Keep", "SHA`t$ExpectedSha", "RESULT`t$resFile")
+            [System.IO.File]::WriteAllText($jobFile, ($linhas -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+            Invoke-AsLoggedOnUser -User $u -HelperFile $helper -JobFile $jobFile -ResultFile $resFile -TimeoutSec $TimeoutSec
+            if (-not (Test-Path $resFile)) { $falhas += "${u}: sem resposta em $TimeoutSec s"; continue }
+            $p = ([System.IO.File]::ReadAllText($resFile)).Split("`t")
+            if ($p[0] -eq "OK") {
+                $removidos = 0; if ($p.Count -ge 4) { [void][int]::TryParse($p[3], [ref]$removidos) }
+                $final = if ($p.Count -ge 3) { $p[2] } else { "" }
+                return [PSCustomObject]@{ Ok = $true; User = $p[1]; FinalPath = $final; Removed = $removidos; Message = "OK" }
+            }
+            $falhas += "$($p[1]): $(if ($p.Count -ge 3) { $p[2] } else { 'falha sem detalhe' })"
+        } catch {
+            $falhas += "${u}: $($_.Exception.Message)"
+        } finally {
+            try { Remove-Item $jobDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+    return [PSCustomObject]@{ Ok = $false; User = ""; FinalPath = ""; Removed = 0; Message = ($falhas -join " | ") }
+}
 
 # Teste de gravacao real no destino, executado pela interface como SYSTEM (tarefa
-# agendada temporaria): a mesma conta do backup automatico.
+# agendada temporaria): mesma logica do backup automatico -- direto pela conta do
+# servidor e, se ela for barrada, pela sessao do usuario logado.
 function Invoke-NetworkAccessTest {
     param([string[]]$Destinations)
     $results = @()
@@ -476,18 +631,31 @@ function Invoke-NetworkAccessTest {
         if ([string]::IsNullOrWhiteSpace($d)) { continue }
         $dest = (Resolve-MappedDrivePath $d.Trim()).TrimEnd('\', '/')
         $probe = Join-Path $dest (".mecshield_teste_{0}.tmp" -f ([Guid]::NewGuid().ToString("N")))
+        $direto = ""
         try {
             if (-not (Test-Path $dest)) { throw "pasta inacessivel ou inexistente para a conta do servidor" }
             [System.IO.File]::WriteAllText($probe, "MEC Shield - teste de gravacao $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
             $lido = [System.IO.File]::ReadAllText($probe)
             if ($lido -notmatch '^MEC Shield - teste de gravacao') { throw "arquivo de teste lido com conteudo diferente" }
-            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Gravacao, leitura e exclusao OK." }
         } catch {
-            $motivo = "$($_.Exception.Message)".Trim()
-            if ([string]::IsNullOrWhiteSpace($motivo)) { $motivo = "$_" }
-            $results += [PSCustomObject]@{ Destination = $dest; Ok = $false; Message = "Falha: $motivo" }
+            $direto = "$($_.Exception.Message)".Trim()
+            if ([string]::IsNullOrWhiteSpace($direto)) { $direto = "$_" }
         } finally {
             try { if (Test-Path $probe) { Remove-Item $probe -Force -ErrorAction SilentlyContinue } } catch {}
+        }
+        if ([string]::IsNullOrWhiteSpace($direto)) {
+            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Gravacao direta pelo servico: OK (funciona 24h, mesmo sem ninguem logado)." }
+            continue
+        }
+        if (-not (Test-IsSystemAccount)) {
+            $results += [PSCustomObject]@{ Destination = $dest; Ok = $false; Message = "Falha: $direto" }
+            continue
+        }
+        $v = Copy-ViaLoggedOnUser -DestDir $dest -Probe -TimeoutSec 120
+        if ($v.Ok) {
+            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Grava pelo usuario logado ($($v.User)), igual ao FIBS antigo, sem senha. Precisa de alguem logado no servidor para a copia de rede (o backup local continua 24h)." }
+        } else {
+            $results += [PSCustomObject]@{ Destination = $dest; Ok = $false; Message = "Servico: $direto | Usuario logado: $($v.Message)" }
         }
     }
     return $results
@@ -2194,7 +2362,7 @@ function Test-ExternalDestinationsHealth {
                 $firstFail = [DateTime]::Parse($netTracker[$destTrim].FirstFailure)
                 $hoursSince = ((Get-Date) - $firstFail).TotalHours
                 if ([string]::IsNullOrWhiteSpace($detectedReason)) {
-                    $detectedReason = if (-not [string]::IsNullOrWhiteSpace($authFailureReason)) { $authFailureReason } else { "Terminal offline, pasta descompartilhada ou sem permissao de gravacao para o servidor." }
+                    $detectedReason = if (-not [string]::IsNullOrWhiteSpace($authFailureReason)) { $authFailureReason } else { "Terminal offline, pasta descompartilhada, ou pasta sem permissao para o servico e ninguem logado no servidor." }
                 }
             }
 
@@ -4252,6 +4420,9 @@ foreach ($destTrimmed in $resolvedDestList) {
         } catch {
             Log-Message "Tentativa $attempt de copia para '$destTrimmed' falhou: $_"
             if ([string]::IsNullOrWhiteSpace($destinationFailureReason)) { $destinationFailureReason = "$_" }
+            # Servico sem permissao na pasta de rede: repetir nao adianta; vai direto para
+            # a copia pelo usuario logado (logo abaixo).
+            $semPermissao = ($isNetwork -and (Test-IsSystemAccount) -and (Test-IsAccessDeniedError $_))
             # Nao deixar arquivo reprovado na pasta: ele seria contado como "backup
             # existente" pelo monitor e pela numeracao sequencial, mascarando a falha.
             try {
@@ -4260,10 +4431,26 @@ foreach ($destTrimmed in $resolvedDestList) {
                     Log-Message "Copia reprovada removida do destino para nao mascarar a falha: $finalPath"
                 }
             } catch {}
+            if ($semPermissao) { break }
         }
 
         if ($attempt -lt $retryCount) {
             Start-Sleep -Seconds $retryInterval
+        }
+    }
+
+    # O servico nao conseguiu gravar na pasta de rede: a copia e feita pelo usuario logado
+    # no servidor, com o mesmo acesso do Explorer (como o FIBS original fazia).
+    if (-not $destSuccess -and $isNetwork -and (Test-IsSystemAccount)) {
+        Log-Message "Rede: o servico nao gravou em '$destTrimmed'. Copiando pelo usuario logado no servidor..."
+        $viaUser = Copy-ViaLoggedOnUser -DestDir ($destTrimmed.Trim().TrimEnd('\', '/')) -SourceFile $tempGz -Prefix $basePrefix -Keep $keepBackupsCount -ExpectedSha $zipSha
+        if ($viaUser.Ok) {
+            $destSuccess = $true
+            $networkSuccessList += $viaUser.FinalPath
+            Log-Message "Backup GZ gravado e CONFERIDO em: $($viaUser.FinalPath) pelo usuario logado $($viaUser.User) (SHA-256 identico a origem; $($viaUser.Removed) backup(s) antigo(s) removido(s) pela retencao)"
+        } else {
+            $destinationFailureReason = "o servico nao tem permissao na pasta e a copia pelo usuario logado falhou: $($viaUser.Message)"
+            Log-Message "AVISO DE REDE: '$destTrimmed': $destinationFailureReason"
         }
     }
 
