@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.32",
-    "releaseDate":  "2026-09-28",
+    "version":  "2.2.33",
+    "releaseDate":  "2026-09-29",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Copia de rede igual ao FIBS original: o servico tenta gravar direto; se a pasta recusar, a copia e feita pelo usuario logado no servidor (mesmo acesso do Explorer), sem usuario nem senha.\\n2. Backup local continua 24h pelo servico; sem ninguem logado, a copia de rede aguarda e o monitor alerta apos o prazo.\\n3. Botao Testar Acesso como SYSTEM usa a mesma logica e informa se grava direto ou pelo usuario logado.",
-    "setupSha256":  "46361C48C92137ADEAA879F81BB7B56E51896CBBCF283B3C643D1D3F41EFB4D9",
-    "engineSha256":  "B2F111B543D523ED4AB22F83C40FC05BE76EA1D690A96BC8D05259E708DCBECE",
-    "signature":  "vDRBFBVysOOo72DBWqw/A9mFk7oG0i63EERkqjyv/uYOza/N0XGD57xtjhJVB/SY6vcKyVMtkY+9g80fwaOPJaiOwcc91soHOszdHJD9MtuQlXNSrw4EbVhttJkLljiGIWcP2mFxibQIKMHwWDZTexopbfxWYBv56RmKHOX1s88NMl3D9o5o+L+jRRx7feR8WnfDRdp/ndh9/e60fDB/ZMp6EHZEBBrLEIbRCg+HUSNBjS/zVOSEX4Md4CYC4t/b/GtUNOURwpT2DXnAh2e19nxHU4vUnt8e3jmdobJLXdt9+H9ozbijw16wckPehFxZXbCTcxbkjF3+mPybatM/5zO3FdtErMFCwrkqFOSxID6rviFr4sjto5JHUKtGXjOPC/X0q2u7W6ruX9QHofPP2ULVReo5yvZz40POYOAgul+IKd6RrSj5FkPgFYZ9Sp4wn7nvBt7lpyOFPB+FEcYTMqgW70e52cxa/oWn/7mgKTWQdIBspH6NbGeRmaXgQ5Em"
+    "changelog":  "1. Instalador volta a trazer nome do motel, AnyDesk e TeamViewer: deteccao no PowerShell 64 bits, registro lido nas vistas 64/32 bits e AnyDesk procurado em todas as variantes (service.conf, AnyDesk personalizado, perfis) e via AnyDesk.exe --get-id.\\n2. Valores ja salvos no config anterior sao mantidos quando a deteccao nao encontra nada.\\n3. Botao Detectar do painel usa a mesma busca do AnyDesk.",
+    "setupSha256":  "7DA1C7B365770A0FA51EAE692A7EE5B78EB402542FBD444AED85D66BB4B0FE19",
+    "engineSha256":  "E26EE4AE941479A5D1EBEBD25D1135BC6041BA30CEE812CFBA161E2E880454D1",
+    "signature":  "o6bEglgRYqwQDVqnvupIdHlE79ECW023+dMCe/wufxzuQr4MJxKd4IZcFKTtsS8cTGb0byUSUQPskON9vmrSlJKY++6ZvUTmb062oyYEBavl1HkRg+NI2+jrXYkqlyptcuPsWrp5tz6Enzfnqhorr3fidbY2EDNm62j+xkrk5i/2PYtQtFZ/8/QqwyhS44UVesronkiL8YPAM/u3e/clFgiOt3rU0P+l0mHfFm7oAuy1O1xL0FRfOJvtNeOE49JIo0Wr8+0pFkwwHqAtGO9C1RWBiOz11FzyiIw11xRU8kNn7ryG7M+qoRmk7Qfe40YnCF1jt71lXN/bO1Xpefzbyzb9ApWvt5waV0pybgCTZA/Sxm+JSRXkY/tFTdcLnJzz5UoiyU/enPM+EOvU3HcK/T30yNRcatY8IdeSKZxUfjYhgi2u5bCKsMhwUF1Ri+04Lc9Fb+6qb2NTzpJlZFLhDLnhuC2+z0nL2ql9gRQ08xs6Rr4ps5J5LG7GZa/8QyYc"
 }
