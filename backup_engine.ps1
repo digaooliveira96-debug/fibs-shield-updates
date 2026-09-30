@@ -19,7 +19,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.33"
+$script:EngineVersion = "2.2.34"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -524,7 +524,10 @@ try {
     } else {
         $final = Join-Path $dest (Split-Path $job["SRC"] -Leaf)
         Copy-Item -LiteralPath $job["SRC"] -Destination $final -Force -ErrorAction Stop
-        $sha = (Get-FileHash -LiteralPath $final -Algorithm SHA256).Hash
+        # SHA-256 pelo .NET: Get-FileHash nao existe no PowerShell 2/3
+        $fs = [IO.File]::Open($final, 'Open', 'Read', 'Read')
+        $alg = [Security.Cryptography.SHA256]::Create()
+        try { $sha = [BitConverter]::ToString($alg.ComputeHash($fs)).Replace("-", "") } finally { $alg.Clear(); $fs.Close() }
         if ($sha -ne $job["SHA"]) {
             Remove-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue
             throw "SHA-256 da copia nao confere com a origem (arquivo chegou alterado)"
@@ -700,10 +703,22 @@ function Invoke-NetworkAccessTestFromRequest {
 # descompactado contra o hash do .fbk original: detecta corrupcao silenciosa, e a
 # abertura do arquivo detecta truncamento (diretorio central ausente).
 
+# SHA-256 direto pelo .NET. NAO usar Get-FileHash: ele nao existe no PowerShell 2/3 e o
+# -InputStream so existe a partir do 5.0. Em servidor com PowerShell 4 (Windows Server
+# 2012 R2) o portao do GZ falhava em TODA rotina e nenhum backup era gravado.
+function Get-Sha256OfStream {
+    param([System.IO.Stream]$Stream)
+    $alg = [System.Security.Cryptography.SHA256]::Create()
+    try { return [System.BitConverter]::ToString($alg.ComputeHash($Stream)).Replace("-", "") }
+    finally { $alg.Clear() }
+}
+
 function Get-Sha256OfFile {
     param([string]$Path)
-    try { return (Get-FileHash -Path $Path -Algorithm SHA256 -ErrorAction Stop).Hash }
-    catch { return $null }
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        try { return Get-Sha256OfStream -Stream $fs } finally { $fs.Close() }
+    } catch { return $null }
 }
 
 function Test-BackupGzIntegrity {
@@ -729,7 +744,7 @@ function Test-BackupGzIntegrity {
         }
 
         $stream = $entry.Open()
-        try { $hash = (Get-FileHash -InputStream $stream -Algorithm SHA256 -ErrorAction Stop).Hash }
+        try { $hash = Get-Sha256OfStream -Stream $stream }
         finally { $stream.Close() }
 
         if ($hash -ne $ExpectedSha256) {
@@ -2401,7 +2416,8 @@ function Get-OptimalSandboxDir {
     )
     
     # A restauracao de teste tem ao mesmo tempo o FBK extraido e o FDB restaurado:
-    # exige 2.5x o banco (minimo 4096 MB). No disco do banco soma a folga do Firebird
+    # exige 2.5x o banco (minimo 4096 MB), mais a reserva de 5 GB do disco (no disco
+    # do banco, max(5 GB, 10%))
     # (antes 1.5x, e a auditoria das 03:30 podia zerar o disco do banco).
     $minRequiredMB = Get-RequiredFreeMB -DbSizeMB $DbSizeMB -Factor 2.5 -MinMB 4096
     $dbDrive = [System.IO.Path]::GetPathRoot($DbPath)
@@ -3406,19 +3422,22 @@ function Get-DriveFreeMB {
 # O disco do banco precisa de folga para o Firebird crescer o .FDB e gravar arquivos
 # de ordenacao; se ele zerar, o Sismotel para. Toda gravacao do MEC Shield nesse disco
 # (copia, temporario do gbak, sandbox da auditoria, fail-safe) deixa essa folga livre.
+# Reserva minima de 5 GB em QUALQUER disco (decisao do usuario): com menos que isso o
+# servidor do cliente ja comeca a travar. Antes era 512 MB fora do disco do banco.
 # ------------------------------------------------------------------------------
+$script:MinFreeDiskMB = 5120
 function Get-DiskReserveMB {
     param([double]$TotalMB, [bool]$IsDbDrive)
-    if ($IsDbDrive) { return [math]::Round([Math]::Max(2048, $TotalMB * 0.10), 0) }
-    return 512
+    if ($IsDbDrive) { return [math]::Round([Math]::Max($script:MinFreeDiskMB, $TotalMB * 0.10), 0) }
+    return $script:MinFreeDiskMB
 }
 
-# Espaco para processar o banco num disco: Factor x banco (no minimo MinMB) e, no
-# disco do banco, mais a folga do Firebird.
+# Espaco para processar o banco num disco: Factor x banco (no minimo MinMB) mais a
+# reserva do disco (5 GB; no disco do banco, max(5 GB, 10%)).
 function Get-RequiredFreeMB {
     param([double]$DbSizeMB, [double]$Factor, [double]$MinMB = 0, [double]$DriveTotalMB = 0, [bool]$IsDbDrive = $false)
     $base = [Math]::Max($MinMB, $DbSizeMB * $Factor)
-    $reserve = if ($IsDbDrive) { Get-DiskReserveMB -TotalMB $DriveTotalMB -IsDbDrive $true } else { 0 }
+    $reserve = Get-DiskReserveMB -TotalMB $DriveTotalMB -IsDbDrive $IsDbDrive
     return [math]::Round($base + $reserve, 0)
 }
 
@@ -3503,8 +3522,8 @@ function Clear-StaleBackupTemp {
 }
 
 # Pasta do fail-safe (ultima linha). Prefere um disco diferente do banco e so grava
-# no disco do banco se, apos a copia, sobrar folga (>= 10% e >= 2 GB): encher o disco
-# do Firebird derrubaria o Sismotel.
+# no disco do banco se, apos a copia, sobrar folga (>= 10% e >= 5 GB): encher o disco
+# do Firebird derrubaria o Sismotel. Em outro disco, sobra no minimo a reserva de 5 GB.
 function Select-FailSafeDirectory {
     param([string]$DbPath, [double]$GzSizeMB)
     $dbRoot = [System.IO.Path]::GetPathRoot($DbPath)
@@ -3523,7 +3542,10 @@ function Select-FailSafeDirectory {
                 Log-Message "Fail-safe: '$c' fica no mesmo disco do banco e ficaria com pouca folga ($([math]::Round($freeAfterMB)) MB). Disco ignorado para proteger o Firebird."
                 continue
             }
-            if ($freeAfterMB -lt 512) { continue }
+            if ($freeAfterMB -lt (Get-DiskReserveMB -TotalMB ($di.TotalSize / 1MB) -IsDbDrive $false)) {
+                Log-Message "Fail-safe: '$c' ficaria com menos de $($script:MinFreeDiskMB) MB livres ($([math]::Round($freeAfterMB)) MB). Disco ignorado."
+                continue
+            }
             return $c
         } catch {}
     }
@@ -4016,9 +4038,9 @@ foreach ($d in $resolvedDestList) {
 $tempDir = $null
 $dbDrive = [System.IO.Path]::GetPathRoot($dbPath)
 
-# Exige espaco para o FBK + GZ (1.5x o banco). No disco do banco soma a folga do
-# Firebird (Get-ProcessingRequiredMB): antes 1.5x bastava e o gbak podia zerar o disco.
-$minRequiredMB = [math]::Round($dbSizeMB * 1.5, 2)
+# Exige espaco para o FBK + GZ (1.5x o banco) mais a reserva do disco
+# (Get-ProcessingRequiredMB): 5 GB, ou max(5 GB, 10%) no disco do banco.
+$minRequiredMB = [math]::Round($dbSizeMB * 1.5 + $script:MinFreeDiskMB, 2)
 
 # 1) Procura um destino local em particao diferente do banco para isolamento fisico de gravacao
 foreach ($candDest in $resolvedDestList) {
@@ -4079,7 +4101,7 @@ if ($null -eq $tempDir) {
 
 if ($null -eq $tempDir) {
     # Nenhuma unidade possui espaco suficiente!
-    $errMsg = "ALERTA PREVENTIVO DE SEGURANCA: Nenhuma unidade possui os $minRequiredMB MB livres necessarios (no disco do banco, somados a folga de max(2 GB, 10%) reservada ao Firebird). Para proteger o banco Firebird e o sistema contra corrupcao por falta de espaco em disco, a rotina foi interrompida preventivamente com 100% de seguranca."
+    $errMsg = "ALERTA PREVENTIVO DE SEGURANCA: Nenhuma unidade possui os $minRequiredMB MB livres necessarios (1.5x o banco + reserva minima de $($script:MinFreeDiskMB) MB livres; no disco do banco a reserva e max(5 GB, 10%)). Para proteger o banco Firebird e o sistema contra corrupcao por falta de espaco em disco, a rotina foi interrompida preventivamente com 100% de seguranca."
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo "Espaco em Disco Critico ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
     Exit-BackupLock
@@ -4101,6 +4123,7 @@ Clear-StaleBackupTemp -Directories $pastasTemp
 try {
     $tempRoot = [System.IO.Path]::GetPathRoot($tempDir)
     $freeSpaceMB = Get-DriveFreeMB -Path $tempRoot
+    $minRequiredMB = Get-ProcessingRequiredMB -Path $tempRoot -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5
     Log-Message "Espaco livre na unidade de processamento ($tempRoot): $freeSpaceMB MB (Minimo seguro exigido: $minRequiredMB MB)"
 } catch {
     Log-Message "Aviso ao verificar espaco em disco: $_"
