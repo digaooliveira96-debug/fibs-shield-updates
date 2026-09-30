@@ -13,13 +13,14 @@ param (
     [switch]$CheckExternalHealth,
     [switch]$Manual,
     [switch]$ScheduledAudit,
-    [switch]$TestNetworkAccess
+    [switch]$TestNetworkAccess,
+    [switch]$ReopenPanel
 )
 
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.37"
+$script:EngineVersion = "2.2.38"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -3379,8 +3380,17 @@ function Invoke-MecLiveUpdate {
         $exeNeedsUpdate = ($exeVer.Major -eq 0) -or ($exeVer3 -lt $remoteVer3)
         $engineNeedsUpdate = ($remoteVer -gt $localVer)
 
-        if (-not $engineNeedsUpdate -and -not $exeNeedsUpdate -and -not $Force) {
+        # -ForceUpdate so pula os prazos (24 h); a MESMA versao nunca e reinstalada. Antes o
+        # botao do painel reinstalava sempre: o Setup fechava o painel e ninguem reabria.
+        if (-not $engineNeedsUpdate -and -not $exeNeedsUpdate) {
             Log-Message "[LIVEUPDATE] FIBS esta 100% atualizado (Motor: v$engineVersion, Interface: v$exeVer). Nenhuma acao necessaria."
+            return
+        }
+
+        # Pasta de desenvolvimento (tem a suite de testes): o Setup silencioso trocaria as
+        # permissoes da pasta e registraria o servico nela (aconteceu em 30/09/2026).
+        if (Test-Path (Join-Path $scriptDir "tests\MecShield.Tests.ps1")) {
+            Log-Message "[LIVEUPDATE] Checagem de atualizacoes concluida sem alteracao no sistema: pasta de desenvolvimento ($scriptDir). Nada foi instalado."
             return
         }
 
@@ -3421,6 +3431,7 @@ function Invoke-MecLiveUpdate {
                     throw "SHA-256 do instalador baixado nao confere com o manifesto assinado."
                 }
                 Log-Message "[LIVEUPDATE] Instalador conferido (SHA-256 assinado). Executando em modo silencioso..."
+                $script:LiveUpdateInstalou = $true
                 $proc = Start-Process -FilePath $tempSetup -ArgumentList "/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=`"$scriptDir`"" -PassThru
                 $null = $proc.Handle
                 if (-not $proc.WaitForExit(15 * 60 * 1000)) {
@@ -3466,6 +3477,7 @@ function Invoke-MecLiveUpdate {
         $bakEngineFile = Join-Path $scriptDir "backup_engine.ps1.bak"
         Copy-Item $liveEngineFile $bakEngineFile -Force
         Move-Item $stageFile $liveEngineFile -Force
+        $script:LiveUpdateInstalou = $true
 
         Log-Message "[LIVEUPDATE 100% SUCESSO] Motor FIBS atualizado com sucesso para a versao v$($manifest.version)!"
         Log-Message "[LIVEUPDATE] Backup da versao anterior salvo em: $bakEngineFile"
@@ -3853,7 +3865,22 @@ if ($TestNetworkAccess) {
 if ($CheckUpdateOnly) {
     Log-Message "======================================================"
     Log-Message "SOLICITACAO RECEBIDA: Verificando atualizacoes online sob demanda (-CheckUpdateOnly)..."
+    $script:LiveUpdateInstalou = $false
     Invoke-MecLiveUpdate -Force:$ForceUpdate
+    # Pedido pelo painel: o instalador fecha o painel a forca (taskkill) e, em modo
+    # silencioso, nao reabre. So reabre se algo foi realmente instalado.
+    if ($ReopenPanel -and $script:LiveUpdateInstalou) {
+        $painel = Join-Path $scriptDir "MEC_Shield.exe"
+        $aberto = @(Get-Process -Name "MEC_Shield" -ErrorAction SilentlyContinue).Count -gt 0
+        if (-not $aberto -and (Test-Path $painel)) {
+            try {
+                Start-Process -FilePath $painel -ArgumentList "/atualizado" -WorkingDirectory $scriptDir
+                Log-Message "[LIVEUPDATE] Painel reaberto apos a atualizacao."
+            } catch {
+                Log-Message "[LIVEUPDATE AVISO] Nao foi possivel reabrir o painel: $_"
+            }
+        }
+    }
     Log-Message "Verificacao de atualizacoes concluida."
     Log-Message "======================================================"
     exit 0
