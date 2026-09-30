@@ -19,7 +19,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.34"
+$script:EngineVersion = "2.2.35"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -2976,7 +2976,7 @@ function Invoke-DatabaseHealthAudit {
         if (Test-Path $sandboxDir) {
             Get-ChildItem -Path $sandboxDir -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
         } else {
-            New-Item -ItemType Directory -Path $sandboxDir -Force | Out-Null
+            New-Item -ItemType Directory -Path $sandboxDir -Force -ErrorAction Stop | Out-Null
         }
         $sandboxDbPath = Join-Path $sandboxDir "audit_sandbox_$(Get-Date -Format 'yyyyMMdd_HHmmss').fdb"
 
@@ -3508,6 +3508,34 @@ function Invoke-DestinationSpaceGuard {
 
 # Remove sobras de rotinas interrompidas (FBK/GZ parciais) das pastas temporarias
 # exclusivas do MEC Shield. So e chamada com a trava de backup em maos.
+# Cria a pasta (se preciso) e prova que da para gravar nela. Erro de New-Item e
+# nao-terminante: sem -ErrorAction Stop o try/catch nao via a falha e o motor seguia
+# com uma pasta que nem existia (SRVILHA 29/09/2026: D:\FIBS_TEMP nunca foi criada e o
+# gbak falhou 3x com "cannot open status and error output file").
+function Test-WritableDirectory {
+    param([string]$Path, [switch]$Hide)
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+            New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+        }
+        $probe = Join-Path $Path ("mec_probe_{0}.tmp" -f $PID)
+        [System.IO.File]::WriteAllText($probe, "ok")
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+    } catch {
+        Log-Message "Aviso: a pasta '$Path' nao aceita gravacao ($($_.Exception.Message)). Tentando a proxima opcao."
+        return $false
+    }
+    if ($Hide) {
+        try {
+            $attr = [System.IO.File]::GetAttributes($Path)
+            if (($attr -band [System.IO.FileAttributes]::Hidden) -ne [System.IO.FileAttributes]::Hidden) {
+                [System.IO.File]::SetAttributes($Path, $attr -bor [System.IO.FileAttributes]::Hidden)
+            }
+        } catch {}
+    }
+    return $true
+}
+
 function Clear-StaleBackupTemp {
     param([string[]]$Directories)
     foreach ($dir in ($Directories | Select-Object -Unique)) {
@@ -4043,47 +4071,21 @@ $dbDrive = [System.IO.Path]::GetPathRoot($dbPath)
 $minRequiredMB = [math]::Round($dbSizeMB * 1.5 + $script:MinFreeDiskMB, 2)
 
 # 1) Procura um destino local em particao diferente do banco para isolamento fisico de gravacao
-foreach ($candDest in $resolvedDestList) {
-    if ($candDest.StartsWith("\")) { continue } # NUNCA usar rede para temporario
-    $candDrive = [System.IO.Path]::GetPathRoot($candDest)
-    if ((Test-Path $candDrive) -and ($candDrive -ne $dbDrive)) {
-        if ((Get-DriveFreeMB -Path $candDrive) -ge (Get-ProcessingRequiredMB -Path $candDrive -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5)) {
-            $candidateTemp = Join-Path $candDrive "FIBS_TEMP"
-            try {
-                if (-not (Test-Path $candidateTemp)) { New-Item -ItemType Directory -Path $candidateTemp -Force | Out-Null }
-                try {
-                    $attr = [System.IO.File]::GetAttributes($candidateTemp)
-                    if (($attr -band [System.IO.FileAttributes]::Hidden) -ne [System.IO.FileAttributes]::Hidden) {
-                        [System.IO.File]::SetAttributes($candidateTemp, $attr -bor [System.IO.FileAttributes]::Hidden)
-                    }
-                } catch {}
-                $tempDir = $candidateTemp
-                break
-            } catch {}
-        }
-    }
-}
-
-# 2) Nenhum destino isolado com espaco. Tenta qualquer outro destino local disponivel.
-if ($null -eq $tempDir) {
+# 2) Nenhum destino isolado serviu: tenta qualquer outro destino local (inclusive o disco do banco)
+# Cada cliente tem um layout de discos. Nao se supoe nada: cada candidato so vale se
+# a pasta existir de fato e aceitar gravacao (Test-WritableDirectory).
+foreach ($isolado in @($true, $false)) {
+    if ($null -ne $tempDir) { break }
     foreach ($candDest in $resolvedDestList) {
-        if ($candDest.StartsWith("\")) { continue }
+        if ($candDest.StartsWith("\")) { continue } # NUNCA usar rede para temporario
         $candDrive = [System.IO.Path]::GetPathRoot($candDest)
-        if (Test-Path $candDrive) {
-            if ((Get-DriveFreeMB -Path $candDrive) -ge (Get-ProcessingRequiredMB -Path $candDrive -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5)) {
-                $candidateTemp = Join-Path $candDrive "FIBS_TEMP"
-                try {
-                    if (-not (Test-Path $candidateTemp)) { New-Item -ItemType Directory -Path $candidateTemp -Force | Out-Null }
-                    try {
-                        $attr = [System.IO.File]::GetAttributes($candidateTemp)
-                        if (($attr -band [System.IO.FileAttributes]::Hidden) -ne [System.IO.FileAttributes]::Hidden) {
-                            [System.IO.File]::SetAttributes($candidateTemp, $attr -bor [System.IO.FileAttributes]::Hidden)
-                        }
-                    } catch {}
-                    $tempDir = $candidateTemp
-                    break
-                } catch {}
-            }
+        if (-not (Test-Path $candDrive)) { continue }
+        if ($isolado -and $candDrive -eq $dbDrive) { continue }
+        if ((Get-DriveFreeMB -Path $candDrive) -lt (Get-ProcessingRequiredMB -Path $candDrive -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5)) { continue }
+        $candidateTemp = Join-Path $candDrive "FIBS_TEMP"
+        if (Test-WritableDirectory -Path $candidateTemp -Hide) {
+            $tempDir = $candidateTemp
+            break
         }
     }
 }
@@ -4092,10 +4094,7 @@ if ($null -eq $tempDir) {
 if ($null -eq $tempDir) {
     $fallbackTemp = Join-Path $scriptDir "temp_backup"
     if ((Get-DriveFreeMB -Path $fallbackTemp) -ge (Get-ProcessingRequiredMB -Path $fallbackTemp -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5)) {
-        try {
-            if (-not (Test-Path $fallbackTemp)) { New-Item -ItemType Directory -Path $fallbackTemp -Force | Out-Null }
-            $tempDir = $fallbackTemp
-        } catch {}
+        if (Test-WritableDirectory -Path $fallbackTemp) { $tempDir = $fallbackTemp }
     }
 }
 
