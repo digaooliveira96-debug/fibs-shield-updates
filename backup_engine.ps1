@@ -19,7 +19,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.36"
+$script:EngineVersion = "2.2.37"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -1038,6 +1038,10 @@ function Send-MailWithRetry {
     # IMPORTANTE: o resultado sai por $global:mailSent, NAO pelo valor de retorno
     # (padrao mantido por compatibilidade com os chamadores).
     $global:mailSent = $false
+    # webmail.mectelecom.com.br apresenta o certificado *.hostgator.com.br (nome nao
+    # confere). mail.mectelecom.com.br e o nome oficial do cPanel e tem certificado
+    # *.mectelecom.com.br valido na 587. Configs antigos seguem funcionando sem editar.
+    if ("$SmtpServer".Trim() -ieq "webmail.mectelecom.com.br") { $SmtpServer = "mail.mectelecom.com.br" }
 
     $smtpPassword = $null
     if (-not [string]::IsNullOrWhiteSpace($Pref.SmtpUser) -and -not [string]::IsNullOrWhiteSpace($Pref.SmtpPass)) {
@@ -1089,7 +1093,16 @@ function Send-MailWithRetry {
             } catch {
                 $inner = if ($_.Exception -and $_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
                 $semTls = ($useTls -and -not $UseSsl -and ("$($_.Exception.Message) $inner" -match 'secure connections|conex.es seguras|STARTTLS'))
-                if ($semTls) {
+                $certRecusado = (-not $allowInvalidCert -and ("$($_.Exception.Message) $inner" -match 'certificado remoto|remote certificate|RemoteCertificate'))
+                if ($certRecusado) {
+                    # Config antigo com SmtpAllowInvalidCertificate=false (o painel nao tem essa
+                    # opcao). O SMTP da MEC (HostGator) apresenta *.hostgator.com.br, que nao
+                    # confere com o nome configurado: sem isto o cliente ficava sem nenhum alerta.
+                    Log-Message "Aviso: o certificado do servidor SMTP $SmtpServer nao confere com o nome configurado (config antigo recusava). Enviando aceitando o certificado, como nos demais servidores."
+                    $allowInvalidCert = $true
+                    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+                    $try--
+                } elseif ($semTls) {
                     Log-Message "Aviso: o servidor SMTP $SmtpServer nao oferece TLS (STARTTLS). Enviando sem criptografia; recomenda-se um servidor com TLS."
                     $useTls = $false
                     $try--
@@ -2506,7 +2519,7 @@ function Get-OptimalSandboxDir {
     
     # A restauracao de teste tem ao mesmo tempo o FBK extraido e o FDB restaurado:
     # exige 2.5x o banco (minimo 4096 MB), mais a reserva de 5 GB do disco (no disco
-    # do banco, max(5 GB, 10%))
+    # do banco, 8 GB)
     # (antes 1.5x, e a auditoria das 03:30 podia zerar o disco do banco).
     $minRequiredMB = Get-RequiredFreeMB -DbSizeMB $DbSizeMB -Factor 2.5 -MinMB 4096
     $dbDrive = [System.IO.Path]::GetPathRoot($DbPath)
@@ -3522,15 +3535,18 @@ function Get-DriveFreeMB {
 # Reserva minima de 5 GB em QUALQUER disco (decisao do usuario): com menos que isso o
 # servidor do cliente ja comeca a travar. Antes era 512 MB fora do disco do banco.
 # ------------------------------------------------------------------------------
+# No disco do banco a reserva e fixa em 8 GB (decisao do usuario, 30/09/2026): os 10%
+# anteriores exigiam 24 GB livres num disco de 240 GB e barravam clientes com HD pequeno.
 $script:MinFreeDiskMB = 5120
+$script:MinFreeDbDiskMB = 8192
 function Get-DiskReserveMB {
     param([double]$TotalMB, [bool]$IsDbDrive)
-    if ($IsDbDrive) { return [math]::Round([Math]::Max($script:MinFreeDiskMB, $TotalMB * 0.10), 0) }
+    if ($IsDbDrive) { return $script:MinFreeDbDiskMB }
     return $script:MinFreeDiskMB
 }
 
 # Espaco para processar o banco num disco: Factor x banco (no minimo MinMB) mais a
-# reserva do disco (5 GB; no disco do banco, max(5 GB, 10%)).
+# reserva do disco (5 GB; no disco do banco, 8 GB).
 function Get-RequiredFreeMB {
     param([double]$DbSizeMB, [double]$Factor, [double]$MinMB = 0, [double]$DriveTotalMB = 0, [bool]$IsDbDrive = $false)
     $base = [Math]::Max($MinMB, $DbSizeMB * $Factor)
@@ -3647,7 +3663,7 @@ function Clear-StaleBackupTemp {
 }
 
 # Pasta do fail-safe (ultima linha). Prefere um disco diferente do banco e so grava
-# no disco do banco se, apos a copia, sobrar folga (>= 10% e >= 5 GB): encher o disco
+# no disco do banco se, apos a copia, sobrar a folga de 8 GB: encher o disco
 # do Firebird derrubaria o Sismotel. Em outro disco, sobra no minimo a reserva de 5 GB.
 function Select-FailSafeDirectory {
     param([string]$DbPath, [double]$GzSizeMB)
@@ -4164,8 +4180,8 @@ $tempDir = $null
 $dbDrive = [System.IO.Path]::GetPathRoot($dbPath)
 
 # Exige espaco para o FBK + GZ (1.5x o banco) mais a reserva do disco
-# (Get-ProcessingRequiredMB): 5 GB, ou max(5 GB, 10%) no disco do banco.
-$minRequiredMB = [math]::Round($dbSizeMB * 1.5 + $script:MinFreeDiskMB, 2)
+# (Get-ProcessingRequiredMB): 5 GB, ou 8 GB no disco do banco.
+$pastasRecusadas = @()
 
 # 1) Procura um destino local em particao diferente do banco para isolamento fisico de gravacao
 # 2) Nenhum destino isolado serviu: tenta qualquer outro destino local (inclusive o disco do banco)
@@ -4180,10 +4196,12 @@ foreach ($isolado in @($true, $false)) {
         if ($isolado -and $candDrive -eq $dbDrive) { continue }
         if ((Get-DriveFreeMB -Path $candDrive) -lt (Get-ProcessingRequiredMB -Path $candDrive -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5)) { continue }
         $candidateTemp = Join-Path $candDrive "FIBS_TEMP"
+        if ($pastasRecusadas -contains $candidateTemp) { continue }
         if (Test-WritableDirectory -Path $candidateTemp -Hide) {
             $tempDir = $candidateTemp
             break
         }
+        $pastasRecusadas += $candidateTemp
     }
 }
 
@@ -4196,8 +4214,20 @@ if ($null -eq $tempDir) {
 }
 
 if ($null -eq $tempDir) {
-    # Nenhuma unidade possui espaco suficiente!
-    $errMsg = "ALERTA PREVENTIVO DE SEGURANCA: Nenhuma unidade possui os $minRequiredMB MB livres necessarios (1.5x o banco + reserva minima de $($script:MinFreeDiskMB) MB livres; no disco do banco a reserva e max(5 GB, 10%)). Para proteger o banco Firebird e o sistema contra corrupcao por falta de espaco em disco, a rotina foi interrompida preventivamente com 100% de seguranca."
+    # Nenhuma unidade serviu: diz disco por disco quanto tem e quanto precisaria
+    $discos = @()
+    $vistos = @()
+    foreach ($p in (@($resolvedDestList | Where-Object { -not $_.StartsWith("\\") }) + @($scriptDir))) {
+        $r = [System.IO.Path]::GetPathRoot($p)
+        if ([string]::IsNullOrWhiteSpace($r) -or ($vistos -contains $r) -or -not (Test-Path $r)) { continue }
+        $vistos += $r
+        $livreGB = [math]::Round((Get-DriveFreeMB -Path $r) / 1024, 1)
+        $precisaGB = [math]::Round((Get-ProcessingRequiredMB -Path $r -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5) / 1024, 1)
+        $tipo = if ($r -eq $dbDrive) { " (disco do banco)" } else { "" }
+        $discos += "$r$tipo tem $livreGB GB livres e precisa de $precisaGB GB"
+    }
+    $recusaTxt = if ($pastasRecusadas.Count -gt 0) { " Pastas que nao aceitaram gravacao: $($pastasRecusadas -join ', ')." } else { "" }
+    $errMsg = "ALERTA PREVENTIVO DE SEGURANCA: Espaco em disco insuficiente para gerar o backup com seguranca. $($discos -join '; ').$recusaTxt Regra: 1.5x o banco ($([math]::Round($dbSizeMB * 1.5 / 1024, 1)) GB) + reserva de 5 GB (8 GB no disco do banco). A rotina foi interrompida para proteger o banco Firebird."
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo "Espaco em Disco Critico ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
     Exit-BackupLock

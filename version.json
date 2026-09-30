@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.36",
-    "releaseDate":  "2026-09-29",
+    "version":  "2.2.37",
+    "releaseDate":  "2026-09-30",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
     "changelog":  "1. Instalador volta a trazer nome do motel, AnyDesk e TeamViewer: deteccao no PowerShell 64 bits, registro lido nas vistas 64/32 bits e AnyDesk procurado em todas as variantes (service.conf, AnyDesk personalizado, perfis) e via AnyDesk.exe --get-id.\\n2. Valores ja salvos no config anterior sao mantidos quando a deteccao nao encontra nada.\\n3. Botao Detectar do painel usa a mesma busca do AnyDesk.",
-    "setupSha256":  "3F86CBC626908090524AB51A6C017F0A8B5C4FDE31FDD95A7DBDB313B34306F2",
-    "engineSha256":  "7A858FA9C9BDEDE0D042D184C38E1FECCCC9125F069E102D5B615B4D2FAACF05",
-    "signature":  "IFiOA22peua9mHW+8CO+vppk5UCCDBpkxUaKBBZbSHGIKBadTPb+/Lw37aYS+y6AyxLopwGZmBIf1CQemABN4brAlAc1TynZ0QFi0JNKCZPr1NVH1IPMhuItgrniuyF0EFrcya2C9NvtNq0uYL98xoWA2ECmhmDNk0qvipNJ/NdmmRP12V3FyCLbdlrS8q6LnK4tQb8U7fHPNoXLNBzqSb20cYrOZf02qj6SVJlQ9DFi2Z6AvoXM5O6CG14qE3NK65e0X1lsuz/bxFvTnZuOJueyclSGL548GZodJM4ox8xyd5SDxoYT/PxZVn6kxdF9pjPxl0tqLi5GitcUICflYwGC4FxYv6+bf2C+1uiehukR29SuV7oPE2Ny/VE/SqubwFcDcinFEVw5h4FoeqPyvISqMdBZi3YMhr+5yACjiOG7vvWGSjLDlBDVoUi7JMYhHZ3oK15hzipPlzweCLQ4i58lpvaFAOjAAuffojBUuP4KKH3a7ccMvPDLlWxWkNCj"
+    "setupSha256":  "6C4129D5B1D2C262B55029ECD0B050E1EB5A08191AAB44FA9A8BDA2E280B8460",
+    "engineSha256":  "0D6181C6567D8A80732F312CDAAF3118A2E1664347FDB571503E98E6331FD50D",
+    "signature":  "ePBqD11WS7gvBqvxjwhV2Us+yD5Z1che+kAbB6bswci2ozl645gn5U3OhXwETUt5jbXMq3aXrb/yVcnsATLkkdoSBs2xtQt8OOWUaB5/XyscEXzfU+/kzqbQnVmy5OTLr2pp3q6qa2ICbFKsmpPXRtzsoHMNv+JcuxV8vCnZLnSw30gxLu1gymyTrEtoXjRiOZOUzd3ED+0QPGaCk+HM9z+tJiGVGyGDSi4VT+U8Fjai7IV2ExVdeIGqfAfHHvBqZ+0yiFV+OKokjvR9uqncazF+S8vFZTDUOQ9ObzSLKpmpQHszJrxNDnJ0KASGt0r8wk35CPU6yong+T1j+DwxjIZPjKFh7LOYmZimtV5Wi9pFBOgIvlx97+Bnz3Kal6rJuvMAYx2YXouF1rKy9AdLqXRDKb6oPyeEa8/vJrEzpwFzWb11mALeF2kGQDRlFfYPv9UEN+E/PzsEVkqejsyY9H1fPrnBSjbIiJsW3ujVM66h7CmosDOBnKA021DaQJJm"
 }
