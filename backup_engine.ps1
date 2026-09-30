@@ -19,7 +19,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.35"
+$script:EngineVersion = "2.2.36"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -225,6 +225,78 @@ function ConvertTo-HtmlSafe {
     param([string]$Text)
     if ($null -eq $Text) { return "" }
     return [System.Net.WebUtility]::HtmlEncode($Text)
+}
+
+# Traduz o erro tecnico para o e-mail: o que aconteceu, a causa provavel e o passo a
+# passo especifico. O texto original continua no e-mail como detalhe tecnico.
+# Textos em HTML com entidades (o motor e so ASCII). A ordem importa: vale a primeira
+# regra que casar. Sem regra conhecida devolve $null e o e-mail usa o checklist geral.
+function Get-FailureDiagnosis {
+    param([string]$Text, [string]$SubjectInfo = "")
+    $t = "$SubjectInfo`n$Text"
+    $regras = @(
+        @{ Codigo = "POWERSHELL_ANTIGO"
+           Padrao = "InputStream|localizar um par.metro que coincida|parameter cannot be found that matches"
+           Titulo = "Motor desatualizado para o PowerShell deste servidor"
+           Causa  = "O servidor tem um PowerShell antigo (ex.: Windows Server 2012) e esta vers&atilde;o do motor usou um recurso que ele n&atilde;o possui. O backup n&atilde;o foi gravado."
+           Passos = @("Conferir a vers&atilde;o no rodap&eacute; deste e-mail e comparar com a &uacute;ltima publicada.", "Aguardar a atualiza&ccedil;&atilde;o autom&aacute;tica ou reinstalar com o Setup mais recente.", "Rodar a tarefa manualmente pelo painel e conferir se volta a gravar.") }
+        @{ Codigo = "BANCO_CORROMPIDO"
+           Padrao = "database file appears corrupt|wrong page type|checksum error|consistency check|is of wrong type|record .* is corrupt"
+           Titulo = "O banco de dados do Sismotel tem p&aacute;ginas danificadas"
+           Causa  = "O Firebird encontrou dados corrompidos dentro do banco ao ler para o backup. Isso costuma vir de queda de energia ou de disco com defeito."
+           Passos = @("<b>N&atilde;o</b> reiniciar nem mexer no banco antes de avaliar.", "Guardar o &uacute;ltimo backup bom (o mais recente sem alerta).", "Acionar o suporte Microtecs para reparo com <code>gfix -v -full</code>.", "Verificar a sa&uacute;de do disco do banco (CrystalDiskInfo).") }
+        @{ Codigo = "SENHA_BANCO"
+           Padrao = "user name and password are not defined|Senha do Banco Ilegivel|DbPassword"
+           Titulo = "Senha do banco (SYSDBA) recusada"
+           Causa  = "O Firebird n&atilde;o aceitou o usu&aacute;rio e a senha da tarefa, ou a senha foi salva em outro computador."
+           Passos = @("Abrir o painel MEC Shield, editar a tarefa e redigitar a senha do banco.", "Salvar e rodar a tarefa manualmente para confirmar.") }
+        @{ Codigo = "FIREBIRD_PARADO"
+           Padrao = "Unable to complete network request|Failed to establish a connection|connection refused|conex.o recusada|10061|unavailable database"
+           Titulo = "O servi&ccedil;o do Firebird n&atilde;o respondeu"
+           Causa  = "O gbak n&atilde;o conseguiu se conectar ao Firebird. O servi&ccedil;o est&aacute; parado ou travado."
+           Passos = @("Abrir <code>services.msc</code> e iniciar o <code>Firebird Server</code> (e o <code>Firebird Guardian</code>, se existir).", "Confirmar que o Sismotel abre normalmente na recep&ccedil;&atilde;o.", "Rodar a tarefa manualmente pelo painel.") }
+        @{ Codigo = "DISCO_TEMPORARIO"
+           Padrao = "corrompido e ileg|corrupted and unreadable|cannot open status and error output file|nao aceita gravacao|nao aceite gravacao|e que aceite gravacao"
+           Titulo = "Um disco do servidor recusou a grava&ccedil;&atilde;o"
+           Causa  = "A pasta de trabalho do backup n&atilde;o p&ocirc;de ser criada ou gravada. Normalmente &eacute; o sistema de arquivos (NTFS) do disco com erro depois de queda de energia. O disco f&iacute;sico pode estar bom."
+           Passos = @("No PowerShell como Administrador: <code>Get-Volume | select DriveLetter,HealthStatus</code>. O disco com problema aparece diferente de <code>Healthy</code>.", "Fora do hor&aacute;rio de pico, rodar <code>chkdsk X: /f</code> no disco indicado (X = letra do disco).", "Conferir a sa&uacute;de f&iacute;sica com o CrystalDiskInfo.", "Rodar a tarefa manualmente pelo painel.") }
+        @{ Codigo = "ARQUIVO_EM_USO"
+           Padrao = "lock time-out|being used by another process|sendo usado por outro processo"
+           Titulo = "Arquivo preso por outro programa"
+           Causa  = "Outro programa (antiv&iacute;rus, outro backup ou c&oacute;pia manual) estava usando o arquivo no momento."
+           Passos = @("Verificar se h&aacute; outro software de backup ou c&oacute;pia rodando no mesmo hor&aacute;rio.", "Colocar a pasta do MEC Shield e a pasta de backup nas exce&ccedil;&otilde;es do antiv&iacute;rus.", "Rodar a tarefa manualmente pelo painel.") }
+        @{ Codigo = "SEM_ESPACO"
+           Padrao = "Espaco em Disco|MB livres necessarios|not enough space|espa.o insuficiente|disk is full|Nenhum disco com espaco"
+           Titulo = "Falta espa&ccedil;o em disco"
+           Causa  = "Nenhum disco tem o espa&ccedil;o necess&aacute;rio para gerar o backup mantendo a reserva de seguran&ccedil;a do Firebird."
+           Passos = @("Ver os discos no Explorer (Este Computador).", "Apagar arquivos grandes que n&atilde;o sejam backup (downloads, instaladores antigos).", "Se o banco cresceu muito, avaliar um disco maior.") }
+        @{ Codigo = "GBAK_TEMPO"
+           Padrao = "excedeu o limite de 2 horas"
+           Titulo = "O backup demorou demais e foi interrompido"
+           Causa  = "O gbak passou de 2 horas. O servidor pode estar sobrecarregado ou o disco muito lento."
+           Passos = @("Ver no Gerenciador de Tarefas se algo est&aacute; usando 100% do disco ou da CPU.", "Verificar a sa&uacute;de dos discos (CrystalDiskInfo).", "Rodar a tarefa manualmente fora do hor&aacute;rio de pico.") }
+        @{ Codigo = "GBAK_AUSENTE"
+           Padrao = "gbak\.exe nao encontrado"
+           Titulo = "O Firebird n&atilde;o foi encontrado neste servidor"
+           Causa  = "O programa gbak.exe (parte do Firebird) n&atilde;o est&aacute; no caminho configurado nem nas pastas padr&atilde;o."
+           Passos = @("Confirmar a pasta do Firebird (ex.: <code>C:\Program Files\Firebird\Firebird_2_5\bin</code>).", "Corrigir o caminho do gbak nas prefer&ecirc;ncias do painel.") }
+        @{ Codigo = "BANCO_AUSENTE"
+           Padrao = "Banco de dados inacessivel|Banco Inacessivel"
+           Titulo = "O arquivo do banco n&atilde;o foi encontrado"
+           Causa  = "O banco n&atilde;o est&aacute; no caminho configurado na tarefa (foi movido, renomeado ou o disco sumiu)."
+           Passos = @("Localizar o arquivo <code>.FDB</code> usado pelo Sismotel.", "Corrigir o caminho do banco na tarefa pelo painel.") }
+        @{ Codigo = "COPIA_LOCAL"
+           Padrao = "nao confere com a origem|corrupcao silenciosa|Falha ao Gravar nos Discos Locais|Nao foi possivel gravar nos discos locais"
+           Titulo = "A c&oacute;pia no disco de destino falhou ou chegou alterada"
+           Causa  = "O backup foi gerado, mas a grava&ccedil;&atilde;o no disco de destino falhou ou n&atilde;o bateu com o original: disco cheio, sem permiss&atilde;o ou com erro no sistema de arquivos."
+           Passos = @("Ver o espa&ccedil;o livre do disco de destino.", "No PowerShell como Administrador: <code>Get-Volume | select DriveLetter,HealthStatus</code>.", "Se o disco n&atilde;o estiver <code>Healthy</code>, rodar <code>chkdsk X: /f</code> fora do hor&aacute;rio de pico.") }
+    )
+    foreach ($r in $regras) {
+        if ($t -match $r.Padrao) {
+            return [PSCustomObject]@{ Codigo = $r.Codigo; Titulo = $r.Titulo; Causa = $r.Causa; Passos = $r.Passos }
+        }
+    }
+    return $null
 }
 
 # Converte para forma criptografada, no proprio cliente, qualquer senha que ainda
@@ -1244,6 +1316,7 @@ function Send-BackupNotification {
 
         # Tudo que vem de mensagens de erro, caminhos e config entra no HTML escapado.
         $clientNameHtml = ConvertTo-HtmlSafe $clientName
+        $diag = if ($Status -eq "FALHA" -or $Status -eq "AVISO") { Get-FailureDiagnosis -Text $BodyDetails -SubjectInfo $SubjectInfo } else { $null }
         $BodyDetails = ConvertTo-HtmlSafe $BodyDetails
         $DbPath = ConvertTo-HtmlSafe $DbPath
         $SuccessDests = @($SuccessDests | ForEach-Object { ConvertTo-HtmlSafe $_ })
@@ -1306,6 +1379,15 @@ function Send-BackupNotification {
               <strong>4. Banco de Dados Local:</strong> Nenhuma a&ccedil;&atilde;o necess&aacute;ria no banco Firebird (o banco est&aacute; 100% &iacute;ntegro e seguro no servidor).
             </div>
 "@
+        } elseif ($null -ne $diag) {
+            $passosHtml = "<div style='margin-bottom:8px;'><strong>1.</strong> Conectar no servidor via AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).</div>"
+            $n = 2
+            foreach ($passo in $diag.Passos) {
+                $passosHtml += "<div style='margin-bottom:8px;'><strong>$n.</strong> $passo</div>"
+                $n++
+            }
+            $passosHtml += "<div style='font-size:12px; color:#94a3b8;'>Log completo da rotina: <code>C:\Microtecs\FIBS\logs\</code></div>"
+            $passosHtml
         } else {
             @"
             <div style='margin-bottom:8px;'>
@@ -1467,7 +1549,14 @@ function Send-BackupNotification {
             <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
               <div style='background-color:#450a0a; border:1px solid #7f1d1d; border-left:4px solid #ef4444; border-radius:8px; padding:16px; font-size:13.5px; color:#fca5a5; line-height:1.6;'>
                 <strong style='color:#f87171; font-size:14.5px;'>DIAGN&Oacute;STICO DA FALHA:</strong><br/>
-                <div style='margin-top:8px; font-family:Consolas,monospace; white-space:pre-wrap; word-break:break-all; font-size:13px;'>$BodyDetails</div>
+                $(if ($null -ne $diag) {
+                "<div style='margin-top:8px; font-size:16px; font-weight:800; color:#fecaca;'>$($diag.Titulo)</div>
+                <div style='margin-top:6px; font-size:14px; color:#fde2e2;'><strong>Causa prov&aacute;vel:</strong> $($diag.Causa)</div>
+                <div style='margin-top:12px; font-size:11.5px; color:#fca5a5; text-transform:uppercase; letter-spacing:0.5px;'>Detalhe t&eacute;cnico (para o suporte):</div>
+                <div style='margin-top:4px; font-family:Consolas,monospace; white-space:pre-wrap; word-break:break-all; font-size:12px; opacity:0.85;'>$BodyDetails</div>"
+                } else {
+                "<div style='margin-top:8px; font-family:Consolas,monospace; white-space:pre-wrap; word-break:break-all; font-size:13px;'>$BodyDetails</div>"
+                })
               </div>
             </td>
           </tr>
@@ -2441,11 +2530,15 @@ function Get-OptimalSandboxDir {
             foreach ($c in $candidates) {
                 if ([System.IO.Path]::GetPathRoot($c) -eq $d.Name) {
                     $sandboxPath = Join-Path $c "_temp_audit"
-                    return [PSCustomObject]@{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" }
+                    if (Test-WritableDirectory -Path $sandboxPath) {
+                        return [PSCustomObject]@{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" }
+                    }
                 }
             }
             $sandboxPath = Join-Path $d.Name "BKP_SISMOTEL\_temp_audit"
-            return [PSCustomObject]@{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" }
+            if (Test-WritableDirectory -Path $sandboxPath) {
+                return [PSCustomObject]@{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" }
+            }
         }
     }
     
@@ -2456,7 +2549,9 @@ function Get-OptimalSandboxDir {
         $reqDbDrive = Get-RequiredFreeMB -DbSizeMB $DbSizeMB -Factor 2.5 -MinMB 4096 -DriveTotalMB ($sameDrive.TotalSize / 1MB) -IsDbDrive $true
         if ($freeMB -ge $reqDbDrive) {
             $sandboxPath = Join-Path $scriptDir "_temp_audit"
-            return [PSCustomObject]@{ Path = $sandboxPath; Drive = $sameDrive.Name; FreeMB = $freeMB; RequiredMB = $reqDbDrive; Status = "OK" }
+            if (Test-WritableDirectory -Path $sandboxPath) {
+                return [PSCustomObject]@{ Path = $sandboxPath; Drive = $sameDrive.Name; FreeMB = $freeMB; RequiredMB = $reqDbDrive; Status = "OK" }
+            }
         }
     }
     
@@ -2465,7 +2560,9 @@ function Get-OptimalSandboxDir {
         $freeMB = [math]::Round($d.AvailableFreeSpace / 1MB, 0)
         if ($freeMB -ge $minRequiredMB) {
             $sandboxPath = Join-Path $d.Name "BKP_SISMOTEL\_temp_audit"
-            return [PSCustomObject]@{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" }
+            if (Test-WritableDirectory -Path $sandboxPath) {
+                return [PSCustomObject]@{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" }
+            }
         }
     }
     
@@ -2969,7 +3066,7 @@ function Invoke-DatabaseHealthAudit {
         catch { $dbSizeMB = [math]::Round(($latestGz.Length / 1MB) * 1.3, 2) }
         $sandboxInfo = Get-OptimalSandboxDir -DbPath $liveDb -DbSizeMB $dbSizeMB -ConfiguredDestinations $task.Destinations
         if ($sandboxInfo.Status -eq "INSUFFICIENT_SPACE") {
-            throw [System.InvalidOperationException]::new("Espaco em disco insuficiente para a sandbox (minimo $($sandboxInfo.RequiredMB) MB). O teste de restauracao nao foi feito.")
+            throw [System.InvalidOperationException]::new("Nenhum disco com espaco suficiente (minimo $($sandboxInfo.RequiredMB) MB) e que aceite gravacao para a sandbox. O teste de restauracao nao foi feito.")
         }
         $sandboxDir = $sandboxInfo.Path
         Log-Message "[AUDITORIA] 3/4 - Ambiente Sandbox Isolado: $($sandboxInfo.Drive) | Caminho: $sandboxDir | Espaco Livre: $($sandboxInfo.FreeMB) MB"
