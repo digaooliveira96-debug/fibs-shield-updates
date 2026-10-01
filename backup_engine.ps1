@@ -794,6 +794,87 @@ function Get-Sha256OfFile {
     } catch { return $null }
 }
 
+# Detecta o formato real do arquivo .GZ pelos magic bytes:
+#   50 4B 03 04 = ZIP  (formato padrao do FIBS via ZipFile::Open)
+#   1F 8B       = GZIP nativo (gerado por ferramentas externas: 7-Zip, gzip.exe, etc.)
+#   52 61 72 21 1A 07 00    = RAR4 (WinRAR)
+#   52 61 72 21 1A 07 01 00 = RAR5 (WinRAR)
+# Retorna: "ZIP", "GZIP", "RAR4", "RAR5" ou "UNKNOWN"
+function Get-GzFileFormat {
+    param([string]$Path)
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path) | Select-Object -First 8
+        if ($bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B) { return "ZIP" }
+        if ($bytes[0] -eq 0x1F -and $bytes[1] -eq 0x8B) { return "GZIP" }
+        if ($bytes[0] -eq 0x52 -and $bytes[1] -eq 0x61 -and $bytes[2] -eq 0x72 -and $bytes[3] -eq 0x21 -and $bytes[4] -eq 0x1A -and $bytes[5] -eq 0x07) {
+            if ($bytes[6] -eq 0x01) { return "RAR5" }
+            return "RAR4"
+        }
+    } catch {}
+    return "UNKNOWN"
+}
+
+# Localiza o executavel do WinRAR (rar.exe preferido; unrar.exe como fallback)
+function Find-WinRarExe {
+    $candidates = @(
+        "C:\Program Files\WinRAR\rar.exe",
+        "C:\Program Files\WinRAR\unrar.exe",
+        "C:\Program Files (x86)\WinRAR\rar.exe",
+        "C:\Program Files (x86)\WinRAR\unrar.exe"
+    )
+    foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
+    # Tenta via PATH do sistema (PS 5.1 compativel - sem operador ?.)
+    try {
+        $cmd = Get-Command "rar.exe" -ErrorAction SilentlyContinue
+        if ($null -ne $cmd -and (Test-Path $cmd.Source)) { return $cmd.Source }
+        $cmd = Get-Command "unrar.exe" -ErrorAction SilentlyContinue
+        if ($null -ne $cmd -and (Test-Path $cmd.Source)) { return $cmd.Source }
+    } catch {}
+    return $null
+}
+
+# Extrai o primeiro arquivo .fbk de dentro de um RAR para $DestDir.
+# Retorna o caminho completo do .fbk extraido, ou lanca excecao se falhar.
+# Usa ProcessStartInfo (sem console) para ser compativel com execucao como servico Windows.
+function Expand-RarArchive {
+    param(
+        [string]$RarPath,
+        [string]$DestDir
+    )
+    $rarExe = Find-WinRarExe
+    if ([string]::IsNullOrWhiteSpace($rarExe)) {
+        throw "WinRAR nao encontrado no sistema. Instale o WinRAR para que arquivos RAR possam ser extraidos pela auditoria FIBS."
+    }
+    # 'e' = extrai sem estrutura de pastas, -y = sim para tudo, filtra apenas *.fbk
+    $args = "e -y `"$RarPath`" *.fbk `"$DestDir\`""
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $rarExe
+    $psi.Arguments = $args
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow  = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    $errTask = $p.StandardError.ReadToEndAsync()
+    $finished = $p.WaitForExit(120000) # 2 minutos max para extrair
+    if (-not $finished) { try { $p.Kill() } catch {}; $p.WaitForExit() }
+    $exitCode = $p.ExitCode
+    $p.Dispose()
+    if (-not $finished) {
+        throw "WinRAR excedeu 2 minutos ao extrair '$RarPath'. Operacao cancelada."
+    }
+    if ($exitCode -ne 0) {
+        $errOut = try { $errTask.Result } catch { "" }
+        throw "WinRAR retornou codigo $exitCode ao extrair '$RarPath'. $errOut".Trim()
+    }
+    $extracted = Get-ChildItem -Path $DestDir -Filter "*.fbk" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $extracted) {
+        throw "Nenhum arquivo .fbk encontrado dentro de '$RarPath' apos extracao pelo WinRAR."
+    }
+    return $extracted.FullName
+}
+
 function Test-BackupGzIntegrity {
     param(
         [string]$GzPath,
@@ -802,32 +883,67 @@ function Test-BackupGzIntegrity {
         [string]$ExpectedSha256
     )
     $zip = $null
+    $rarTempDir = $null
     try {
         try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue } catch {}
+        try { Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue } catch {}
 
-        # Truncamento / GZ invalido estoura logo aqui (fim do diretorio central ausente)
-        $zip = [System.IO.Compression.ZipFile]::OpenRead($GzPath)
+        $fmt = Get-GzFileFormat -Path $GzPath
 
-        $entry = $zip.Entries | Where-Object { $_.Name -eq $ExpectedEntryName } | Select-Object -First 1
-        if ($null -eq $entry) {
-            return @{ Ok = $false; Reason = "A entrada '$ExpectedEntryName' nao existe dentro do GZ." }
+        if ($fmt -eq "ZIP") {
+            # Formato padrao do FIBS: ZIP com extensao .GZ
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($GzPath)
+            $entry = $zip.Entries | Where-Object { $_.Name -eq $ExpectedEntryName } | Select-Object -First 1
+            if ($null -eq $entry) {
+                return @{ Ok = $false; Reason = "A entrada '$ExpectedEntryName' nao existe dentro do GZ (ZIP)." }
+            }
+            if ($entry.Length -ne $ExpectedSize) {
+                return @{ Ok = $false; Reason = "Tamanho descompactado divergente: GZ diz $($entry.Length) bytes, o .fbk tinha $ExpectedSize bytes." }
+            }
+            $stream = $entry.Open()
+            try { $hash = Get-Sha256OfStream -Stream $stream }
+            finally { $stream.Close() }
+            if ($hash -ne $ExpectedSha256) {
+                return @{ Ok = $false; Reason = "SHA-256 do conteudo descompactado nao confere com o .fbk original (corrupcao silenciosa)." }
+            }
+            return @{ Ok = $true; Reason = "Conteudo conferido por SHA-256 (formato ZIP)." }
+
+        } elseif ($fmt -eq "GZIP") {
+            # Formato GZIP nativo (gerado por ferramenta externa ao FIBS)
+            $fsIn  = [System.IO.File]::OpenRead($GzPath)
+            $gzip  = New-Object System.IO.Compression.GZipStream($fsIn, [System.IO.Compression.CompressionMode]::Decompress)
+            try { $hash = Get-Sha256OfStream -Stream $gzip }
+            finally { $gzip.Close(); $fsIn.Close() }
+            if ($hash -ne $ExpectedSha256) {
+                return @{ Ok = $false; Reason = "SHA-256 do conteudo descompactado nao confere com o .fbk original (GZIP nativo, corrupcao silenciosa)." }
+            }
+            return @{ Ok = $true; Reason = "Conteudo conferido por SHA-256 (formato GZIP nativo)." }
+
+        } elseif ($fmt -eq "RAR4" -or $fmt -eq "RAR5") {
+            # Formato RAR (WinRAR) - extrai para temp, confere SHA-256, remove
+            $rarTempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("fibs_rar_verif_" + [System.IO.Path]::GetRandomFileName())
+            New-Item -ItemType Directory -Path $rarTempDir -Force | Out-Null
+            $fbkPath = Expand-RarArchive -RarPath $GzPath -DestDir $rarTempDir
+            $extractedSize = (Get-Item $fbkPath).Length
+            if ($extractedSize -ne $ExpectedSize) {
+                return @{ Ok = $false; Reason = "Tamanho descompactado divergente: RAR extraiu $extractedSize bytes, o .fbk tinha $ExpectedSize bytes." }
+            }
+            $hash = Get-Sha256OfFile -Path $fbkPath
+            if ($hash -ne $ExpectedSha256) {
+                return @{ Ok = $false; Reason = "SHA-256 do conteudo extraido nao confere com o .fbk original ($fmt, corrupcao silenciosa)." }
+            }
+            return @{ Ok = $true; Reason = "Conteudo conferido por SHA-256 (formato $fmt via WinRAR)." }
+
+        } else {
+            return @{ Ok = $false; Reason = "Formato do arquivo nao reconhecido (nem ZIP, GZIP nem RAR). Magic bytes invalidos." }
         }
-        if ($entry.Length -ne $ExpectedSize) {
-            return @{ Ok = $false; Reason = "Tamanho descompactado divergente: GZ diz $($entry.Length) bytes, o .fbk tinha $ExpectedSize bytes." }
-        }
-
-        $stream = $entry.Open()
-        try { $hash = Get-Sha256OfStream -Stream $stream }
-        finally { $stream.Close() }
-
-        if ($hash -ne $ExpectedSha256) {
-            return @{ Ok = $false; Reason = "SHA-256 do conteudo descompactado nao confere com o .fbk original (corrupcao silenciosa)." }
-        }
-        return @{ Ok = $true; Reason = "Conteudo conferido por SHA-256." }
     } catch {
         return @{ Ok = $false; Reason = "Nao foi possivel abrir/ler o GZ: $_" }
     } finally {
         if ($null -ne $zip) { try { $zip.Dispose() } catch {} }
+        if (-not [string]::IsNullOrWhiteSpace($rarTempDir) -and (Test-Path $rarTempDir)) {
+            Remove-Item $rarTempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -2588,7 +2704,7 @@ function Get-OptimalSandboxDir {
 # era gravada reescrevendo o config.json inteiro, concorrendo com a interface.
 function Get-AuditState {
     $f = Join-Path $scriptDir "audit_state.json"
-    $st = [PSCustomObject]@{ LastAuditDate = ""; LastResult = ""; ConsecutiveInconclusive = 0; LastInconclusiveAlert = $null }
+    $st = [PSCustomObject]@{ LastAuditDate = ""; LastResult = ""; ConsecutiveInconclusive = 0; LastInconclusiveAlert = $null; ConsecutiveNotRestorable = 0; LastNotRestorableAlert = $null }
     try {
         if (Test-Path $f) {
             $raw = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -2601,6 +2717,7 @@ function Get-AuditState {
         }
     } catch {}
     if ($null -eq $st.ConsecutiveInconclusive) { $st.ConsecutiveInconclusive = 0 }
+    if ($null -eq $st.ConsecutiveNotRestorable) { $st.ConsecutiveNotRestorable = 0 }
     return $st
 }
 
@@ -2626,8 +2743,19 @@ function Send-AuditAlertNotification {
         [long]$NextTransaction,
         [string]$AuditLogSnippet,
         [string]$Headline = "ANOMALIA DETECTADA NO FIREBIRD",
-        [string]$Diagnosis = ""
+        [string]$Diagnosis = "",
+        # Cooldown interno: se LastAlertTimestamp estiver dentro de CooldownHours,
+        # a funcao bloqueia o envio ela mesma, sem depender do chamador.
+        # Deixe CooldownHours = 0 (padrao) para disparo imediato sem cooldown.
+        [double]$CooldownHours = 0,
+        [string]$LastAlertTimestamp = $null
     )
+    # Guarda de cooldown: protege contra chamadas duplicadas (ex: -ForceAudit multiplo)
+    if ($CooldownHours -gt 0 -and (Test-WithinCooldown -Timestamp $LastAlertTimestamp -Hours $CooldownHours)) {
+        $h = [Math]::Round(((Get-Date) - [DateTime]::Parse("$LastAlertTimestamp")).TotalHours, 1)
+        Log-Message "[AUDITORIA ZERO SPAM] Alerta '$Headline' suprimido: cooldown de ${CooldownHours}h ativo (ultimo envio ha ${h}h)."
+        return
+    }
     $headlineHtml = ConvertTo-HtmlSafe $Headline
     $diagnosisHtml = ConvertTo-HtmlSafe $Diagnosis
     $AuditLogSnippet = ConvertTo-HtmlSafe $AuditLogSnippet
@@ -3091,15 +3219,38 @@ function Invoke-DatabaseHealthAudit {
         }
         $sandboxDbPath = Join-Path $sandboxDir "audit_sandbox_$(Get-Date -Format 'yyyyMMdd_HHmmss').fdb"
 
-        # Extrai o FBK
+        # Extrai o FBK - suporta ZIP (formato padrao FIBS) e GZIP nativo (ferramentas externas)
         Log-Message "[AUDITORIA] Extraindo .FBK do backup para o sandbox..."
         try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue } catch {}
+        try { Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue } catch {}
         try {
-            $zip = [System.IO.Compression.ZipFile]::OpenRead($latestGz.FullName)
-            $fbkEntry = $zip.Entries | Where-Object { $_.Name.EndsWith(".fbk", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
-            if ($null -eq $fbkEntry) { throw "o arquivo .FBK nao existe dentro de $($latestGz.Name)" }
-            $extractedFbkPath = Join-Path $sandboxDir $fbkEntry.Name
-            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($fbkEntry, $extractedFbkPath, $true)
+            $gzFmt = Get-GzFileFormat -Path $latestGz.FullName
+            Log-Message "[AUDITORIA] Formato detectado: $gzFmt ($($latestGz.Name))"
+
+            if ($gzFmt -eq "ZIP") {
+                $zip = [System.IO.Compression.ZipFile]::OpenRead($latestGz.FullName)
+                $fbkEntry = $zip.Entries | Where-Object { $_.Name.EndsWith(".fbk", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+                if ($null -eq $fbkEntry) { throw "o arquivo .FBK nao existe dentro de $($latestGz.Name)" }
+                $extractedFbkPath = Join-Path $sandboxDir $fbkEntry.Name
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($fbkEntry, $extractedFbkPath, $true)
+
+            } elseif ($gzFmt -eq "GZIP") {
+                # GZIP nativo: o nome do arquivo interno nao e acessivel sem descomprimir; usa o nome do .GZ trocando a extensao
+                $fbkName = [System.IO.Path]::GetFileNameWithoutExtension($latestGz.Name) + ".fbk"
+                $extractedFbkPath = Join-Path $sandboxDir $fbkName
+                $fsIn  = [System.IO.File]::OpenRead($latestGz.FullName)
+                $gzip  = New-Object System.IO.Compression.GZipStream($fsIn, [System.IO.Compression.CompressionMode]::Decompress)
+                $fsOut = [System.IO.File]::Create($extractedFbkPath)
+                try { $gzip.CopyTo($fsOut) }
+                finally { $fsOut.Close(); $gzip.Close(); $fsIn.Close() }
+
+            } elseif ($gzFmt -eq "RAR4" -or $gzFmt -eq "RAR5") {
+                # Formato RAR (WinRAR) - extrai diretamente para o sandboxDir
+                $extractedFbkPath = Expand-RarArchive -RarPath $latestGz.FullName -DestDir $sandboxDir
+
+            } else {
+                throw "Formato do arquivo nao reconhecido (nem ZIP, GZIP nem RAR): $($latestGz.Name)"
+            }
         } catch {
             # Arquivo de backup que nem abre e, por definicao, um backup inutilizavel
             $verdict = "NAO_RESTAURAVEL"
@@ -3172,20 +3323,35 @@ function Invoke-DatabaseHealthAudit {
     $headline = $null
     if ($verdict -eq "OK") {
         $auditState.ConsecutiveInconclusive = 0
+        $auditState.ConsecutiveNotRestorable = 0
         $gapTxt = if ($transGap -ge $gapThreshold) { "Transaction Gap em $transGap (notificacao de e-mail silenciada)." } else { "Transaction Gap normal ($transGap)." }
         Log-Message "[AUDITORIA 100% SUCESSO] Backup restaurado e banco FISICAMENTE INTEGRO! 0 erros de registro, 0 erros de paginas. $gapTxt"
         Log-Message "[AUDITORIA ZERO SPAM] Operacao 100% silenciosa no e-mail conforme politica corporativa."
     } elseif ($verdict -eq "INCONCLUSIVO") {
         $auditState.ConsecutiveInconclusive = [int]$auditState.ConsecutiveInconclusive + 1
+        $auditState.ConsecutiveNotRestorable = 0
         Log-Message "[AUDITORIA INCONCLUSIVA] A integridade NAO foi comprovada hoje ($($auditState.ConsecutiveInconclusive) dia(s) seguido(s)). Motivo: $diagnostico"
         # Falha persistente (2 auditorias seguidas) avisa; um soluco isolado nao.
         if ($auditState.ConsecutiveInconclusive -ge 2 -and -not (Test-WithinCooldown -Timestamp $auditState.LastInconclusiveAlert -Hours 20)) {
             $headline = "AUDITORIA NAO CONSEGUE VALIDAR O BANCO"
         }
-    } else {
+    } elseif ($verdict -eq "NAO_RESTAURAVEL") {
+        # Anti-spam: um GZ corrompido por backup interrompido e transitorio (o proximo ciclo corrige).
+        # So alerta apos 2 dias consecutivos, igual ao INCONCLUSIVO.
         $auditState.ConsecutiveInconclusive = 0
+        $auditState.ConsecutiveNotRestorable = [int]$auditState.ConsecutiveNotRestorable + 1
+        Log-Message "[AUDITORIA NAO_RESTAURAVEL] Backup nao restauravel hoje ($($auditState.ConsecutiveNotRestorable) dia(s) seguido(s)). Motivo: $diagnostico"
+        if ($auditState.ConsecutiveNotRestorable -ge 2 -and -not (Test-WithinCooldown -Timestamp $auditState.LastNotRestorableAlert -Hours 20)) {
+            $headline = "BACKUP NAO RESTAURAVEL"
+        } else {
+            $motivo = if ($auditState.ConsecutiveNotRestorable -lt 2) { "aguardando reconfirmacao no proximo ciclo antes de notificar" } else { "cooldown de alerta ainda ativo (menos de 20h desde o ultimo envio)" }
+            Log-Message "[AUDITORIA ZERO SPAM] NAO_RESTAURAVEL dia $($auditState.ConsecutiveNotRestorable): $motivo."
+        }
+    } else {
+        # CORROMPIDO, LIMITE_TRANSACOES e outros: risco real e urgente, disparo imediato.
+        $auditState.ConsecutiveInconclusive = 0
+        $auditState.ConsecutiveNotRestorable = 0
         $headline = switch ($verdict) {
-            "NAO_RESTAURAVEL"   { "BACKUP NAO RESTAURAVEL" }
             "CORROMPIDO"        { "CORRUPCAO FISICA DETECTADA NO FIREBIRD" }
             "LIMITE_TRANSACOES" { "LIMITE DE TRANSACOES DO FIREBIRD PROXIMO" }
             default             { "ANOMALIA DETECTADA NO FIREBIRD" }
@@ -3195,9 +3361,26 @@ function Invoke-DatabaseHealthAudit {
 
     if ($null -ne $headline) {
         $global:mailSent = $false
-        Send-AuditAlertNotification -ClientName $clientName -AnyDeskId $anyDeskId -TeamViewerId $teamViewerId -DbPath $liveDb -RecordErrors $recordErrors -PageErrors $pageErrors -TransactionGap $transGap -NextTransaction $nextTrans -AuditLogSnippet $gfixLog -Headline $headline -Diagnosis $diagnostico
+        # CooldownHours e LastAlertTimestamp: dupla protecao contra envios duplicados.
+        # INCONCLUSIVO e NAO_RESTAURAVEL: 20h (ja controlados pelos contadores, mas a funcao
+        # tambem se auto-defende caso seja chamada forcadamente mais de uma vez no mesmo dia).
+        # CORROMPIDO/LIMITE_TRANSACOES: sem cooldown (risco real e urgente, sempre dispara).
+        $alertCooldownH = switch ($verdict) {
+            "INCONCLUSIVO"    { 20 }
+            "NAO_RESTAURAVEL" { 20 }
+            default           { 0 }
+        }
+        $alertLastTs = switch ($verdict) {
+            "INCONCLUSIVO"    { $auditState.LastInconclusiveAlert }
+            "NAO_RESTAURAVEL" { $auditState.LastNotRestorableAlert }
+            default           { $null }
+        }
+        Send-AuditAlertNotification -ClientName $clientName -AnyDeskId $anyDeskId -TeamViewerId $teamViewerId -DbPath $liveDb -RecordErrors $recordErrors -PageErrors $pageErrors -TransactionGap $transGap -NextTransaction $nextTrans -AuditLogSnippet $gfixLog -Headline $headline -Diagnosis $diagnostico -CooldownHours $alertCooldownH -LastAlertTimestamp "$alertLastTs"
         if ($verdict -eq "INCONCLUSIVO" -and $global:mailSent) {
             $auditState.LastInconclusiveAlert = (Get-Date).ToString("o")
+        }
+        if ($verdict -eq "NAO_RESTAURAVEL" -and $global:mailSent) {
+            $auditState.LastNotRestorableAlert = (Get-Date).ToString("o")
         }
     }
     Save-AuditState -State $auditState
