@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.49"
+$script:EngineVersion = "2.2.50"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -325,20 +325,24 @@ function Convert-PlainPasswordsInConfig {
                 $mudou = $true; $campos += "SmtpPass"
             }
             foreach ($t in $cfg.Tasks) {
-                # Migracao e auto-restauracao das credenciais de rede padrao MEC:
-                # - NetworkUser/NetworkPassword null  = tarefa antiga sem credencial (primeira execucao apos OTA)
-                # - NetworkUser/NetworkPassword vazio = interface limpou (normal: UI nao exibe credencial de rede)
-                # Em ambos os casos aplica o padrao MEC para que o WNetAddConnection2 funcione 24/7
-                # sem usuario logado. Clientes que precisam de credencial diferente podem configurar
-                # manualmente via config.json. Nao sobrescreve blob DPAPI valido.
-                if ($null -eq $t.NetworkUser -or [string]::IsNullOrWhiteSpace($t.NetworkUser)) {
-                    $t | Add-Member -NotePropertyName NetworkUser -NotePropertyValue "administrador" -Force
-                    $mudou = $true; $campos += "$($t.TaskName).NetworkUser (padrao MEC)"
-                }
-                if ($null -eq $t.NetworkPassword -or [string]::IsNullOrWhiteSpace($t.NetworkPassword)) {
-                    # Add-Member cobre tambem tarefas antigas sem a propriedade
-                    $t | Add-Member -NotePropertyName NetworkPassword -NotePropertyValue "mecinfo" -Force
-                    $mudou = $true; $campos += "$($t.TaskName).NetworkPassword (padrao MEC)"
+                # NetworkCredentialCustom = $true: tecnico configurou credencial especifica via Setup TECNICO.
+                # O motor respeita e NAO sobrescreve com o padrao MEC. Caso contrario (null/false),
+                # aplica administrador/mecinfo automaticamente via OTA, sem intervencao do tecnico.
+                $credCustom = ($t.NetworkCredentialCustom -eq $true)
+                if (-not $credCustom) {
+                    # Migracao e auto-restauracao das credenciais de rede padrao MEC:
+                    # - null  = tarefa antiga sem credencial (primeira execucao apos OTA)
+                    # - vazio = interface limpou ao salvar (UI nao exibe credencial de rede)
+                    # Nao sobrescreve blob DPAPI valido.
+                    if ($null -eq $t.NetworkUser -or [string]::IsNullOrWhiteSpace($t.NetworkUser)) {
+                        $t | Add-Member -NotePropertyName NetworkUser -NotePropertyValue "administrador" -Force
+                        $mudou = $true; $campos += "$($t.TaskName).NetworkUser (padrao MEC)"
+                    }
+                    if ($null -eq $t.NetworkPassword -or [string]::IsNullOrWhiteSpace($t.NetworkPassword)) {
+                        # Add-Member cobre tambem tarefas antigas sem a propriedade
+                        $t | Add-Member -NotePropertyName NetworkPassword -NotePropertyValue "mecinfo" -Force
+                        $mudou = $true; $campos += "$($t.TaskName).NetworkPassword (padrao MEC)"
+                    }
                 }
                 foreach ($nome in @("DbPassword", "NetworkPassword")) {
                     $valor = $t.$nome
@@ -4771,7 +4775,16 @@ foreach ($destTrimmed in $resolvedDestList) {
             if ($wnetResult.Ok) {
                 Log-Message "WNet: autenticado em $wnetServer como '$netUser' (codigo=$($wnetResult.Code))"
             } else {
-                Log-Message "WNet: nao foi possivel autenticar em $wnetServer como '$netUser': $($wnetResult.Error)"
+                $wnetCode = $wnetResult.Code
+                $wnetDica = switch ($wnetCode) {
+                    1326 { "Senha ou usuario incorretos. Configure a credencial correta via Setup TECNICO ou defina NetworkCredentialCustom=true no config.json." }
+                    1331 { "Conta de usuario desativada no Windows do terminal. Ative a conta ou use outra via Setup TECNICO." }
+                    1907 { "Senha da conta expirada no terminal. Redefina a senha ou use conta sem expiracao." }
+                    1219 { "" }  # nunca chega aqui (tratado como Ok), mas por seguranca
+                    default { "Verifique se o compartilhamento esta acessivel e se a conta tem permissao." }
+                }
+                $wnetMsg = "WNet: nao foi possivel autenticar em $wnetServer como '$netUser' (codigo=$wnetCode). $wnetDica"
+                Log-Message $wnetMsg
                 $wnetServer = $null  # nao desconecta se nao conectou
             }
         }
