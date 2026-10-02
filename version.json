@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.46",
+    "version":  "2.2.47",
     "releaseDate":  "2026-10-02",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
     "changelog":  "1. Instalador volta a trazer nome do motel, AnyDesk e TeamViewer: deteccao no PowerShell 64 bits, registro lido nas vistas 64/32 bits e AnyDesk procurado em todas as variantes (service.conf, AnyDesk personalizado, perfis) e via AnyDesk.exe --get-id.\\n2. Valores ja salvos no config anterior sao mantidos quando a deteccao nao encontra nada.\\n3. Botao Detectar do painel usa a mesma busca do AnyDesk.",
-    "setupSha256":  "BFC98B70425D6F8C885F31F13C60BB28C2282F0DC1734E927D0EB9715FC03FD3",
-    "engineSha256":  "9B47091FEF6CDCA8E46787DC8A41C5251F5F53FD0517285593C4D87E436C6A6F",
-    "signature":  "Uy73LOeCNVfcwemvp3dAE1tR2DhT9N3Sm4k64flX80UvJnMT0itHImimA0NIeJjggdFYsyKhOVW74ArK52Kc0tkA43t7Skr1i8+7ldf2zLxn09Tx2U4bh4Jj65npR1XDgL7kVDSuaq+Cgoxdc7MNN4RFA/nAa/OU8ORgrxRct7EsqaizqHl/bI9QWaxO1dyRGkkrENThymqppikeO8ic60qpP2JnAC23mmZyfIuJoH/FpkU1OF0HEwQRuzn6nSxo+n9Tcvp5GYdRAdHUXUdiXbsVFouJ4QKuN+rGdX/tYOnF9NBNK31VBMdhV8ytqFL+r+YOf9yCpHjEjzjqhGeCXRxjaraNAbfQU6DyfWYfcfveYDQI1FunDhdEqVs8/UIQUp2wQSyx44hHevsYLEE14MSXTXgstCcbTn4+UdO1o+4i1dUjAKlJ7BHdbAWTga2kWM2tuVsWlwphderwjwdEQKezqWCVIaoYZ2l/7cFVy/Fa9C6CcyxqkzAx+c5rTZbh"
+    "setupSha256":  "5B954EE79A32775E4AEEE87F5DB3A5CD086D8A7CB56E9EEA58D90F0C35C647E3",
+    "engineSha256":  "38E3751C2DB4DD3D84BFA5B445F5D1DF4867CD284CABA4DA7FF3712E71DCF4CB",
+    "signature":  "jWocUMuuectEJqOC4CguRrTNj81az3z9HK+CwcfxEO2kXasc2cTVu5Z3vXtZg4NYrRwR7R+DDYJAYheDy9qg+Woa4C9MalO037qocwVoUYW5fEiWeMGIsI6GgHyk0MRTZjLu8f/OEvvzydpKM/Q/4AE8AOEXhLb76tN0gHKGdrXaIpJ3i4I/I9GCPcAGOMswr4RavDuq8YoIagy1/2Mofjj6qo/X4LKPgcD8ZpylhAGQaK2Wc/uzDLeswz9+o+CNCX4NyMk6d6/ybLg04CzIKxrB4Ifqn0kL569aZtM8hXWufinoNqMI48wyaKFmom42muZP4+qwHlQQlIvtn6zzAf8zwsVIBCITFf9wINSLTr9dRufBmN0qp30k1DIiGW8Xt6RHNpEiHx/0TdepJjZMSTLksBC/8whmL7J647TE4YBiaw97PZRCaFF8a1J6uJsYmH5wgkKwEvidc0ExsoWWo/uU6wPXBC6177Yyh4X3zQLf4pl5wH5ao2/bmcmEQyzJ"
 }

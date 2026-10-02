@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.46"
+$script:EngineVersion = "2.2.47"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -4815,7 +4815,15 @@ foreach ($destTrimmed in $resolvedDestList) {
             $networkSuccessList += $viaUser.FinalPath
             Log-Message "Backup GZ gravado e CONFERIDO em: $($viaUser.FinalPath) pelo usuario logado $($viaUser.User) (SHA-256 identico a origem; $($viaUser.Removed) backup(s) antigo(s) removido(s) pela retencao)"
         } else {
-            $destinationFailureReason = "o servico nao tem permissao na pasta e a copia pelo usuario logado falhou: $($viaUser.Message)"
+            # Detecta automaticamente dominio vs workgroup para dar orientacao clara ao tecnico.
+            # Em dominio (AD/Kerberos) o SYSTEM autentica via maquina -- falha e de permissao de pasta.
+            # Em workgroup a credencial precisa ser registrada no cofre do SYSTEM via instalador.
+            $ehDominio = try { (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).PartOfDomain } catch { $false }
+            if ($ehDominio) {
+                $destinationFailureReason = "o servico nao tem permissao na pasta e a copia pelo usuario logado falhou: $($viaUser.Message). DOMINIO DETECTADO: verifique a permissao de escrita da pasta '$destTrimmed' para o computador do servidor"
+            } else {
+                $destinationFailureReason = "o servico nao tem permissao na pasta e a copia pelo usuario logado falhou: $($viaUser.Message). WORKGROUP DETECTADO: rode o instalador MEC Shield neste servidor e configure as credenciais do terminal de rede na tela 'Credenciais do Terminal de Rede'"
+            }
             Log-Message "AVISO DE REDE: '$destTrimmed': $destinationFailureReason"
         }
     }
