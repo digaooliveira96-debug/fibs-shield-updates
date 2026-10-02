@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.47"
+$script:EngineVersion = "2.2.48"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -503,6 +503,54 @@ function Resolve-MappedDrivePath {
         }
     }
     return $p
+}
+
+# Autenticacao temporaria em compartilhamento UNC via WNetAddConnection2 (P/Invoke).
+# Usa CONNECT_TEMPORARY (flag=4): a conexao morre com o processo, sem persistencia
+# no Credential Manager, sem conflito com Kerberos em dominio, sem erro 1219.
+# Chamado antes de cada copia para destino UNC quando NetworkUser esta configurado.
+# Em dominio com trust OK, o Kerberos prevalece (WNet recebe ERROR_SESSION_CREDENTIAL_CONFLICT
+# e ignora silenciosamente, pois a sessao SMB ja existe). Em workgroup ou trust quebrado,
+# esta funcao e o unico meio de autenticar sem usuario logado.
+function Invoke-WNetConnect {
+    param([string]$UNCServer, [string]$User, [string]$Password)
+    if ([string]::IsNullOrWhiteSpace($UNCServer) -or [string]::IsNullOrWhiteSpace($User)) { return @{ Ok = $false; Code = -1; Error = "Credenciais vazias" } }
+
+    if (-not ([System.Management.Automation.PSTypeName]'MecWNetHelper').Type) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class MecWNetHelper {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct NETRESOURCE {
+        public int dwScope; public int dwType; public int dwDisplayType; public int dwUsage;
+        public string lpLocalName; public string lpRemoteName; public string lpComment; public string lpProvider;
+    }
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int WNetAddConnection2(ref NETRESOURCE r, string pass, string user, int flags);
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern int WNetCancelConnection2(string name, int flags, bool force);
+}
+'@ -ErrorAction SilentlyContinue
+    }
+
+    $nr = New-Object MecWNetHelper+NETRESOURCE
+    $nr.dwType = 1  # RESOURCETYPE_DISK
+    $nr.lpRemoteName = $UNCServer
+
+    # CONNECT_TEMPORARY (0x04): conexao descartada quando o processo termina
+    $code = [MecWNetHelper]::WNetAddConnection2([ref]$nr, $Password, $User, 4)
+
+    # 0 = sucesso; 1219 = sessao SMB ja existe com credencial diferente (Kerberos dominio)
+    # ambos sao aceitaveis - em dominio OK, Kerberos ja autenticou antes de chegarmos aqui
+    $ok = ($code -eq 0 -or $code -eq 1219)
+    return @{ Ok = $ok; Code = $code; Error = if ($ok) { "" } else { "WNetAddConnection2 retornou $code" } }
+}
+
+function Invoke-WNetDisconnect {
+    param([string]$UNCServer)
+    if (-not ([System.Management.Automation.PSTypeName]'MecWNetHelper').Type) { return }
+    [MecWNetHelper]::WNetCancelConnection2($UNCServer, 0, $false) | Out-Null
 }
 
 # Identifica se uma unidade ou caminho pertence a uma particao reservada do sistema
@@ -4698,6 +4746,27 @@ foreach ($destTrimmed in $resolvedDestList) {
     $finalPath = $null
     Log-Message "Gravando backup GZ no destino $($destTypeTag) - $destTrimmed"
 
+    # Autenticacao temporaria para destinos UNC (workgroup ou fallback de dominio).
+    # WNetAddConnection2 com CONNECT_TEMPORARY: nao persiste no cofre, nao conflita
+    # com Kerberos em dominio (codigo 1219 = sessao SMB ja existe = OK).
+    $wnetServer = $null
+    if ($isNetwork -and (Test-IsSystemAccount)) {
+        $netUser = if (-not [string]::IsNullOrWhiteSpace($task.NetworkUser)) { Unprotect-String $task.NetworkUser } else { $null }
+        $netPass = if (-not [string]::IsNullOrWhiteSpace($task.NetworkPassword)) { Unprotect-String $task.NetworkPassword } else { $null }
+        if (-not [string]::IsNullOrWhiteSpace($netUser)) {
+            # Extrai \\servidor do caminho UNC completo (\\servidor\pasta\subpasta -> \\servidor)
+            $uncParts = $destTrimmed.TrimStart('\').Split('\')
+            $wnetServer = "\\$($uncParts[0])"
+            $wnetResult = Invoke-WNetConnect -UNCServer $wnetServer -User $netUser -Password $netPass
+            if ($wnetResult.Ok) {
+                Log-Message "WNet: autenticado em $wnetServer como '$netUser' (codigo=$($wnetResult.Code))"
+            } else {
+                Log-Message "WNet: nao foi possivel autenticar em $wnetServer como '$netUser': $($wnetResult.Error)"
+                $wnetServer = $null  # nao desconecta se nao conectou
+            }
+        }
+    }
+
     $destSuccess = $false
     for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
         try {
@@ -4840,6 +4909,11 @@ foreach ($destTrimmed in $resolvedDestList) {
         } else {
             Log-Message "ERRO: Falha definitiva de copia para o destino local: $destTrimmed"
         }
+    }
+
+    # Libera a conexao WNet temporaria ao final de cada destino
+    if ($null -ne $wnetServer) {
+        Invoke-WNetDisconnect -UNCServer $wnetServer
     }
 }
 
