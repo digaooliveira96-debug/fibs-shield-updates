@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.43"
+$script:EngineVersion = "2.2.44"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -3490,8 +3490,9 @@ function Invoke-MecLiveUpdate {
             [DateTime]::TryParse("$($fibsState.LastUpdateCheck)", [ref]$lastCheckTime) | Out-Null
         }
 
-        # Se ja verificou ha menos de 24 horas e nao e Force nem CheckUpdateOnly, aguarda o proximo ciclo diario
-        if (-not $Force -and -not $CheckUpdateOnly -and ($lastCheckTime -gt [DateTime]::MinValue) -and (($now - $lastCheckTime).TotalHours -lt 24)) {
+        # Se ja verificou ha menos de 4 horas e nao e Force nem CheckUpdateOnly, aguarda o proximo ciclo.
+        # Intervalo de 4h garante que atualizacoes publicadas cheguem nos clientes rapidamente.
+        if (-not $Force -and -not $CheckUpdateOnly -and ($lastCheckTime -gt [DateTime]::MinValue) -and (($now - $lastCheckTime).TotalHours -lt 4)) {
             return
         }
 
