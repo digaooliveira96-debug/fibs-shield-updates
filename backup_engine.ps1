@@ -1,4 +1,4 @@
-# ==============================================================================
+﻿# ==============================================================================
 # FIBS Resiliente - Motor de Execucao de Backup (backup_engine.ps1)
 # Executa 24/7 de forma consistente, online e com auto-recuperacao no boot
 # Compativel com Windows 7, 8, 10, 11 e Windows Server (2008 R2 a 2025)
@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.39"
+$script:EngineVersion = "2.2.40"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
