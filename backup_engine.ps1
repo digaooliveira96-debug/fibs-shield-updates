@@ -1,4 +1,4 @@
-﻿# ==============================================================================
+# ==============================================================================
 # FIBS Resiliente - Motor de Execucao de Backup (backup_engine.ps1)
 # Executa 24/7 de forma consistente, online e com auto-recuperacao no boot
 # Compativel com Windows 7, 8, 10, 11 e Windows Server (2008 R2 a 2025)
@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.50"
+$script:EngineVersion = "2.2.51"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -328,7 +328,7 @@ function Convert-PlainPasswordsInConfig {
                 # NetworkCredentialCustom = $true: tecnico configurou credencial especifica via Setup TECNICO.
                 # O motor respeita e NAO sobrescreve com o padrao MEC. Caso contrario (null/false),
                 # aplica administrador/mecinfo automaticamente via OTA, sem intervencao do tecnico.
-                $credCustom = ($t.NetworkCredentialCustom -eq $true)
+                $credCustom = ($t.NetworkCredentialCustom -eq $true -or "$($t.NetworkCredentialCustom)".Trim().ToLower() -eq 'true')
                 if (-not $credCustom) {
                     # Migracao e auto-restauracao das credenciais de rede padrao MEC:
                     # - null  = tarefa antiga sem credencial (primeira execucao apos OTA)
@@ -528,10 +528,35 @@ function Resolve-MappedDrivePath {
 # esta funcao e o unico meio de autenticar sem usuario logado.
 function Invoke-WNetConnect {
     param([string]$UNCServer, [string]$User, [string]$Password)
-    if ([string]::IsNullOrWhiteSpace($UNCServer) -or [string]::IsNullOrWhiteSpace($User)) { return @{ Ok = $false; Code = -1; Error = "Credenciais vazias" } }
+    if ([string]::IsNullOrWhiteSpace($UNCServer) -or [string]::IsNullOrWhiteSpace($User)) { 
+        return @{ Ok = $false; Code = -1; Error = "Credenciais vazias" } 
+    }
 
-    if (-not ([System.Management.Automation.PSTypeName]'MecWNetHelper').Type) {
-        Add-Type -TypeDefinition @'
+    try {
+        # 1. Pre-checagem rapida de conectividade TCP na porta 445 (SMB) com timeout de 2 segundos.
+        # Evita que o WNetAddConnection2 bloqueie a thread por 20 a 45 segundos se o equipamento estiver desligado.
+        $hostOrIp = $UNCServer.TrimStart('\').Split('\')[0]
+        $tcpOk = $false
+        try {
+            $tcp = New-Object System.Net.Sockets.TcpClient
+            $iar = $tcp.BeginConnect($hostOrIp, 445, $null, $null)
+            $waitSuccess = $iar.AsyncWaitHandle.WaitOne(2000, $false)
+            if ($waitSuccess -and $tcp.Connected) {
+                $tcp.EndConnect($iar)
+                $tcpOk = $true
+            }
+            $tcp.Close()
+        } catch {
+            $tcpOk = $false
+        }
+
+        if (-not $tcpOk) {
+            return @{ Ok = $false; Code = 53; Error = "Host '$hostOrIp' nao respondeu na porta 445 (SMB) em 2s (equipamento offline ou bloqueado por firewall)" }
+        }
+
+        # 2. Inicializacao segura do P/Invoke
+        if (-not ([System.Management.Automation.PSTypeName]'MecWNetHelper').Type) {
+            Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 public class MecWNetHelper {
@@ -546,25 +571,34 @@ public class MecWNetHelper {
     public static extern int WNetCancelConnection2(string name, int flags, bool force);
 }
 '@ -ErrorAction SilentlyContinue
+        }
+
+        if (-not ([System.Management.Automation.PSTypeName]'MecWNetHelper').Type) {
+            return @{ Ok = $false; Code = -2; Error = "Nao foi possivel carregar o helper MecWNetHelper (mpr.dll ou compilador C# indisponivel)" }
+        }
+
+        $nr = New-Object MecWNetHelper+NETRESOURCE
+        $nr.dwType = 1  # RESOURCETYPE_DISK
+        $nr.lpRemoteName = $UNCServer
+
+        # CONNECT_TEMPORARY (0x04): conexao descartada quando o processo termina
+        $code = [MecWNetHelper]::WNetAddConnection2([ref]$nr, $Password, $User, 4)
+
+        # 0 = sucesso; 1219 = sessao SMB ja existe com credencial diferente (Kerberos dominio)
+        # ambos sao aceitaveis - em dominio OK, Kerberos ja autenticou antes de chegarmos aqui
+        $ok = ($code -eq 0 -or $code -eq 1219)
+        return @{ Ok = $ok; Code = $code; Error = if ($ok) { "" } else { "WNetAddConnection2 retornou $code" } }
+    } catch {
+        return @{ Ok = $false; Code = -3; Error = "Excecao inesperada no WNetConnect: $($_.Exception.Message)" }
     }
-
-    $nr = New-Object MecWNetHelper+NETRESOURCE
-    $nr.dwType = 1  # RESOURCETYPE_DISK
-    $nr.lpRemoteName = $UNCServer
-
-    # CONNECT_TEMPORARY (0x04): conexao descartada quando o processo termina
-    $code = [MecWNetHelper]::WNetAddConnection2([ref]$nr, $Password, $User, 4)
-
-    # 0 = sucesso; 1219 = sessao SMB ja existe com credencial diferente (Kerberos dominio)
-    # ambos sao aceitaveis - em dominio OK, Kerberos ja autenticou antes de chegarmos aqui
-    $ok = ($code -eq 0 -or $code -eq 1219)
-    return @{ Ok = $ok; Code = $code; Error = if ($ok) { "" } else { "WNetAddConnection2 retornou $code" } }
 }
 
 function Invoke-WNetDisconnect {
     param([string]$UNCServer)
-    if (-not ([System.Management.Automation.PSTypeName]'MecWNetHelper').Type) { return }
-    [MecWNetHelper]::WNetCancelConnection2($UNCServer, 0, $false) | Out-Null
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'MecWNetHelper').Type) { return }
+        [MecWNetHelper]::WNetCancelConnection2($UNCServer, 0, $false) | Out-Null
+    } catch {}
 }
 
 # Identifica se uma unidade ou caminho pertence a uma particao reservada do sistema
