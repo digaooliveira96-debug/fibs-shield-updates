@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.44"
+$script:EngineVersion = "2.2.45"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -3490,10 +3490,16 @@ function Invoke-MecLiveUpdate {
             [DateTime]::TryParse("$($fibsState.LastUpdateCheck)", [ref]$lastCheckTime) | Out-Null
         }
 
-        # Se ja verificou ha menos de 4 horas e nao e Force nem CheckUpdateOnly, aguarda o proximo ciclo.
-        # Intervalo de 4h garante que atualizacoes publicadas cheguem nos clientes rapidamente.
-        if (-not $Force -and -not $CheckUpdateOnly -and ($lastCheckTime -gt [DateTime]::MinValue) -and (($now - $lastCheckTime).TotalHours -lt 4)) {
+        # Verifica uma vez por dia, a partir de 1h da manha (antes da auditoria das 3:30h).
+        # O servico roda a cada 2h. Na primeira execucao apos 01:00 que ainda nao verificou
+        # hoje, busca a atualizacao. Garante versao atualizada antes da auditoria diaria.
+        $jaVerificouHoje = ($lastCheckTime -gt [DateTime]::MinValue) -and ($lastCheckTime.Date -eq $now.Date)
+        $dentroJanela    = $now.Hour -ge 1  # a partir de 1h da manha
+        if (-not $Force -and -not $CheckUpdateOnly -and $jaVerificouHoje) {
             return
+        }
+        if (-not $Force -and -not $CheckUpdateOnly -and -not $dentroJanela) {
+            return  # antes de 1h da manha: aguarda a janela diaria
         }
 
         # Chave publica obrigatoria: valida a assinatura RSA do manifesto
