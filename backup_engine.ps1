@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.51"
+$script:EngineVersion = "2.2.52"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -519,86 +519,135 @@ function Resolve-MappedDrivePath {
     return $p
 }
 
-# Autenticacao temporaria em compartilhamento UNC via WNetAddConnection2 (P/Invoke).
-# Usa CONNECT_TEMPORARY (flag=4): a conexao morre com o processo, sem persistencia
-# no Credential Manager, sem conflito com Kerberos em dominio, sem erro 1219.
-# Chamado antes de cada copia para destino UNC quando NetworkUser esta configurado.
-# Em dominio com trust OK, o Kerberos prevalece (WNet recebe ERROR_SESSION_CREDENTIAL_CONFLICT
-# e ignora silenciosamente, pois a sessao SMB ja existe). Em workgroup ou trust quebrado,
-# esta funcao e o unico meio de autenticar sem usuario logado.
-function Invoke-WNetConnect {
-    param([string]$UNCServer, [string]$User, [string]$Password)
-    if ([string]::IsNullOrWhiteSpace($UNCServer) -or [string]::IsNullOrWhiteSpace($User)) { 
-        return @{ Ok = $false; Code = -1; Error = "Credenciais vazias" } 
-    }
-
+# Login de rede "so para a rede" (LogonUser LOGON32_LOGON_NEW_CREDENTIALS + impersonacao).
+# O processo continua SYSTEM para os arquivos locais e apresenta usuario/senha ao terminal.
+# Prova de campo (SRVFIRENIGHT, Server 2016, 02/10/2026, tools\testar_rede_real.ps1):
+# como SYSTEM o WNetAddConnection2 da v2.2.51 devolvia 1312 e a gravacao era negada;
+# NEW_CREDENTIALS gravou. Cada login e uma sessao nova: nao herda conexao antiga do
+# SYSTEM com o terminal (o antigo codigo 1219) e nada fica conectado depois.
+# A senha so e conferida pelo terminal no acesso: senha errada aparece como acesso negado.
+# A impersonacao vale para a thread atual; o motor roda numa thread so (powershell -File).
+function Initialize-MecNetLogon {
+    if (([System.Management.Automation.PSTypeName]'MecNetLogon').Type) { return $true }
     try {
-        # 1. Pre-checagem rapida de conectividade TCP na porta 445 (SMB) com timeout de 2 segundos.
-        # Evita que o WNetAddConnection2 bloqueie a thread por 20 a 45 segundos se o equipamento estiver desligado.
-        $hostOrIp = $UNCServer.TrimStart('\').Split('\')[0]
-        $tcpOk = $false
-        try {
-            $tcp = New-Object System.Net.Sockets.TcpClient
-            $iar = $tcp.BeginConnect($hostOrIp, 445, $null, $null)
-            $waitSuccess = $iar.AsyncWaitHandle.WaitOne(2000, $false)
-            if ($waitSuccess -and $tcp.Connected) {
-                $tcp.EndConnect($iar)
-                $tcpOk = $true
-            }
-            $tcp.Close()
-        } catch {
-            $tcpOk = $false
-        }
-
-        if (-not $tcpOk) {
-            return @{ Ok = $false; Code = 53; Error = "Host '$hostOrIp' nao respondeu na porta 445 (SMB) em 2s (equipamento offline ou bloqueado por firewall)" }
-        }
-
-        # 2. Inicializacao segura do P/Invoke
-        if (-not ([System.Management.Automation.PSTypeName]'MecWNetHelper').Type) {
-            Add-Type -TypeDefinition @'
+        Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
-public class MecWNetHelper {
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    public struct NETRESOURCE {
-        public int dwScope; public int dwType; public int dwDisplayType; public int dwUsage;
-        public string lpLocalName; public string lpRemoteName; public string lpComment; public string lpProvider;
-    }
-    [DllImport("mpr.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern int WNetAddConnection2(ref NETRESOURCE r, string pass, string user, int flags);
-    [DllImport("mpr.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    public static extern int WNetCancelConnection2(string name, int flags, bool force);
+public class MecNetLogon {
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool LogonUser(string user, string domain, string pass, int logonType, int provider, out IntPtr token);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr handle);
 }
-'@ -ErrorAction SilentlyContinue
-        }
-
-        if (-not ([System.Management.Automation.PSTypeName]'MecWNetHelper').Type) {
-            return @{ Ok = $false; Code = -2; Error = "Nao foi possivel carregar o helper MecWNetHelper (mpr.dll ou compilador C# indisponivel)" }
-        }
-
-        $nr = New-Object MecWNetHelper+NETRESOURCE
-        $nr.dwType = 1  # RESOURCETYPE_DISK
-        $nr.lpRemoteName = $UNCServer
-
-        # CONNECT_TEMPORARY (0x04): conexao descartada quando o processo termina
-        $code = [MecWNetHelper]::WNetAddConnection2([ref]$nr, $Password, $User, 4)
-
-        # 0 = sucesso; 1219 = sessao SMB ja existe com credencial diferente (Kerberos dominio)
-        # ambos sao aceitaveis - em dominio OK, Kerberos ja autenticou antes de chegarmos aqui
-        $ok = ($code -eq 0 -or $code -eq 1219)
-        return @{ Ok = $ok; Code = $code; Error = if ($ok) { "" } else { "WNetAddConnection2 retornou $code" } }
-    } catch {
-        return @{ Ok = $false; Code = -3; Error = "Excecao inesperada no WNetConnect: $($_.Exception.Message)" }
-    }
-}
-
-function Invoke-WNetDisconnect {
-    param([string]$UNCServer)
-    try {
-        if (-not ([System.Management.Automation.PSTypeName]'MecWNetHelper').Type) { return }
-        [MecWNetHelper]::WNetCancelConnection2($UNCServer, 0, $false) | Out-Null
+'@ -ErrorAction Stop
     } catch {}
+    return [bool](([System.Management.Automation.PSTypeName]'MecNetLogon').Type)
+}
+
+# Terminal responde na porta 445 em ate 2 s? Evita esperar 20-45 s por um terminal desligado.
+function Test-SmbPort {
+    param([string]$UNCPath)
+    $hostOrIp = $UNCPath.TrimStart('\').Split('\')[0]
+    try {
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        try {
+            $iar = $tcp.BeginConnect($hostOrIp, 445, $null, $null)
+            if ($iar.AsyncWaitHandle.WaitOne(2000, $false) -and $tcp.Connected) { $tcp.EndConnect($iar); return $true }
+        } finally { $tcp.Close() }
+    } catch {}
+    return $false
+}
+
+# Usuario sem dominio ("administrador") e conta local do TERMINAL: vira TERMINAL\administrador.
+# "DOMINIO\usuario" e "usuario@dominio" sao usados como vieram.
+function Split-NetworkUser {
+    param([string]$User, [string]$UNCPath)
+    if ($User.Contains('\')) { $p = $User.Split('\', 2); return @{ Domain = $p[0]; User = $p[1] } }
+    if ($User.Contains('@')) { return @{ Domain = $null; User = $User } }
+    return @{ Domain = $UNCPath.TrimStart('\').Split('\')[0]; User = $User }
+}
+
+# Abre o login de rede e passa a agir com ele. Devolve a sessao para Exit-NetworkCredential.
+function Enter-NetworkCredential {
+    param([string]$UNCPath, [string]$User, [string]$Password)
+    if ([string]::IsNullOrWhiteSpace($UNCPath) -or [string]::IsNullOrWhiteSpace($User)) {
+        return @{ Ok = $false; Code = -1; Error = "Credencial de rede vazia" }
+    }
+    if (-not (Initialize-MecNetLogon)) {
+        return @{ Ok = $false; Code = -2; Error = "Nao foi possivel carregar o login de rede (compilador C# indisponivel)" }
+    }
+    try {
+        $u = Split-NetworkUser -User $User -UNCPath $UNCPath
+        $tok = [IntPtr]::Zero
+        # LOGON32_LOGON_NEW_CREDENTIALS = 9, LOGON32_PROVIDER_WINNT50 = 3
+        if (-not [MecNetLogon]::LogonUser($u.User, $u.Domain, $Password, 9, 3, [ref]$tok)) {
+            $code = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            return @{ Ok = $false; Code = $code; Error = "LogonUser recusou o usuario de rede (codigo $code)" }
+        }
+        try {
+            $ctx = [System.Security.Principal.WindowsIdentity]::Impersonate($tok)
+        } catch {
+            [MecNetLogon]::CloseHandle($tok) | Out-Null
+            return @{ Ok = $false; Code = -3; Error = "Falha ao assumir o usuario de rede: $($_.Exception.Message)" }
+        }
+        $quem = if ($u.Domain) { "$($u.Domain)\$($u.User)" } else { $u.User }
+        return @{ Ok = $true; Code = 0; Error = ""; Context = $ctx; Token = $tok; Account = $quem }
+    } catch {
+        return @{ Ok = $false; Code = -4; Error = "Excecao no login de rede: $($_.Exception.Message)" }
+    }
+}
+
+# Volta a agir como o servico e fecha o login de rede. Pode ser chamada mais de uma vez.
+function Exit-NetworkCredential {
+    param($Session)
+    if ($null -eq $Session -or -not $Session.Ok) { return }
+    try { if ($null -ne $Session.Context) { $Session.Context.Undo(); $Session.Context = $null } } catch {}
+    try { if ($Session.Token -ne [IntPtr]::Zero) { [MecNetLogon]::CloseHandle($Session.Token) | Out-Null; $Session.Token = [IntPtr]::Zero } } catch {}
+}
+
+# Senha recusada pelo terminal (o erro so aparece no acesso, nao no LogonUser)?
+function Test-IsNetworkLogonFailure {
+    param($ErrorRecord)
+    $m = "$ErrorRecord $($ErrorRecord.Exception.InnerException)"
+    return ($m -match '(?i)user name or password|nome de usu.rio ou (a )?senha|logon failure|falha de logon|1326|account is disabled|conta.*desativada|password has expired|senha.*expirou')
+}
+
+# Orientacao ao tecnico quando o terminal recusa o login de rede.
+function Get-NetworkLoginHint {
+    param([int]$Code)
+    switch ($Code) {
+        53   { return "Terminal desligado, fora da rede ou firewall bloqueando a porta 445." }
+        86   { return "Senha incorreta para este usuario no terminal." }
+        1326 { return "Senha ou usuario incorretos. Configure a credencial correta via Setup TECNICO ou defina NetworkCredentialCustom=true no config.json." }
+        1331 { return "Conta de usuario desativada no Windows do terminal. Ative a conta ou use outra via Setup TECNICO." }
+        1907 { return "Senha da conta expirada no terminal. Redefina a senha ou use conta sem expiracao." }
+        default { return "Verifique se o compartilhamento esta acessivel e se a conta tem permissao." }
+    }
+}
+
+# Credencial de rede (texto aberto) que o backup usaria para este destino UNC:
+# a da tarefa que tem o destino; sem tarefa correspondente (destino ainda nao salvo
+# no painel), a primeira tarefa com credencial. $null quando nao ha credencial.
+function Get-NetworkCredentialForDestination {
+    param([string]$Destination, $Tasks)
+    if ([string]::IsNullOrWhiteSpace($Destination) -or $null -eq $Tasks) { return $null }
+    $alvo = $Destination.Trim().TrimEnd('\', '/')
+    $comCred = @($Tasks | Where-Object { $null -ne $_ -and -not [string]::IsNullOrWhiteSpace($_.NetworkUser) })
+    if ($comCred.Count -eq 0) { return $null }
+    $escolhida = $null
+    foreach ($t in $comCred) {
+        foreach ($d in @($t.Destinations)) {
+            if ([string]::IsNullOrWhiteSpace($d)) { continue }
+            $dn = (Resolve-MappedDrivePath $d.Trim()).TrimEnd('\', '/')
+            if ($dn -ieq $alvo) { $escolhida = $t; break }
+        }
+        if ($null -ne $escolhida) { break }
+    }
+    if ($null -eq $escolhida) { $escolhida = $comCred[0] }
+    $user = Unprotect-String $escolhida.NetworkUser
+    if ([string]::IsNullOrWhiteSpace($user)) { return $null }
+    $pass = if ([string]::IsNullOrWhiteSpace($escolhida.NetworkPassword)) { "" } else { Unprotect-String $escolhida.NetworkPassword }
+    return @{ User = $user; Password = $pass; TaskName = $escolhida.TaskName }
 }
 
 # Identifica se uma unidade ou caminho pertence a uma particao reservada do sistema
@@ -630,12 +679,15 @@ function Test-IsSystemReservedDrive {
 }
 
 # ==============================================================================
-# BACKUP EM REDE SEM SENHA (igual ao FIBS 2.0.2 original)
-# O FIBS rodava como programa aberto NO USUARIO LOGADO e gravava na pasta de rede com
-# o login dele. O MEC Shield roda como servico (conta do servidor): primeiro tenta
-# gravar direto; se a pasta nao aceitar a conta do servidor, entrega a copia ao
-# usuario logado no servidor, que grava com o mesmo acesso do Explorer.
-# Nenhum usuario ou senha e pedido, guardado ou enviado.
+# BACKUP EM REDE: o acesso e escolhido sozinho, por destino UNC
+# O servico roda como SYSTEM (Sessao 0), onde drives mapeados e credenciais do
+# usuario nao existem. Ordem tentada ate gravar:
+#   1. Conta do servidor, sem senha (dominio com a pasta liberada para o servidor).
+#   2. NetworkUser/NetworkPassword da tarefa, com login "so para a rede"
+#      (Enter-NetworkCredential). Funciona com o servidor bloqueado.
+#   3. Usuario logado no servidor (Copy-ViaLoggedOnUser), com o mesmo acesso do
+#      Explorer (como o FIBS original).
+# A senha de rede nunca fica em texto puro no disco: e cifrada com DPAPI.
 # ==============================================================================
 function Test-IsSystemAccount {
     try { return [System.Security.Principal.WindowsIdentity]::GetCurrent().IsSystem } catch { return $false }
@@ -793,39 +845,71 @@ function Copy-ViaLoggedOnUser {
     return [PSCustomObject]@{ Ok = $false; User = ""; FinalPath = ""; Removed = 0; Message = ($falhas -join " | ") }
 }
 
+# Grava, le e apaga um arquivo de prova. Devolve "" se deu certo ou a mensagem de erro.
+function Test-WriteProbe {
+    param([string]$Dir)
+    $probe = Join-Path $Dir (".mecshield_teste_{0}.tmp" -f ([Guid]::NewGuid().ToString("N")))
+    try {
+        if (-not (Test-Path $Dir)) { throw "pasta inacessivel ou inexistente para a conta do servidor" }
+        [System.IO.File]::WriteAllText($probe, "MEC Shield - teste de gravacao $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+        $lido = [System.IO.File]::ReadAllText($probe)
+        if ($lido -notmatch '^MEC Shield - teste de gravacao') { throw "arquivo de teste lido com conteudo diferente" }
+        return ""
+    } catch {
+        $m = "$($_.Exception.Message)".Trim()
+        if ([string]::IsNullOrWhiteSpace($m)) { $m = "$_" }
+        return $m
+    } finally {
+        try { if (Test-Path $probe) { Remove-Item $probe -Force -ErrorAction SilentlyContinue } } catch {}
+    }
+}
+
 # Teste de gravacao real no destino, executado pela interface como SYSTEM (tarefa
-# agendada temporaria): mesma logica do backup automatico -- direto pela conta do
-# servidor e, se ela for barrada, pela sessao do usuario logado.
+# agendada temporaria): mesma ordem do backup automatico -- conta do servidor sem
+# senha, depois usuario e senha de rede da tarefa (login "so para a rede") e, por
+# ultimo, a sessao do usuario logado.
+# Antes o teste ignorava a credencial e dava falha onde o backup real gravava.
 function Invoke-NetworkAccessTest {
-    param([string[]]$Destinations)
+    param([string[]]$Destinations, $Tasks)
     $results = @()
     foreach ($d in $Destinations) {
         if ([string]::IsNullOrWhiteSpace($d)) { continue }
         $dest = (Resolve-MappedDrivePath $d.Trim()).TrimEnd('\', '/')
-        $probe = Join-Path $dest (".mecshield_teste_{0}.tmp" -f ([Guid]::NewGuid().ToString("N")))
-        $direto = ""
-        try {
-            if (-not (Test-Path $dest)) { throw "pasta inacessivel ou inexistente para a conta do servidor" }
-            [System.IO.File]::WriteAllText($probe, "MEC Shield - teste de gravacao $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
-            $lido = [System.IO.File]::ReadAllText($probe)
-            if ($lido -notmatch '^MEC Shield - teste de gravacao') { throw "arquivo de teste lido com conteudo diferente" }
-        } catch {
-            $direto = "$($_.Exception.Message)".Trim()
-            if ([string]::IsNullOrWhiteSpace($direto)) { $direto = "$_" }
-        } finally {
-            try { if (Test-Path $probe) { Remove-Item $probe -Force -ErrorAction SilentlyContinue } } catch {}
-        }
+        $direto = Test-WriteProbe -Dir $dest
         if ([string]::IsNullOrWhiteSpace($direto)) {
-            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Gravacao direta pelo servico: OK (funciona 24h, mesmo sem ninguem logado)." }
+            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Gravacao direta pelo servico, sem senha: OK (funciona 24h, mesmo sem ninguem logado)." }
             continue
         }
         if (-not (Test-IsSystemAccount)) {
             $results += [PSCustomObject]@{ Destination = $dest; Ok = $false; Message = "Falha: $direto" }
             continue
         }
+        $comSenha = ""
+        if ($dest.StartsWith("\\")) {
+            $cred = Get-NetworkCredentialForDestination -Destination $dest -Tasks $Tasks
+            if ($null -ne $cred) {
+                $s = Enter-NetworkCredential -UNCPath $dest -User $cred.User -Password $cred.Password
+                if ($s.Ok) {
+                    try { $comSenha = Test-WriteProbe -Dir $dest } finally { Exit-NetworkCredential $s }
+                    if ([string]::IsNullOrWhiteSpace($comSenha)) {
+                        $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Gravacao pelo servico com o usuario de rede '$($s.Account)': OK (funciona 24h, mesmo sem ninguem logado)." }
+                        continue
+                    }
+                    if ($comSenha -match '(?i)user name or password|nome de usu.rio ou (a )?senha|logon failure|falha de logon') {
+                        $comSenha = "terminal recusou o usuario '$($s.Account)': $(Get-NetworkLoginHint -Code 1326)"
+                    }
+                    $comSenha = "Com usuario de rede '$($s.Account)': $comSenha"
+                } else {
+                    $comSenha = "Login de rede como '$($cred.User)' nao abriu: $($s.Error)"
+                }
+            } else {
+                $comSenha = "Sem usuario e senha de rede configurados"
+            }
+            $direto = "$direto | $comSenha"
+        }
         $v = Copy-ViaLoggedOnUser -DestDir $dest -Probe -TimeoutSec 120
         if ($v.Ok) {
-            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Grava pelo usuario logado ($($v.User)), igual ao FIBS antigo, sem senha. Precisa de alguem logado no servidor para a copia de rede (o backup local continua 24h)." }
+            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Grava pelo usuario logado ($($v.User)). Precisa de alguem logado no servidor para a copia de rede (o backup local continua 24h). Servico: $direto" }
         } else {
             $results += [PSCustomObject]@{ Destination = $dest; Ok = $false; Message = "Servico: $direto | Usuario logado: $($v.Message)" }
         }
@@ -850,7 +934,10 @@ function Invoke-NetworkAccessTestFromRequest {
     if ($dests.Count -eq 0) {
         $out += "FALHA`t-`tPedido de teste vazio ou ilegivel."
     } else {
-        foreach ($r in (Invoke-NetworkAccessTest -Destinations $dests)) {
+        # Mesma credencial de rede que o backup automatico usa (config.json da instalacao)
+        $cfg = try { Read-ConfigData } catch { $null }
+        $tasks = if ($null -ne $cfg) { @($cfg.Tasks) } else { @() }
+        foreach ($r in (Invoke-NetworkAccessTest -Destinations $dests -Tasks $tasks)) {
             $status = if ($r.Ok) { "OK" } else { "FALHA" }
             $out += "$status`t$($r.Destination)`t$(($r.Message -replace '[\r\n\t]+', ' '))"
         }
@@ -2646,15 +2733,34 @@ function Test-ExternalDestinationsHealth {
             # Checagem Fisica Real de Arquivos .GZ no destino
             $realLastBackupTime = $null
             $destAccessible = $false
-            try {
-                if (Test-Path $destTrim) {
-                    $destAccessible = $true
-                    $existingGzs = @(Get-ChildItem -Path "$destTrim\*" -Include "*.GZ", "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
-                    if ($existingGzs.Count -gt 0) {
-                        $realLastBackupTime = $existingGzs[0].LastWriteTime
+            # Mesma ordem do backup: conta do servidor e, se ela nao enxergar a pasta de
+            # rede, o usuario e senha de rede (senao o monitor alertaria um destino que grava).
+            $credMonitor = $null
+            if ($destTrim.StartsWith("\\") -and (Test-IsSystemAccount)) {
+                $credMonitor = Get-NetworkCredentialForDestination -Destination $destTrim -Tasks $global:configData.Tasks
+            }
+            foreach ($comSenha in @($false, $true)) {
+                if ($destAccessible -or ($comSenha -and $null -eq $credMonitor)) { break }
+                $sessaoMonitor = $null
+                try {
+                    if ($comSenha) {
+                        $sessaoMonitor = Enter-NetworkCredential -UNCPath $destTrim -User $credMonitor.User -Password $credMonitor.Password
+                        if (-not $sessaoMonitor.Ok) { $authFailureReason = "Login de rede como '$($credMonitor.User)' nao abriu: $($sessaoMonitor.Error)"; break }
                     }
+                    if (Test-Path $destTrim) {
+                        $destAccessible = $true
+                        $existingGzs = @(Get-ChildItem -Path "$destTrim\*" -Include "*.GZ", "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+                        if ($existingGzs.Count -gt 0) {
+                            $realLastBackupTime = $existingGzs[0].LastWriteTime
+                        }
+                    } elseif ($comSenha) {
+                        $authFailureReason = "A pasta nao abriu nem com o usuario de rede '$($sessaoMonitor.Account)' (senha errada, usuario sem permissao ou terminal desligado)."
+                    }
+                } catch {
+                } finally {
+                    Exit-NetworkCredential $sessaoMonitor
                 }
-            } catch {}
+            }
 
             $hoursSince = 0
             if ($destAccessible) {
@@ -4794,37 +4900,37 @@ foreach ($destTrimmed in $resolvedDestList) {
     $finalPath = $null
     Log-Message "Gravando backup GZ no destino $($destTypeTag) - $destTrimmed"
 
-    # Autenticacao temporaria para destinos UNC (workgroup ou fallback de dominio).
-    # WNetAddConnection2 com CONNECT_TEMPORARY: nao persiste no cofre, nao conflita
-    # com Kerberos em dominio (codigo 1219 = sessao SMB ja existe = OK).
-    $wnetServer = $null
+    # Destino de rede como SYSTEM: o acesso e escolhido sozinho, na ordem
+    #   1. conta do servidor, sem senha (dominio com a pasta liberada para o servidor);
+    #   2. usuario e senha de rede da tarefa (login "so para a rede", ver Enter-NetworkCredential);
+    #   3. usuario logado no servidor (Copy-ViaLoggedOnUser, mais abaixo).
+    # O primeiro que gravar e conferir o SHA-256 vale; o log diz qual foi usado.
+    $modosAcesso = @("DIRETO")
+    $netUser = $null; $netPass = $null
     if ($isNetwork -and (Test-IsSystemAccount)) {
         $netUser = if (-not [string]::IsNullOrWhiteSpace($task.NetworkUser)) { Unprotect-String $task.NetworkUser } else { $null }
-        $netPass = if (-not [string]::IsNullOrWhiteSpace($task.NetworkPassword)) { Unprotect-String $task.NetworkPassword } else { $null }
-        if (-not [string]::IsNullOrWhiteSpace($netUser)) {
-            # Extrai \\servidor do caminho UNC completo (\\servidor\pasta\subpasta -> \\servidor)
-            $uncParts = $destTrimmed.TrimStart('\').Split('\')
-            $wnetServer = "\\$($uncParts[0])"
-            $wnetResult = Invoke-WNetConnect -UNCServer $wnetServer -User $netUser -Password $netPass
-            if ($wnetResult.Ok) {
-                Log-Message "WNet: autenticado em $wnetServer como '$netUser' (codigo=$($wnetResult.Code))"
-            } else {
-                $wnetCode = $wnetResult.Code
-                $wnetDica = switch ($wnetCode) {
-                    1326 { "Senha ou usuario incorretos. Configure a credencial correta via Setup TECNICO ou defina NetworkCredentialCustom=true no config.json." }
-                    1331 { "Conta de usuario desativada no Windows do terminal. Ative a conta ou use outra via Setup TECNICO." }
-                    1907 { "Senha da conta expirada no terminal. Redefina a senha ou use conta sem expiracao." }
-                    1219 { "" }  # nunca chega aqui (tratado como Ok), mas por seguranca
-                    default { "Verifique se o compartilhamento esta acessivel e se a conta tem permissao." }
-                }
-                $wnetMsg = "WNet: nao foi possivel autenticar em $wnetServer como '$netUser' (codigo=$wnetCode). $wnetDica"
-                Log-Message $wnetMsg
-                $wnetServer = $null  # nao desconecta se nao conectou
-            }
+        $netPass = if (-not [string]::IsNullOrWhiteSpace($task.NetworkPassword)) { Unprotect-String $task.NetworkPassword } else { "" }
+        if (-not [string]::IsNullOrWhiteSpace($netUser)) { $modosAcesso += "SENHA" }
+        if (-not (Test-SmbPort -UNCPath $destTrimmed)) {
+            Log-Message "Rede: o terminal de '$destTrimmed' nao respondeu na porta 445 em 2 s (desligado, fora da rede ou firewall). Tentando mesmo assim."
         }
     }
 
     $destSuccess = $false
+    foreach ($modoAcesso in $modosAcesso) {
+    if ($destSuccess) { break }
+    $netSession = $null
+    $acessoNegado = $false
+    if ($modoAcesso -eq "SENHA") {
+        $netSession = Enter-NetworkCredential -UNCPath $destTrimmed -User $netUser -Password $netPass
+        if (-not $netSession.Ok) {
+            Log-Message "Rede: login de rede como '$netUser' nao foi aberto: $($netSession.Error)"
+            continue
+        }
+        Log-Message "Rede: a conta do servidor nao gravou em '$destTrimmed'. Tentando com o usuario de rede '$($netSession.Account)'..."
+        $destinationFailureReason = ""
+    }
+    try {
     for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
         try {
 
@@ -4911,10 +5017,14 @@ foreach ($destTrimmed in $resolvedDestList) {
             break
         } catch {
             Log-Message "Tentativa $attempt de copia para '$destTrimmed' falhou: $_"
+            if ($modoAcesso -eq "SENHA" -and (Test-IsNetworkLogonFailure $_)) {
+                $destinationFailureReason = "o terminal recusou o usuario de rede '$netUser': $(Get-NetworkLoginHint -Code 1326)"
+            }
             if ([string]::IsNullOrWhiteSpace($destinationFailureReason)) { $destinationFailureReason = "$_" }
-            # Servico sem permissao na pasta de rede: repetir nao adianta; vai direto para
-            # a copia pelo usuario logado (logo abaixo).
-            $semPermissao = ($isNetwork -and (Test-IsSystemAccount) -and (Test-IsAccessDeniedError $_))
+            # Servico sem permissao na pasta de rede: repetir nao adianta; passa para o
+            # proximo acesso (usuario de rede, depois usuario logado).
+            $semPermissao = ($isNetwork -and (Test-IsSystemAccount) -and ((Test-IsAccessDeniedError $_) -or (Test-IsNetworkLogonFailure $_)))
+            $acessoNegado = $semPermissao
             # Nao deixar arquivo reprovado na pasta: ele seria contado como "backup
             # existente" pelo monitor e pela numeracao sequencial, mascarando a falha.
             try {
@@ -4929,6 +5039,15 @@ foreach ($destTrimmed in $resolvedDestList) {
         if ($attempt -lt $retryCount) {
             Start-Sleep -Seconds $retryInterval
         }
+    }
+    } finally {
+        Exit-NetworkCredential $netSession
+    }
+    if ($destSuccess -and $modoAcesso -eq "SENHA") {
+        Log-Message "Rede: '$destTrimmed' gravado com o usuario de rede '$($netSession.Account)' (funciona com o servidor bloqueado, sem ninguem logado)."
+    }
+    # Terminal desligado ou fora da rede: trocar de conta nao adianta.
+    if (-not $destSuccess -and -not $acessoNegado) { break }
     }
 
     # O servico nao conseguiu gravar na pasta de rede: a copia e feita pelo usuario logado
@@ -4966,11 +5085,6 @@ foreach ($destTrimmed in $resolvedDestList) {
         } else {
             Log-Message "ERRO: Falha definitiva de copia para o destino local: $destTrimmed"
         }
-    }
-
-    # Libera a conexao WNet temporaria ao final de cada destino
-    if ($null -ne $wnetServer) {
-        Invoke-WNetDisconnect -UNCServer $wnetServer
     }
 }
 
