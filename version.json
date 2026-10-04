@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.52",
-    "releaseDate":  "2026-10-02",
+    "version":  "2.2.53",
+    "releaseDate":  "2026-10-04",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
     "changelog":  "1. Backup externo com o servidor bloqueado: a pasta de rede passa a ser acessada com login de rede proprio (LogonUser NEW_CREDENTIALS). O metodo da v2.2.51 (WNetAddConnection2) falhava como SYSTEM com o codigo 1312.\\n2. Acesso escolhido sozinho: conta do servidor sem senha (dominio), depois usuario e senha de rede, depois usuario logado.\\n3. Botao Testar Acesso como SYSTEM e monitor horario usam a mesma ordem e a mesma senha do backup.",
-    "setupSha256":  "9AF220D93A6D7500C6D63D83C49D323E0CD12630F3964A49B3E82BFF8CC0F69F",
-    "engineSha256":  "9338AF93765652FD4D0F58724D7DE7BD83C1E57824D2CBA6DE7ED8EC8E64E62C",
-    "signature":  "GLLXKQ8d1JLB8mz1FPiL4SeUvWvcztae3qe/WAyuCoV0PAmPiKrvogTh7P34eUQ6aWGCUQLG7zZJFwFXtyUUWZpz3naxxthsv44ERfe2QY94ylYUqY/69cMO5uc71VzqMe1U16MItVNhr6aLBUIh7zOAHaCLD7qcXRqQfb55N4c6nV8mXhamdH0CisH/KzYEpqJlORTqE5LxjCRYXTKktnVUH+1zMBe2VNjXbVUtxHWL2kLO2XLEQJ9muZ2GvXJ8cMTepnHHW/sGhula3RkPcZtOdg/qalF/5ECvf4W0rjpnpJvkPsSwNKeRy6kzMbCA0LZwsOHIFMzPL4+lsfBtDqf1NIhKHLWCHBaOU2s9/PaUJz9pNlM/K8CGA8CvOKcG650js1kk4Ytipe/TiPmJvofBYYnaV/FYQrP6z7a0DIsS/mW4U5pIr+k0YbPGJxENDdmDha9hcMAPYGqhUt8KgKYSIzKP/rM3dro8tN8TQ0WKZvOGuvpkJ3xRhWoXWCOG"
+    "setupSha256":  "D6F293B357E8B6A46FEA03F791131344EBD85F0A8BC61F13623F9B50C220041E",
+    "engineSha256":  "09DCD6EF8F2B4DBAB091555C727C84F0B3BC54A6010DD0069D57E785BB177722",
+    "signature":  "slnH0AY+UGJB00jCSfqoSjVmQZ67tBSa5M/skwkAOE2wUe9jhQEtTBg66C7GpNiFs756Duwt2AEMtg/SRwIQ6O2he5HX0OuM7sXy/H7GJr1dWcBS3dQ37OfZX7crBdJt/CxSqYxvGyHxPaPuVVYN17ZD7Qmfq6uisUx+Rp1vYr8tltsF0zUPUgEyyvEk2b8ElnN4rDcacaNEnmwF1MVK8hrYLiFvQ43CQbGdaqUF+yznAYzOcHehLrA/1hFmbNEkdSPGgP4C6GW50KU+DjaAiu6VOn8Wg+AP/7sxo3ljFI9Fo7z8alzLSc9A4tvetX0JrDpqRtPty64LC8Gml8ohXDnciWTUgLKJt1G7QBybAWxbCz71VfmqOa4XoAOD3GDcExQ7DMH6Fa4Th02Sjoc5IAlmhg+NcWP1EmhkJ5VqONXwEsmRw0835GW0FXCyIBHjcLOwUIynX1AojLx0tK6a9qr+Wck5KYjm6qA6JZIODKyUBKmNen5+95ynB4eCKIoK"
 }

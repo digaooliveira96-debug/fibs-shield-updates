@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.52"
+$script:EngineVersion = "2.2.53"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -734,7 +734,18 @@ try {
     foreach ($l in (Get-Content -LiteralPath $JobFile -Encoding UTF8)) { $p = $l.Split("`t", 2); if ($p.Count -eq 2) { $job[$p[0]] = $p[1] } }
     $res = $job["RESULT"]
     $dest = $job["DESTDIR"]
-    if (-not (Test-Path -LiteralPath $dest)) { New-Item -ItemType Directory -Path $dest -Force -ErrorAction Stop | Out-Null }
+    if (-not (Test-Path -LiteralPath $dest)) {
+        # \\terminal\pasta que nao abre: New-Item na raiz do compartilhamento so devolve
+        # "The path is not of a legal form" e esconde a causa real.
+        if ($dest.StartsWith("\\")) {
+            $partes = $dest.TrimStart('\').Split('\')
+            $raiz = "\\" + $partes[0] + "\" + $(if ($partes.Count -gt 1) { $partes[1] } else { "" })
+            if ($partes.Count -le 2 -or -not (Test-Path -LiteralPath $raiz)) {
+                throw "a pasta compartilhada '$raiz' nao abre nem para este usuario (terminal desligado, nome do computador mudou ou compartilhamento removido)"
+            }
+        }
+        New-Item -ItemType Directory -Path $dest -Force -ErrorAction Stop | Out-Null
+    }
     if ($job["MODE"] -eq "PROBE") {
         $probe = Join-Path $dest (".mecshield_teste_{0}.tmp" -f [Guid]::NewGuid().ToString("N"))
         try {
@@ -2906,7 +2917,7 @@ function Get-OptimalSandboxDir {
 # era gravada reescrevendo o config.json inteiro, concorrendo com a interface.
 function Get-AuditState {
     $f = Join-Path $scriptDir "audit_state.json"
-    $st = [PSCustomObject]@{ LastAuditDate = ""; LastResult = ""; ConsecutiveInconclusive = 0; LastInconclusiveAlert = $null; ConsecutiveNotRestorable = 0; LastNotRestorableAlert = $null }
+    $st = [PSCustomObject]@{ LastAuditDate = ""; LastResult = ""; ConsecutiveInconclusive = 0; LastInconclusiveAlert = $null; ConsecutiveNotRestorable = 0; LastNotRestorableAlert = $null; LastIndexWarning = ""; LastIndexWarningDate = "" }
     try {
         if (Test-Path $f) {
             $raw = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -2988,8 +2999,11 @@ function Send-AuditAlertNotification {
         $remoteBadges = Get-RemoteBadgesHtml -anyDeskId $cleanAnyDesk -teamViewerId $cleanTv
         $timestampNow = Get-Date -Format 'dd/MM/yyyy HH:mm:ss'
 
-        $recordColor = if ($RecordErrors -gt 0) { "#ef4444" } else { "#10b981" }
-        $pageColor = if ($PageErrors -gt 0) { "#ef4444" } else { "#10b981" }
+        # Valor negativo = gfix nao rodou (restauracao falhou antes): mostra "nao verificado", nunca um 0 verde
+        $recordColor = if ($RecordErrors -gt 0) { "#ef4444" } elseif ($RecordErrors -lt 0) { "#94a3b8" } else { "#10b981" }
+        $pageColor = if ($PageErrors -gt 0) { "#ef4444" } elseif ($PageErrors -lt 0) { "#94a3b8" } else { "#10b981" }
+        $recordText = if ($RecordErrors -lt 0) { "n&atilde;o verificado" } else { "$RecordErrors" }
+        $pageText = if ($PageErrors -lt 0) { "n&atilde;o verificado" } else { "$PageErrors" }
         $gapColor = if ($TransactionGap -ge 200000) { "#f59e0b" } else { "#10b981" }
         $limitColor = if ($NextTransaction -ge 1500000000) { "#ef4444" } else { "#10b981" }
 
@@ -3089,11 +3103,11 @@ function Send-AuditAlertNotification {
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#e2e8f0;">
                       <tr>
                         <td width="55%" bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Erros de N&iacute;vel de Registro (Record Errors):</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:800; font-size:15px; color:$recordColor;">$RecordErrors</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:800; font-size:15px; color:$recordColor;">$recordText</td>
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Erros de P&aacute;ginas de Banco (Page Errors):</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:800; font-size:15px; color:$pageColor;">$PageErrors</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:800; font-size:15px; color:$pageColor;">$pageText</td>
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Transaction Gap (Next - Oldest):</td>
@@ -3234,9 +3248,50 @@ function Get-GstatHeaderInfo {
     return $info
 }
 
+# Restauracao em que TODOS os dados voltaram e so indices/chaves nao reativaram.
+# Causa tipica: registro orfao ou duplicado no banco de producao (indice danificado
+# no banco ativo deixou passar). gfix -v nao acusa isso: e logico, nao fisico.
+# O gbak termina com "Database is not online due to failure to activate one or more
+# indices"; qualquer ERROR que nao seja de chave/indice desqualifica.
+function Test-IndexOnlyRestoreFailure {
+    param([string]$Output)
+    if (-not ("$Output" -match '(?i)failure to activate one or more indices')) { return $false }
+    $chave = '(?i)violation of FOREIGN KEY|Foreign key reference target does not exist|Foreign key references are present|violation of PRIMARY or UNIQUE KEY|attempt to store duplicate value|Problematic key value'
+    foreach ($linha in @("$Output" -split "`r?`n")) {
+        if ($linha -match '(?i)ERROR' -and -not ($linha -match $chave)) { return $false }
+    }
+    return $true
+}
+
+# Extrai do log do gbak os indices que nao reativaram, a tabela e o valor problematico.
+function Get-InactiveIndexDetails {
+    param([string]$Output)
+    $indices = @([regex]::Matches("$Output", '(?i)cannot commit index\s+"?([A-Za-z0-9_$]+)') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+    $tabelas = @([regex]::Matches("$Output", '(?i)on table\s+"([^"]+)"') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+    $chaves = @([regex]::Matches("$Output", '(?i)Problematic key value is\s+\(([^\r\n]+?)\)\s*(?:$|\r|\n)') | ForEach-Object { $_.Groups[1].Value.Trim() } | Select-Object -Unique)
+    $tipo = "registro inconsistente"
+    if ("$Output" -match '(?i)Foreign key reference target does not exist') { $tipo = "registro orfao (aponta para cadastro inexistente)" }
+    elseif ("$Output" -match '(?i)duplicate value|PRIMARY or UNIQUE KEY') { $tipo = "registro duplicado em chave unica" }
+    $partes = @()
+    $partes += "Indice(s): " + $(if ($indices.Count -gt 0) { $indices -join ", " } else { "nao identificado no log" })
+    if ($tabelas.Count -gt 0) { $partes += "Tabela(s): " + ($tabelas -join ", ") }
+    if ($chaves.Count -gt 0) { $partes += "Valor: " + ($chaves -join "; ") }
+    $partes += "Tipo: $tipo"
+    # Consulta de conferencia no banco ativo. O "+ 0" impede o uso do indice, que pode estar danificado.
+    $sql = ""
+    $mKey = [regex]::Match("$(if ($chaves.Count -gt 0) { $chaves[0] })", '^"([A-Za-z0-9_$]+)"\s*=\s*(.+)$')
+    if ($tabelas.Count -gt 0 -and $mKey.Success) {
+        $valor = $mKey.Groups[2].Value.Trim()
+        $cmp = if ($valor -match '^-?\d+$') { "$($mKey.Groups[1].Value) + 0 = $valor" } else { "$($mKey.Groups[1].Value) = $valor" }
+        $sql = "SELECT COUNT(*) FROM $($tabelas[0]) WHERE $cmp"
+    }
+    return [PSCustomObject]@{ Indexes = $indices; Tables = $tabelas; Keys = $chaves; Kind = $tipo; Sql = $sql; Summary = ($partes -join " | ") }
+}
+
 # Resultado da restauracao de teste (gbak -rep) na sandbox.
 #  OK             : codigo 0, FDB criado e sem "ERROR" na saida
 #  INCONCLUSIVO   : o Firebird recusou acesso (senha, servico, permissao)
+#  INDICE_INATIVO : dados restaurados; so indice/chave nao reativou (dado inconsistente no banco ativo)
 #  NAO_RESTAURAVEL: qualquer outra falha -> o arquivo de backup nao serve para desastre
 function Get-RestoreVerdict {
     param($ExitCode, [bool]$FdbExists, [long]$FdbSize, [string]$Output)
@@ -3246,6 +3301,10 @@ function Get-RestoreVerdict {
     }
     if (Test-FirebirdAccessProblem $Output) {
         return [PSCustomObject]@{ Verdict = "INCONCLUSIVO"; Reason = "O Firebird recusou a restauracao de teste por acesso/credencial (codigo $ExitCode)." }
+    }
+    if ($FdbExists -and $FdbSize -gt 0 -and (Test-IndexOnlyRestoreFailure $Output)) {
+        $det = Get-InactiveIndexDetails $Output
+        return [PSCustomObject]@{ Verdict = "INDICE_INATIVO"; Details = $det; Reason = "Backup restaurou com todos os dados, mas indice/chave nao reativou por dado inconsistente no banco de producao ($($det.Summary)). Nao e corrupcao fisica." }
     }
     return [PSCustomObject]@{ Verdict = "NAO_RESTAURAVEL"; Reason = "O backup mais recente NAO restaurou (gbak codigo $ExitCode, FDB criado: $FdbExists)." }
 }
@@ -3320,8 +3379,10 @@ function Invoke-DatabaseHealthAudit {
 
     $verdict = "OK"
     $motivos = @()
-    $recordErrors = 0
-    $pageErrors = 0
+    # -1 = gfix nao rodou (o e-mail mostra "nao verificado" em vez de um 0 enganoso)
+    $recordErrors = -1
+    $pageErrors = -1
+    $ressalvaIndice = $null
     $gfixLog = ""
     $oldestTrans = 0
     $nextTrans = 0
@@ -3467,13 +3528,35 @@ function Invoke-DatabaseHealthAudit {
         $gbakArgs = @("-rep", "-v", "`"$extractedFbkPath`"", "`"$sandboxDbPath`"")
         $rGbak = Invoke-ExternalTool -FilePath $gbakExe -Arguments ($gbakArgs -join " ") -Environment $fbEnv -TimeoutMs 7200000
         $saidaGbak = @("$($rGbak.StdOut)" -split "`r?`n")
-        $restoreText = "$($rGbak.StdErr)`n" + (($saidaGbak | Select-Object -Last 40) -join "`n")
+        # Linhas de erro anteriores as 40 ultimas (o indice que falhou pode estar no meio do log)
+        $errosAntes = @()
+        if ($saidaGbak.Count -gt 40) {
+            $errosAntes = @($saidaGbak[0..($saidaGbak.Count - 41)] | Where-Object { $_ -match '(?i)ERROR|cannot commit index' } | Select-Object -First 40)
+        }
+        $restoreText = "$($rGbak.StdErr)`n" + ((@($errosAntes) + @($saidaGbak | Select-Object -Last 40)) -join "`n")
         if ($rGbak.TimedOut) { $restoreText += "`nRestauracao de teste excedeu 2 horas e foi interrompida." }
         Remove-Item $extractedFbkPath -Force -ErrorAction SilentlyContinue; $extractedFbkPath = $null
 
         $fdbExists = Test-Path $sandboxDbPath
         $fdbSize = if ($fdbExists) { (Get-Item $sandboxDbPath).Length } else { 0 }
         $rv = Get-RestoreVerdict -ExitCode $rGbak.ExitCode -FdbExists $fdbExists -FdbSize $fdbSize -Output $restoreText
+        if ($rv.Verdict -eq "INDICE_INATIVO") {
+            # Dados completos; so indice/chave nao reativou. Nao e motivo de e-mail (decisao do
+            # usuario, 04/10/2026): liga o banco da SANDBOX e segue para a validacao fisica, que
+            # e quem decide se ha corrupcao de verdade.
+            $ressalvaIndice = $rv.Details
+            Log-Message "[AUDITORIA RESSALVA] $($rv.Reason)"
+            if (-not [string]::IsNullOrWhiteSpace($ressalvaIndice.Sql)) {
+                Log-Message "[AUDITORIA RESSALVA] Conferencia no banco ativo (sem usar o indice): $($ressalvaIndice.Sql). Correcao cabe ao suporte do Sismotel (Microtecs)."
+            }
+            $rOnline = Invoke-ExternalTool -FilePath $gfixExe -Arguments "-online `"$sandboxDbPath`"" -Environment $fbEnv -TimeoutMs 600000
+            if ($rOnline.ExitCode -eq 0 -and -not $rOnline.TimedOut) {
+                Log-Message "[AUDITORIA] Banco de sandbox colocado online (gfix -online) sem o(s) indice(s) inconsistente(s)."
+                $rv = [PSCustomObject]@{ Verdict = "OK"; Reason = "Restauracao de teste concluida com ressalva de indice." }
+            } else {
+                $rv = [PSCustomObject]@{ Verdict = "INCONCLUSIVO"; Reason = "Restauracao com indice inativo e gfix -online falhou na sandbox (codigo $($rOnline.ExitCode)): $("$($rOnline.StdErr)$($rOnline.StdOut)".Trim())" }
+            }
+        }
         if ($rv.Verdict -ne "OK") {
             $gfixLog = $restoreText
             if ($rv.Verdict -eq "NAO_RESTAURAVEL") { $verdict = "NAO_RESTAURAVEL" } elseif ($verdict -eq "OK") { $verdict = "INCONCLUSIVO" }
@@ -3494,7 +3577,9 @@ function Invoke-DatabaseHealthAudit {
             Log-Message "[AUDITORIA] Resultado da Verificacao Fisica: Record Errors = $recordErrors | Page Errors = $pageErrors ($($gv.Reason))"
             if ($gv.Verdict -eq "CORROMPIDO") {
                 $verdict = "CORROMPIDO"; $motivos += $gv.Reason
+                if ($null -ne $ressalvaIndice) { $motivos += "Alem disso, a restauracao nao reativou indice/chave: $($ressalvaIndice.Summary)." }
             } elseif ($gv.Verdict -eq "INCONCLUSIVO") {
+                $recordErrors = -1; $pageErrors = -1
                 if ($verdict -eq "OK") { $verdict = "INCONCLUSIVO" }
                 $motivos += $gv.Reason
             }
@@ -3527,8 +3612,17 @@ function Invoke-DatabaseHealthAudit {
         $auditState.ConsecutiveInconclusive = 0
         $auditState.ConsecutiveNotRestorable = 0
         $gapTxt = if ($transGap -ge $gapThreshold) { "Transaction Gap em $transGap (notificacao de e-mail silenciada)." } else { "Transaction Gap normal ($transGap)." }
-        Log-Message "[AUDITORIA 100% SUCESSO] Backup restaurado e banco FISICAMENTE INTEGRO! 0 erros de registro, 0 erros de paginas. $gapTxt"
-        Log-Message "[AUDITORIA ZERO SPAM] Operacao 100% silenciosa no e-mail conforme politica corporativa."
+        if ($null -ne $ressalvaIndice) {
+            $auditState.LastIndexWarning = $ressalvaIndice.Summary
+            $auditState.LastIndexWarningDate = (Get-Date -Format "yyyy-MM-dd")
+            Log-Message "[AUDITORIA OK COM RESSALVA] Backup restaurado com todos os dados e banco FISICAMENTE INTEGRO (0 erros de registro, 0 de pagina), mas indice/chave nao reativou: $($ressalvaIndice.Summary). Em desastre: restaurar e rodar gfix -online. $gapTxt"
+            Log-Message "[AUDITORIA ZERO SPAM] Dado inconsistente sem corrupcao fisica nao gera e-mail."
+        } else {
+            $auditState.LastIndexWarning = ""
+            $auditState.LastIndexWarningDate = ""
+            Log-Message "[AUDITORIA 100% SUCESSO] Backup restaurado e banco FISICAMENTE INTEGRO! 0 erros de registro, 0 erros de paginas. $gapTxt"
+            Log-Message "[AUDITORIA ZERO SPAM] Operacao 100% silenciosa no e-mail conforme politica corporativa."
+        }
     } elseif ($verdict -eq "INCONCLUSIVO") {
         $auditState.ConsecutiveInconclusive = [int]$auditState.ConsecutiveInconclusive + 1
         $auditState.ConsecutiveNotRestorable = 0
@@ -5060,15 +5154,19 @@ foreach ($destTrimmed in $resolvedDestList) {
             $networkSuccessList += $viaUser.FinalPath
             Log-Message "Backup GZ gravado e CONFERIDO em: $($viaUser.FinalPath) pelo usuario logado $($viaUser.User) (SHA-256 identico a origem; $($viaUser.Removed) backup(s) antigo(s) removido(s) pela retencao)"
         } else {
-            # Detecta automaticamente dominio vs workgroup para dar orientacao clara ao tecnico.
-            # Em dominio (AD/Kerberos) o SYSTEM autentica via maquina -- falha e de permissao de pasta.
-            # Em workgroup a credencial precisa ser registrada no cofre do SYSTEM via instalador.
+            # Mantem o motivo do servico (terminal fora do ar, senha recusada...) junto com o do
+            # usuario logado: antes o segundo apagava o primeiro e o e-mail dizia "sem permissao"
+            # mesmo com o terminal desligado.
+            $motivoServico = if ([string]::IsNullOrWhiteSpace($destinationFailureReason)) { "sem detalhe" } else { $destinationFailureReason }
             $ehDominio = try { (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).PartOfDomain } catch { $false }
-            if ($ehDominio) {
-                $destinationFailureReason = "o servico nao tem permissao na pasta e a copia pelo usuario logado falhou: $($viaUser.Message). DOMINIO DETECTADO: verifique a permissao de escrita da pasta '$destTrimmed' para o computador do servidor"
+            $orientacao = if (-not $acessoNegado) {
+                "Confira se o terminal esta ligado e se a pasta '$destTrimmed' abre no Explorer deste servidor."
+            } elseif ($ehDominio) {
+                "DOMINIO: libere gravacao na pasta '$destTrimmed' para o computador do servidor."
             } else {
-                $destinationFailureReason = "o servico nao tem permissao na pasta e a copia pelo usuario logado falhou: $($viaUser.Message). WORKGROUP DETECTADO: rode o instalador MEC Shield neste servidor e configure as credenciais do terminal de rede na tela 'Credenciais do Terminal de Rede'"
+                "WORKGROUP: gere o Setup TECNICO com o usuario e a senha do Windows do terminal e reinstale neste servidor."
             }
+            $destinationFailureReason = "o servico nao gravou ($motivoServico) e a copia pelo usuario logado tambem falhou ($($viaUser.Message)). $orientacao"
             Log-Message "AVISO DE REDE: '$destTrimmed': $destinationFailureReason"
         }
     }
