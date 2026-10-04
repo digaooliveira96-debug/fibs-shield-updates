@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.53"
+$script:EngineVersion = "2.2.54"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -785,12 +785,15 @@ if ($res) {
 # Roda o script na sessao do usuario por uma tarefa agendada temporaria ("somente
 # quando o usuario estiver logado": o Windows nao pede senha) e espera a resposta.
 function Invoke-AsLoggedOnUser {
-    param([string]$User, [string]$HelperFile, [string]$JobFile, [string]$ResultFile, [int]$TimeoutSec = 900)
+    param([string]$User, [string]$HelperFile, [string]$JobFile, [string]$ResultFile, [int]$TimeoutSec = 900, [switch]$Limited)
     $nome = "Copia_Rede_" + [Guid]::NewGuid().ToString("N").Substring(0, 12)
     try {
         $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ("-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"{0}`" -JobFile `"{1}`"" -f $HelperFile, $JobFile)
         $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds ($TimeoutSec + 120))
         try {
+            # Unidade do usuario (Google Drive, OneDrive): nivel normal, o mesmo token do
+            # Explorer. Um processo elevado pode nao enxergar a letra que o usuario ve.
+            if ($Limited) { throw "nivel normal pedido" }
             $prn = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
             Register-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Action $act -Principal $prn -Settings $set -Force -ErrorAction Stop | Out-Null
         } catch {
@@ -817,7 +820,8 @@ function Copy-ViaLoggedOnUser {
         [string]$ExpectedSha = "",
         [switch]$Probe,
         [int]$TimeoutSec = 900,
-        [string]$WorkRoot = ""
+        [string]$WorkRoot = "",
+        [switch]$NivelNormal
     )
     $users = @(Get-LoggedOnUsers)
     if ($users.Count -eq 0) {
@@ -838,7 +842,7 @@ function Copy-ViaLoggedOnUser {
             $modo = if ($Probe) { "PROBE" } else { "COPY" }
             $linhas = @("MODE`t$modo", "DESTDIR`t$DestDir", "SRC`t$SourceFile", "PREFIX`t$Prefix", "KEEP`t$Keep", "SHA`t$ExpectedSha", "RESULT`t$resFile")
             [System.IO.File]::WriteAllText($jobFile, ($linhas -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
-            Invoke-AsLoggedOnUser -User $u -HelperFile $helper -JobFile $jobFile -ResultFile $resFile -TimeoutSec $TimeoutSec
+            Invoke-AsLoggedOnUser -User $u -HelperFile $helper -JobFile $jobFile -ResultFile $resFile -TimeoutSec $TimeoutSec -Limited:$NivelNormal
             if (-not (Test-Path $resFile)) { $falhas += "${u}: sem resposta em $TimeoutSec s"; continue }
             $p = ([System.IO.File]::ReadAllText($resFile)).Split("`t")
             if ($p[0] -eq "OK") {
@@ -918,7 +922,7 @@ function Invoke-NetworkAccessTest {
             }
             $direto = "$direto | $comSenha"
         }
-        $v = Copy-ViaLoggedOnUser -DestDir $dest -Probe -TimeoutSec 120
+        $v = Copy-ViaLoggedOnUser -DestDir $dest -Probe -TimeoutSec 120 -NivelNormal:(-not $dest.StartsWith("\\"))
         if ($v.Ok) {
             $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Grava pelo usuario logado ($($v.User)). Precisa de alguem logado no servidor para a copia de rede (o backup local continua 24h). Servico: $direto" }
         } else {
@@ -2809,7 +2813,14 @@ function Test-ExternalDestinationsHealth {
                 $firstFail = [DateTime]::Parse($netTracker[$destTrim].FirstFailure)
                 $hoursSince = ((Get-Date) - $firstFail).TotalHours
                 if ([string]::IsNullOrWhiteSpace($detectedReason)) {
-                    $detectedReason = if (-not [string]::IsNullOrWhiteSpace($authFailureReason)) { $authFailureReason } else { "Terminal offline, pasta descompartilhada, ou pasta sem permissao para o servico e ninguem logado no servidor." }
+                    $raizDestino = [System.IO.Path]::GetPathRoot($destTrim)
+                    $detectedReason = if (-not [string]::IsNullOrWhiteSpace($authFailureReason)) {
+                        $authFailureReason
+                    } elseif (-not $destTrim.StartsWith("\\") -and -not [string]::IsNullOrWhiteSpace($raizDestino) -and -not (Test-Path $raizDestino)) {
+                        "A unidade $raizDestino so existe com um usuario logado (Google Drive, OneDrive ou unidade do usuario): ninguem logado no servidor, aplicativo de sincronizacao fechado ou a copia pela sessao do usuario falhou."
+                    } else {
+                        "Terminal offline, pasta descompartilhada, ou pasta sem permissao para o servico e ninguem logado no servidor."
+                    }
                 }
             }
 
@@ -4645,6 +4656,9 @@ if ($null -ne $destinations) {
 
 $resolvedDestList = @()
 $missingLocalDests = @()
+# Unidade com letra que so existe na sessao do usuario logado (Google Drive, OneDrive,
+# unidade do usuario): o servico nao a enxerga; a copia e feita pela sessao dele.
+$userDriveDests = @()
 foreach ($dest in $destList) {
     if ([string]::IsNullOrWhiteSpace($dest)) { continue }
     $destTrimmed = $dest.Trim()
@@ -4668,7 +4682,10 @@ foreach ($dest in $destList) {
             continue
         }
         $destRoot = [System.IO.Path]::GetPathRoot($destTrimmed)
-        if (-not (Test-Path $destRoot)) {
+        if (-not (Test-Path $destRoot) -and (Test-IsSystemAccount)) {
+            Log-Message "Unidade '$destRoot' nao aparece para o servico (Google Drive, OneDrive ou unidade do usuario). '$destTrimmed' sera copiado pelo usuario logado."
+            if (-not ($userDriveDests -contains $destTrimmed)) { $userDriveDests += $destTrimmed }
+        } elseif (-not (Test-Path $destRoot)) {
             Log-Message "FALHA DE DESTINO: A particao/unidade '$destRoot' nao existe neste computador (drive ausente ou inacessivel para a conta SYSTEM). Destino '$destTrimmed' registrado como FALHA."
             if (-not ($missingLocalDests -contains $destTrimmed)) {
                 $missingLocalDests += $destTrimmed
@@ -4678,7 +4695,9 @@ foreach ($dest in $destList) {
         }
     }
 }
-if ($resolvedDestList.Count -eq 0) {
+# Com unidade do usuario configurada nao grava a copia extra no C:; se a copia pela
+# sessao do usuario falhar, o fail-safe grava a copia de ultima linha.
+if ($resolvedDestList.Count -eq 0 -and $userDriveDests.Count -eq 0) {
     if (-not (Test-IsSystemReservedDrive -Path "C:\BKP_SISMOTEL")) {
         $resolvedDestList += "C:\BKP_SISMOTEL"
     }
@@ -4983,7 +5002,7 @@ $networkSuccessList = @()
 $failedDestinations = @($missingLocalDests)
 $destinationFailureReasons = @{}
 # Todos os destinos configurados da tarefa (ja traduzidos para UNC quando mapeados)
-$allDestinations = @($resolvedDestList) + @($missingLocalDests)
+$allDestinations = @($resolvedDestList) + @($userDriveDests) + @($missingLocalDests)
 
 foreach ($destTrimmed in $resolvedDestList) {
     # Motivo de falha pertence somente a este destino. Nunca reutilizar uma falha
@@ -5183,6 +5202,22 @@ foreach ($destTrimmed in $resolvedDestList) {
         } else {
             Log-Message "ERRO: Falha definitiva de copia para o destino local: $destTrimmed"
         }
+    }
+}
+
+# Unidade do usuario (Google Drive, OneDrive): mesma copia conferida por SHA-256 e mesma
+# retencao, feitas pela sessao do usuario logado (unico lugar onde a letra existe).
+foreach ($destTrimmed in $userDriveDests) {
+    Log-Message "Gravando backup GZ no destino [UNIDADE DO USUARIO] - $destTrimmed"
+    $viaUser = Copy-ViaLoggedOnUser -DestDir ($destTrimmed.TrimEnd('\', '/')) -SourceFile $tempGz -Prefix $basePrefix -Keep $keepBackupsCount -ExpectedSha $zipSha -NivelNormal
+    if ($viaUser.Ok) {
+        $networkSuccessList += $viaUser.FinalPath
+        Log-Message "Backup GZ gravado e CONFERIDO em: $($viaUser.FinalPath) pelo usuario logado $($viaUser.User) (SHA-256 identico a origem; $($viaUser.Removed) backup(s) antigo(s) removido(s) pela retencao)"
+    } else {
+        $motivoUnidade = "a unidade $([System.IO.Path]::GetPathRoot($destTrimmed)) so existe com um usuario logado (Google Drive, OneDrive ou unidade do usuario) e a copia pela sessao dele falhou: $($viaUser.Message)"
+        $destinationFailureReasons[$destTrimmed] = $motivoUnidade
+        if (-not ($failedDestinations -contains $destTrimmed)) { $failedDestinations += $destTrimmed }
+        Log-Message "AVISO DE DESTINO: '$destTrimmed': $motivoUnidade"
     }
 }
 
