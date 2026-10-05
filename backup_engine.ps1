@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.54"
+$script:EngineVersion = "2.2.55"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -694,6 +694,27 @@ function Test-IsSystemAccount {
 }
 
 # Falta de permissao (e nao rede fora do ar): repetir com a mesma conta nao adianta.
+# Abre a raiz \\terminal\pasta e devolve $null (abriu) ou a excecao certa. Test-Path so
+# responde "nao": o motor tratava "sem permissao" como "terminal desligado" e nem tentava
+# o usuario e senha de rede (KIBBUTZ, 04/10/2026, \\DESKTOP-K9GPBOS\c$). Se o terminal
+# responde na porta 445, a falha e de permissao e o proximo acesso deve ser tentado.
+function New-UncRootError {
+    param([string]$Root, [bool]$PortaSmbOk)
+    $erro = $null
+    try {
+        [void][System.IO.Directory]::GetDirectories($Root)
+        return $null
+    } catch {
+        $erro = $_.Exception
+        if ($erro -is [System.Management.Automation.MethodInvocationException] -and $null -ne $erro.InnerException) { $erro = $erro.InnerException }
+    }
+    $detalhe = "$($erro.Message)".Trim()
+    if ($PortaSmbOk -or $erro -is [System.UnauthorizedAccessException] -or $detalhe -match '(?i)access.*denied|acesso.*negado|logon|user name or password|usu.rio ou (a )?senha') {
+        return (New-Object System.UnauthorizedAccessException("Sem permissao para esta conta em '$Root' (o terminal responde na rede): $detalhe"))
+    }
+    return (New-Object System.IO.IOException("O compartilhamento base '$Root' esta inacessivel ou nao existe no servidor remoto: $detalhe"))
+}
+
 function Test-IsAccessDeniedError {
     param($ErrorRecord)
     $ex = $ErrorRecord.Exception
@@ -5020,11 +5041,13 @@ foreach ($destTrimmed in $resolvedDestList) {
     # O primeiro que gravar e conferir o SHA-256 vale; o log diz qual foi usado.
     $modosAcesso = @("DIRETO")
     $netUser = $null; $netPass = $null
+    $portaSmbOk = $false
     if ($isNetwork -and (Test-IsSystemAccount)) {
         $netUser = if (-not [string]::IsNullOrWhiteSpace($task.NetworkUser)) { Unprotect-String $task.NetworkUser } else { $null }
         $netPass = if (-not [string]::IsNullOrWhiteSpace($task.NetworkPassword)) { Unprotect-String $task.NetworkPassword } else { "" }
         if (-not [string]::IsNullOrWhiteSpace($netUser)) { $modosAcesso += "SENHA" }
-        if (-not (Test-SmbPort -UNCPath $destTrimmed)) {
+        $portaSmbOk = Test-SmbPort -UNCPath $destTrimmed
+        if (-not $portaSmbOk) {
             Log-Message "Rede: o terminal de '$destTrimmed' nao respondeu na porta 445 em 2 s (desligado, fora da rede ou firewall). Tentando mesmo assim."
         }
     }
@@ -5063,13 +5086,15 @@ foreach ($destTrimmed in $resolvedDestList) {
                 if ($uncParts.Length -le 2) {
                     # Trata-se de \\servidor\compartilhamento raiz
                     if (-not (Test-Path $destClean)) {
-                        throw "O compartilhamento de rede '$destClean' esta inacessivel ou nao existe no servidor remoto."
+                        $erroRaiz = New-UncRootError -Root $destClean -PortaSmbOk $portaSmbOk
+                        if ($null -ne $erroRaiz) { throw $erroRaiz }
                     }
                 } else {
                     # Trata-se de \\servidor\compartilhamento\subpasta ou \\servidor\c$\subpasta
                     $uncRoot = "\\$($uncParts[0])\$($uncParts[1])"
                     if (-not (Test-Path $uncRoot)) {
-                        throw "O compartilhamento base '$uncRoot' esta inacessivel ou nao existe no servidor remoto."
+                        $erroRaiz = New-UncRootError -Root $uncRoot -PortaSmbOk $portaSmbOk
+                        if ($null -ne $erroRaiz) { throw $erroRaiz }
                     }
                     if (-not (Test-Path $destClean)) {
                         try {
