@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.55"
+$script:EngineVersion = "2.2.56"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -286,8 +286,13 @@ function Get-FailureDiagnosis {
            Titulo = "O arquivo do banco n&atilde;o foi encontrado"
            Causa  = "O banco n&atilde;o est&aacute; no caminho configurado na tarefa (foi movido, renomeado ou o disco sumiu)."
            Passos = @("Localizar o arquivo <code>.FDB</code> usado pelo Sismotel.", "Corrigir o caminho do banco na tarefa pelo painel.") }
+        @{ Codigo = "COMPACTACAO_CORROMPIDA"
+           Padrao = "ERRO na compactacao do GZ|GZ GERADO ESTA CORROMPIDO|Falha na Compactacao"
+           Titulo = "Falha de integridade na compacta&ccedil;&atilde;o do backup"
+           Causa  = "O arquivo compactado .GZ n&atilde;o passou na confer&ecirc;ncia rigorosa de integridade: o conte&uacute;do descompactado n&atilde;o confere com o .fbk original (SHA-256 divergente). O MEC Shield descartou o arquivo para n&atilde;o salvar um backup corrompido."
+           Passos = @("Verificar se o antiv&iacute;rus/Windows Defender bloqueou a pasta tempor&aacute;ria durante a compacta&ccedil;&atilde;o (adicionar <code>C:\Microtecs\FIBS</code> e pastas Temp nas exclus&otilde;es).", "Conferir a sa&uacute;de do disco local: no PowerShell como Administrador rodar <code>Get-Volume C | select HealthStatus</code>.", "Se o disco n&atilde;o estiver <code>Healthy</code>, rodar <code>chkdsk C: /f</code> fora do hor&aacute;rio de pico.", "Se o banco for muito grande (> 2 GB), rodar a tarefa manualmente pelo painel e acompanhar a compacta&ccedil;&atilde;o.") }
         @{ Codigo = "COPIA_LOCAL"
-           Padrao = "nao confere com a origem|corrupcao silenciosa|Falha ao Gravar nos Discos Locais|Nao foi possivel gravar nos discos locais"
+           Padrao = "nao confere com a origem|COPIA CORROMPIDA|Falha ao Gravar nos Discos Locais|Nao foi possivel gravar nos discos locais"
            Titulo = "A c&oacute;pia no disco de destino falhou ou chegou alterada"
            Causa  = "O backup foi gerado, mas a grava&ccedil;&atilde;o no disco de destino falhou ou n&atilde;o bateu com o original: disco cheio, sem permiss&atilde;o ou com erro no sistema de arquivos."
            Passos = @("Ver o espa&ccedil;o livre do disco de destino.", "No PowerShell como Administrador: <code>Get-Volume | select DriveLetter,HealthStatus</code>.", "Se o disco n&atilde;o estiver <code>Healthy</code>, rodar <code>chkdsk X: /f</code> fora do hor&aacute;rio de pico.") }
@@ -4956,58 +4961,84 @@ Log-Message "Origem: $fbkEntryName | $([math]::Round($fbkSizeBytes/1MB,2)) MB | 
 Log-Message "Compactando backup para arquivo .GZ (Compressao Maxima em Prioridade Baixa)..."
 $gzSizeMB = 0
 $zipSha = $null
-try {
-    if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
-    
-    $compressionSuccess = $false
+$maxCompAttempts = 2
+$compSuccessFinal = $false
+$lastCompError = ""
+
+for ($compAttempt = 1; $compAttempt -le $maxCompAttempts; $compAttempt++) {
     try {
-        try {
-            Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
-            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
-        } catch {
-            [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression") | Out-Null
-            [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem") | Out-Null
-        }
-        
-        $zip = [System.IO.Compression.ZipFile]::Open($tempGz, [System.IO.Compression.ZipArchiveMode]::Create)
-        $entryName = Split-Path $tempFbk -Leaf
-        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $tempFbk, $entryName, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
-        $zip.Dispose()
-        $compressionSuccess = $true
-    } catch {
-        Log-Message "Aviso: API de compactacao nativa falhou. Usando fallback Compress-Archive..."
         if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
-        Compress-Archive -Path $tempFbk -DestinationPath $tempGz -CompressionLevel Optimal -Force -ErrorAction Stop
-        $compressionSuccess = $true
-    }
-
-    if ($compressionSuccess -and (Test-Path $tempGz) -and ((Get-Item $tempGz).Length -gt 0)) {
-        $gzSizeMB = [math]::Round(((Get-Item $tempGz).Length / 1MB), 2)
-
-        # PORTAO DE INTEGRIDADE: le o GZ de volta e confere o conteudo contra o .fbk.
-        # So passando daqui o .fbk original pode ser descartado.
-        Log-Message "Verificando integridade do GZ gerado (releitura + SHA-256)..."
-        $verif = Test-BackupGzIntegrity -GzPath $tempGz -ExpectedEntryName $fbkEntryName -ExpectedSize $fbkSizeBytes -ExpectedSha256 $fbkSha
-        if (-not $verif.Ok) {
-            throw "GZ GERADO ESTA CORROMPIDO. $($verif.Reason)"
+        
+        $compressionSuccess = $false
+        try {
+            try {
+                Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+                Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+            } catch {
+                [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression") | Out-Null
+                [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem") | Out-Null
+            }
+            
+            $zip = [System.IO.Compression.ZipFile]::Open($tempGz, [System.IO.Compression.ZipArchiveMode]::Create)
+            $entryName = Split-Path $tempFbk -Leaf
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $tempFbk, $entryName, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+            $zip.Dispose()
+            $compressionSuccess = $true
+        } catch {
+            Log-Message "Aviso: API de compactacao nativa falhou. Usando fallback Compress-Archive..."
+            if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
+            Compress-Archive -Path $tempFbk -DestinationPath $tempGz -CompressionLevel Optimal -Force -ErrorAction Stop
+            $compressionSuccess = $true
         }
-        Log-Message "Integridade do GZ CONFIRMADA: $($verif.Reason)"
 
-        # Impressao digital do proprio GZ, usada para conferir cada copia nos destinos
-        $zipSha = Get-Sha256OfFile -Path $tempGz
-        if ([string]::IsNullOrWhiteSpace($zipSha)) { throw "Nao foi possivel calcular o SHA-256 do GZ verificado." }
+        if ($compressionSuccess -and (Test-Path $tempGz) -and ((Get-Item $tempGz).Length -gt 0)) {
+            $gzSizeMB = [math]::Round(((Get-Item $tempGz).Length / 1MB), 2)
 
-        $global:zipTimer.Stop()
-        $zipElapsedStr = Format-DurationText $global:zipTimer.Elapsed
-        Log-Message "Arquivo GZ gerado e verificado: $tempGz ($gzSizeMB MB) em $zipElapsedStr | SHA-256 $($zipSha.Substring(0,16))..."
+            # PORTAO DE INTEGRIDADE: le o GZ de volta e confere o conteudo contra o .fbk.
+            # So passando daqui o .fbk original pode ser descartado.
+            Log-Message "Verificando integridade do GZ gerado (releitura + SHA-256)..."
+            $verif = Test-BackupGzIntegrity -GzPath $tempGz -ExpectedEntryName $fbkEntryName -ExpectedSize $fbkSizeBytes -ExpectedSha256 $fbkSha
+            if (-not $verif.Ok) {
+                # Se falhou, da uma pequena pausa (antivirus/flush de disco) e tenta re-conferir uma vez antes de descartar
+                Log-Message "Aviso: Primeira conferencia do GZ acusou divergencia ($($verif.Reason)). Aguardando 3s para re-conferencia..."
+                Start-Sleep -Seconds 3
+                [System.GC]::Collect()
+                $verif = Test-BackupGzIntegrity -GzPath $tempGz -ExpectedEntryName $fbkEntryName -ExpectedSize $fbkSizeBytes -ExpectedSha256 $fbkSha
+            }
 
-        # Agora sim e seguro remover o FBK bruto para poupar espaco em disco
-        Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue
-    } else {
-        throw "Arquivo GZ nao foi gerado corretamente ou esta vazio."
+            if (-not $verif.Ok) {
+                throw "GZ GERADO ESTA CORROMPIDO. $($verif.Reason)"
+            }
+            Log-Message "Integridade do GZ CONFIRMADA: $($verif.Reason)"
+
+            # Impressao digital do proprio GZ, usada para conferir cada copia nos destinos
+            $zipSha = Get-Sha256OfFile -Path $tempGz
+            if ([string]::IsNullOrWhiteSpace($zipSha)) { throw "Nao foi possivel calcular o SHA-256 do GZ verificado." }
+
+            $global:zipTimer.Stop()
+            $zipElapsedStr = Format-DurationText $global:zipTimer.Elapsed
+            Log-Message "Arquivo GZ gerado e verificado: $tempGz ($gzSizeMB MB) em $zipElapsedStr | SHA-256 $($zipSha.Substring(0,16))..."
+
+            # Agora sim e seguro remover o FBK bruto para poupar espaco em disco
+            Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue
+            $compSuccessFinal = $true
+            break
+        } else {
+            throw "Arquivo GZ nao foi gerado corretamente ou esta vazio."
+        }
+    } catch {
+        $lastCompError = "$_"
+        if ($compAttempt -lt $maxCompAttempts) {
+            Log-Message "Aviso: Tentativa $compAttempt de compactacao/verificacao falhou ($lastCompError). Aguardando 5s para retentar..."
+            if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
+            Start-Sleep -Seconds 5
+            [System.GC]::Collect()
+        }
     }
-} catch {
-    $errMsg = "ERRO na compactacao do GZ: $_"
+}
+
+if (-not $compSuccessFinal) {
+    $errMsg = "ERRO na compactacao do GZ: $lastCompError"
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha na Compactacao ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
     if (Test-Path $tempFbk) { Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue }

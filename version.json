@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.55",
-    "releaseDate":  "2026-10-04",
+    "version":  "2.2.56",
+    "releaseDate":  "2026-10-07",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Backup externo com o servidor bloqueado: a pasta de rede passa a ser acessada com login de rede proprio (LogonUser NEW_CREDENTIALS). O metodo da v2.2.51 (WNetAddConnection2) falhava como SYSTEM com o codigo 1312.\\n2. Acesso escolhido sozinho: conta do servidor sem senha (dominio), depois usuario e senha de rede, depois usuario logado.\\n3. Botao Testar Acesso como SYSTEM e monitor horario usam a mesma ordem e a mesma senha do backup.",
-    "setupSha256":  "9F2E792FECA791418AE46CD011C249B8ADCEACB7195C0AF3B001E3B0E4340BFE",
-    "engineSha256":  "3B8A70123C2F870EE5B3D202F73D468E63108DFCF18DF6BA4DD2E7C72D6C1C7C",
-    "signature":  "m/DuGajFlKCDESltCIL25H2CtzY07ij13Buy8dyGstTrzgYWIYTmOySkzx7eSlxc5U13TuXx1T1lOFR4hZ+lWKg+d2mwhdQuL5b33k2Ianf2pd7Bbqgmk1GPyzZoRKRwVik2QjSMHQ+04L3feIiSwX1vj41J7VjCHn85zzxa9MzT1iw5O7y65uiR/ZDYk8iKnTw5dKrPe23t2bDy97rGme6JDtfLWyrfZlvW/gaQkNowskmAPlO4UKgNvVNdFff0uU9cIF5drMkPKsu6V6XL5KXlYLOhQ59SN5XeIGCvtXz4oiSPGp1SGSbawGN55p71NqwHTXPQSpAkG/3eKYNdXYze+7eDbKcR/RIKGwC27pSYpik/ijga4JmAA4wclV7p860sEg8z9i3A/Om5GS2CkR87mQFAlLZv3o3vKbLlCCU4WPIhw0mS46hoLgtSMwYndT27TW3EcI70B9Uvi1btmSL+ciJO6mlgxfd2WW0iQ0GknVOb+Cf7RGvVvxH1Htib"
+    "changelog":  "1. Diagnostico claro para falha na compactacao do GZ: classificacao COMPACTACAO_CORROMPIDA evita falso alerta de erro em disco de destino.\\n2. Laco de retentativa com pausa de flushing/antivirus no portao de integridade do GZ antes de declarar corrupcao silenciosa.",
+    "setupSha256":  "35326FB63DFDA5EDE2EEC850CB17129E4ABEB54A4233335215DC014B6FD69AE5",
+    "engineSha256":  "0ADE4508898642FE966028FB2E440AB6257DDFE88B10B300354CFF0D9E9A4E5A",
+    "signature":  "htG8HzNcs+qIb9ZmfRdecIpEmpUr546IJ3I/WZPsQ1BbWFveTNAZUq8lGpUQZT64smIyuhbKi8/KG3gK7KlrQyDzZ7G2tmTyOYisk9YWYcfKcR+5XbeovnnH7ijN08mXISb54QIerefVwRSPOacAUh8Thwp7hCyWvv3roeastcAKyCKiwv/2pgAZs6JBfaZoUITUJKGyOn+rv7NAOXusMNHGfMZYYjcOFZp+xBOSAWMvAPyNHUSiXL93layrdvesaH9+7eIz3x53hn26ekhP54o1Z8WUuR69GcXDzgGN9Yd0tz26dDX1o6oOY4PJdM5Edy0LSDcQDq2ITwHsxjzWKxf0ncPNZaNvFibn1nrz2cDsYu5g712WZtDjpQIxNTBCY6H/KGH8GQ9QqMzwmpLqtOnqKM/i5Bx/wcIIky/JqG2y8nel20bSmV2VUBcvjmR/yd5JAA/Z3J8SCzxLs7zIqlCrIC2zBtlFucBSqzBYEVS+14iDRx5ekY43Y4It/hsk"
 }
