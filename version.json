@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.56",
-    "releaseDate":  "2026-10-07",
+    "version":  "2.2.58",
+    "releaseDate":  "2026-10-09",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Diagnostico claro para falha na compactacao do GZ: classificacao COMPACTACAO_CORROMPIDA evita falso alerta de erro em disco de destino.\\n2. Laco de retentativa com pausa de flushing/antivirus no portao de integridade do GZ antes de declarar corrupcao silenciosa.",
-    "setupSha256":  "35326FB63DFDA5EDE2EEC850CB17129E4ABEB54A4233335215DC014B6FD69AE5",
-    "engineSha256":  "0ADE4508898642FE966028FB2E440AB6257DDFE88B10B300354CFF0D9E9A4E5A",
-    "signature":  "htG8HzNcs+qIb9ZmfRdecIpEmpUr546IJ3I/WZPsQ1BbWFveTNAZUq8lGpUQZT64smIyuhbKi8/KG3gK7KlrQyDzZ7G2tmTyOYisk9YWYcfKcR+5XbeovnnH7ijN08mXISb54QIerefVwRSPOacAUh8Thwp7hCyWvv3roeastcAKyCKiwv/2pgAZs6JBfaZoUITUJKGyOn+rv7NAOXusMNHGfMZYYjcOFZp+xBOSAWMvAPyNHUSiXL93layrdvesaH9+7eIz3x53hn26ekhP54o1Z8WUuR69GcXDzgGN9Yd0tz26dDX1o6oOY4PJdM5Edy0LSDcQDq2ITwHsxjzWKxf0ncPNZaNvFibn1nrz2cDsYu5g712WZtDjpQIxNTBCY6H/KGH8GQ9QqMzwmpLqtOnqKM/i5Bx/wcIIky/JqG2y8nel20bSmV2VUBcvjmR/yd5JAA/Z3J8SCzxLs7zIqlCrIC2zBtlFucBSqzBYEVS+14iDRx5ekY43Y4It/hsk"
+    "changelog":  "1. Integracao nativa do 7-Zip (7z.exe e 7z.dll): eliminacao definitiva do limite de 2 GB em bancos Firebird grandes (Incidente SRVCC).\\n2. Correcao de precedencia no diagnostico de e-mail: tarefas de rede agora priorizam erros tecnicos locais em vez de falso alerta de rede.\\n3. Suporte nativo completo a bancos de dados Firebird de qualquer tamanho no Sismotel.",
+    "setupSha256":  "2BA52446919272A06D49CC2BE10677CF5471822F850489103FA2A1376D039428",
+    "engineSha256":  "6D81330A046DF6E4AA96E72E6E9B57A8CBDA255B04F595043D2BF280E47B27A6",
+    "signature":  "CideRH66VaM80+jXa1j1XZi+rJUq3/g9O6n7k/asd7OjHFEOF4c4Dncq3/cGLa/iKkVgh8fi7sc3tX1xWVyGGQIg08w6IhkN2rLnOVZcq0ifXlZbi8oKpdVNlo33iyYTr+EkAcKVnwOocBLlyqzQ0hz3HjChdXu+LdbfasxrHcWIhgkCylac2FzGbhrLYcFMIlRtWU28LE/4+sTNG12eq1qFks7CeAnxN7Qv+RgZMCKBvx79LN5I5gOQvlsS857J4ginTo+tU1BQtSRPIMKAxdWBc0CKxfxCp2PUm+ipo9rl7b+DQ9QYPAs9HGZ9/RoNiokNBBxuJhzzNvrNIk2hqa05OS1sjFZqiRat7ZTy0uENEaD2vVMP53hCHHIffxxUbBIfiS+kO4rGhxPeZ/QE5Tpz2Xe+7JBgIJDZrI7Cx5uOc7r6ceh6gTRi9LHRPG1irzt+RWq+yqlMqRuaEA+7+ioVtLB8CHq2B9yE1wnfQMMCK71RXswz+5pd3yNKZBu8"
 }

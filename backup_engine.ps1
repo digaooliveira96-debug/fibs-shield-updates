@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.56"
+$script:EngineVersion = "2.2.58"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -330,25 +330,9 @@ function Convert-PlainPasswordsInConfig {
                 $mudou = $true; $campos += "SmtpPass"
             }
             foreach ($t in $cfg.Tasks) {
-                # NetworkCredentialCustom = $true: tecnico configurou credencial especifica via Setup TECNICO.
-                # O motor respeita e NAO sobrescreve com o padrao MEC. Caso contrario (null/false),
-                # aplica administrador/mecinfo automaticamente via OTA, sem intervencao do tecnico.
-                $credCustom = ($t.NetworkCredentialCustom -eq $true -or "$($t.NetworkCredentialCustom)".Trim().ToLower() -eq 'true')
-                if (-not $credCustom) {
-                    # Migracao e auto-restauracao das credenciais de rede padrao MEC:
-                    # - null  = tarefa antiga sem credencial (primeira execucao apos OTA)
-                    # - vazio = interface limpou ao salvar (UI nao exibe credencial de rede)
-                    # Nao sobrescreve blob DPAPI valido.
-                    if ($null -eq $t.NetworkUser -or [string]::IsNullOrWhiteSpace($t.NetworkUser)) {
-                        $t | Add-Member -NotePropertyName NetworkUser -NotePropertyValue "administrador" -Force
-                        $mudou = $true; $campos += "$($t.TaskName).NetworkUser (padrao MEC)"
-                    }
-                    if ($null -eq $t.NetworkPassword -or [string]::IsNullOrWhiteSpace($t.NetworkPassword)) {
-                        # Add-Member cobre tambem tarefas antigas sem a propriedade
-                        $t | Add-Member -NotePropertyName NetworkPassword -NotePropertyValue "mecinfo" -Force
-                        $mudou = $true; $campos += "$($t.TaskName).NetworkPassword (padrao MEC)"
-                    }
-                }
+                # A credencial de rede NAO e mais embutida neste motor (que e publico): o Setup TECNICO grava
+                # NetworkUser/NetworkPassword (cifrada via DPAPI) e NetworkCredentialCustom=true na instalacao.
+                # Tarefa sem credencial segue pelas tentativas 1 (conta do servidor) e 3 (usuario logado).
                 foreach ($nome in @("DbPassword", "NetworkPassword")) {
                     $valor = $t.$nome
                     if (-not [string]::IsNullOrWhiteSpace($valor) -and -not (Test-IsDpapiBlob $valor)) {
@@ -623,7 +607,7 @@ function Get-NetworkLoginHint {
     switch ($Code) {
         53   { return "Terminal desligado, fora da rede ou firewall bloqueando a porta 445." }
         86   { return "Senha incorreta para este usuario no terminal." }
-        1326 { return "Senha ou usuario incorretos. Configure a credencial correta via Setup TECNICO ou defina NetworkCredentialCustom=true no config.json." }
+        1326 { return "Senha ou usuario incorretos. Gere e rode o Setup TECNICO com o usuario e a senha corretos do terminal." }
         1331 { return "Conta de usuario desativada no Windows do terminal. Ative a conta ou use outra via Setup TECNICO." }
         1907 { return "Senha da conta expirada no terminal. Redefina a senha ou use conta sem expiracao." }
         default { return "Verifique se o compartilhamento esta acessivel e se a conta tem permissao." }
@@ -1005,9 +989,29 @@ function Invoke-NetworkAccessTestFromRequest {
 # 2012 R2) o portao do GZ falhava em TODA rotina e nenhum backup era gravado.
 function Get-Sha256OfStream {
     param([System.IO.Stream]$Stream)
+    $res = Get-Sha256OfStreamWithMetrics -Stream $Stream
+    if ($null -ne $res) { return $res.Hash }
+    return $null
+}
+
+function Get-Sha256OfStreamWithMetrics {
+    param([System.IO.Stream]$Stream)
     $alg = [System.Security.Cryptography.SHA256]::Create()
-    try { return [System.BitConverter]::ToString($alg.ComputeHash($Stream)).Replace("-", "") }
-    finally { $alg.Clear() }
+    $buf = New-Object byte[] (64 * 1024)
+    [long]$total = 0
+    try {
+        while (($read = $Stream.Read($buf, 0, $buf.Length)) -gt 0) {
+            $total += $read
+            $alg.TransformBlock($buf, 0, $read, $buf, 0) | Out-Null
+        }
+        $alg.TransformFinalBlock($buf, 0, 0) | Out-Null
+        $hash = [System.BitConverter]::ToString($alg.Hash).Replace("-", "")
+        return @{ Hash = $hash; BytesRead = $total }
+    } catch {
+        return $null
+    } finally {
+        $alg.Clear()
+    }
 }
 
 function Get-Sha256OfFile {
@@ -1027,7 +1031,20 @@ function Get-Sha256OfFile {
 function Get-GzFileFormat {
     param([string]$Path)
     try {
-        $bytes = [System.IO.File]::ReadAllBytes($Path) | Select-Object -First 8
+        # Le so os 8 primeiros bytes (a leitura do arquivo inteiro falhava acima de 2 GB)
+        $bytes = New-Object byte[] 8
+        $fsMagic = $null
+        try {
+            $fsMagic = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $lidos = 0
+            while ($lidos -lt 8) {
+                $n = $fsMagic.Read($bytes, $lidos, (8 - $lidos))
+                if ($n -le 0) { break }
+                $lidos += $n
+            }
+        } finally {
+            if ($fsMagic) { $fsMagic.Dispose() }
+        }
         if ($bytes[0] -eq 0x50 -and $bytes[1] -eq 0x4B) { return "ZIP" }
         if ($bytes[0] -eq 0x1F -and $bytes[1] -eq 0x8B) { return "GZIP" }
         if ($bytes[0] -eq 0x52 -and $bytes[1] -eq 0x61 -and $bytes[2] -eq 0x72 -and $bytes[3] -eq 0x21 -and $bytes[4] -eq 0x1A -and $bytes[5] -eq 0x07) {
@@ -1125,9 +1142,16 @@ function Test-BackupGzIntegrity {
                 return @{ Ok = $false; Reason = "Tamanho descompactado divergente: GZ diz $($entry.Length) bytes, o .fbk tinha $ExpectedSize bytes." }
             }
             $stream = $entry.Open()
-            try { $hash = Get-Sha256OfStream -Stream $stream }
+            $metrics = $null
+            try { $metrics = Get-Sha256OfStreamWithMetrics -Stream $stream }
             finally { $stream.Close() }
-            if ($hash -ne $ExpectedSha256) {
+            if ($null -eq $metrics) {
+                return @{ Ok = $false; Reason = "Falha ao ler o stream de descompactacao do GZ." }
+            }
+            if ($metrics.BytesRead -ne $ExpectedSize) {
+                return @{ Ok = $false; Reason = "Leitura do GZ incompleta (stream truncado): leu $($metrics.BytesRead) bytes de $ExpectedSize bytes esperados." }
+            }
+            if ($metrics.Hash -ne $ExpectedSha256) {
                 return @{ Ok = $false; Reason = "SHA-256 do conteudo descompactado nao confere com o .fbk original (corrupcao silenciosa)." }
             }
             return @{ Ok = $true; Reason = "Conteudo conferido por SHA-256 (formato ZIP)." }
@@ -1136,9 +1160,16 @@ function Test-BackupGzIntegrity {
             # Formato GZIP nativo (gerado por ferramenta externa ao FIBS)
             $fsIn  = [System.IO.File]::OpenRead($GzPath)
             $gzip  = New-Object System.IO.Compression.GZipStream($fsIn, [System.IO.Compression.CompressionMode]::Decompress)
-            try { $hash = Get-Sha256OfStream -Stream $gzip }
+            $metrics = $null
+            try { $metrics = Get-Sha256OfStreamWithMetrics -Stream $gzip }
             finally { $gzip.Close(); $fsIn.Close() }
-            if ($hash -ne $ExpectedSha256) {
+            if ($null -eq $metrics) {
+                return @{ Ok = $false; Reason = "Falha ao ler o stream de descompactacao GZIP nativo." }
+            }
+            if ($metrics.BytesRead -ne $ExpectedSize) {
+                return @{ Ok = $false; Reason = "Leitura do GZIP incompleta (stream truncado): leu $($metrics.BytesRead) bytes de $ExpectedSize bytes esperados." }
+            }
+            if ($metrics.Hash -ne $ExpectedSha256) {
                 return @{ Ok = $false; Reason = "SHA-256 do conteudo descompactado nao confere com o .fbk original (GZIP nativo, corrupcao silenciosa)." }
             }
             return @{ Ok = $true; Reason = "Conteudo conferido por SHA-256 (formato GZIP nativo)." }
@@ -1718,7 +1749,16 @@ function Send-BackupNotification {
         }
 
         $isNetFailure = ($isOddTask -or $SubjectInfo -match "Externo|Rede|Terminal" -or $BodyDetails -match "CONECTIVIDADE|REDE EXTERNA")
-        $recActionsHtml = if ($isNetFailure) {
+        $recActionsHtml = if ($null -ne $diag) {
+            $passosHtml = "<div style='margin-bottom:8px;'><strong>1.</strong> Conectar no servidor via AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).</div>"
+            $n = 2
+            foreach ($passo in $diag.Passos) {
+                $passosHtml += "<div style='margin-bottom:8px;'><strong>$n.</strong> $passo</div>"
+                $n++
+            }
+            $passosHtml += "<div style='font-size:12px; color:#94a3b8;'>Log completo da rotina: <code>C:\Microtecs\FIBS\logs\</code></div>"
+            $passosHtml
+        } elseif ($isNetFailure) {
             @"
             <div style='margin-bottom:8px;'>
               <strong>1. Terminal da Recep&ccedil;&atilde;o:</strong> Verificar se o computador de destino est&aacute; ligado, n&atilde;o est&aacute; hibernando e com cabo de rede conectado.
@@ -1733,15 +1773,6 @@ function Send-BackupNotification {
               <strong>4. Banco de Dados Local:</strong> Nenhuma a&ccedil;&atilde;o necess&aacute;ria no banco Firebird (o banco est&aacute; 100% &iacute;ntegro e seguro no servidor).
             </div>
 "@
-        } elseif ($null -ne $diag) {
-            $passosHtml = "<div style='margin-bottom:8px;'><strong>1.</strong> Conectar no servidor via AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).</div>"
-            $n = 2
-            foreach ($passo in $diag.Passos) {
-                $passosHtml += "<div style='margin-bottom:8px;'><strong>$n.</strong> $passo</div>"
-                $n++
-            }
-            $passosHtml += "<div style='font-size:12px; color:#94a3b8;'>Log completo da rotina: <code>C:\Microtecs\FIBS\logs\</code></div>"
-            $passosHtml
         } else {
             @"
             <div style='margin-bottom:8px;'>
@@ -3528,11 +3559,16 @@ function Invoke-DatabaseHealthAudit {
             Log-Message "[AUDITORIA] Formato detectado: $gzFmt ($($latestGz.Name))"
 
             if ($gzFmt -eq "ZIP") {
-                $zip = [System.IO.Compression.ZipFile]::OpenRead($latestGz.FullName)
-                $fbkEntry = $zip.Entries | Where-Object { $_.Name.EndsWith(".fbk", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
-                if ($null -eq $fbkEntry) { throw "o arquivo .FBK nao existe dentro de $($latestGz.Name)" }
-                $extractedFbkPath = Join-Path $sandboxDir $fbkEntry.Name
-                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($fbkEntry, $extractedFbkPath, $true)
+                if ($null -ne (Find-7zExe)) {
+                    Log-Message "[AUDITORIA] Extraindo com 7-Zip..."
+                    $extractedFbkPath = Expand-7zArchive -ArchivePath $latestGz.FullName -DestDir $sandboxDir -Filter "*.fbk"
+                } else {
+                    $zip = [System.IO.Compression.ZipFile]::OpenRead($latestGz.FullName)
+                    $fbkEntry = $zip.Entries | Where-Object { $_.Name.EndsWith(".fbk", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+                    if ($null -eq $fbkEntry) { throw "o arquivo .FBK nao existe dentro de $($latestGz.Name)" }
+                    $extractedFbkPath = Join-Path $sandboxDir $fbkEntry.Name
+                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($fbkEntry, $extractedFbkPath, $true)
+                }
 
             } elseif ($gzFmt -eq "GZIP") {
                 # GZIP nativo: o nome do arquivo interno nao e acessivel sem descomprimir; usa o nome do .GZ trocando a extensao
@@ -4226,6 +4262,78 @@ function Select-FailSafeDirectory {
         } catch {}
     }
     return $null
+}
+
+function Find-7zExe {
+    $paths = @(
+        "$scriptDir\7z.exe",
+        "C:\Microtecs\FIBS\7z.exe",
+        "$env:ProgramFiles\7-Zip\7z.exe",
+        "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+    )
+    foreach ($p in $paths) {
+        if (Test-Path $p) { return $p }
+    }
+    $inPath = Get-Command "7z.exe" -ErrorAction SilentlyContinue
+    if ($inPath) { return $inPath.Source }
+    return $null
+}
+
+function Compress-BackupWith7z {
+    param([string]$FbkPath, [string]$GzPath)
+    $exe = Find-7zExe
+    if (-not $exe) { return $false }
+    
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.Arguments = "a -tzip -mx5 -bso0 -bsp0 -y `"$GzPath`" `"$FbkPath`""
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
+    
+    if (-not $p.WaitForExit(15 * 60 * 1000)) {
+        try { $p.Kill() } catch {}
+        throw "Timeout de 15 minutos excedido ao compactar com 7-Zip."
+    }
+    if ($p.ExitCode -ne 0) {
+        $err = $p.StandardError.ReadToEnd()
+        throw "Erro no 7-Zip (Codigo $($p.ExitCode)): $err"
+    }
+    return ((Test-Path $GzPath) -and ((Get-Item $GzPath).Length -gt 0))
+}
+
+function Expand-7zArchive {
+    param([string]$ArchivePath, [string]$DestDir, [string]$Filter = "*.fbk")
+    $exe = Find-7zExe
+    if (-not $exe) { throw "7-Zip nao encontrado." }
+    
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe
+    $psi.Arguments = "e -y `"$ArchivePath`" $Filter -o`"$DestDir\`""
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
+    
+    if (-not $p.WaitForExit(15 * 60 * 1000)) {
+        try { $p.Kill() } catch {}
+        throw "Timeout de 15 minutos excedido ao extrair com 7-Zip."
+    }
+    if ($p.ExitCode -ne 0) {
+        $err = $p.StandardError.ReadToEnd()
+        throw "Erro no 7-Zip ao extrair (Codigo $($p.ExitCode)): $err"
+    }
+    
+    $extracted = Get-ChildItem -Path $DestDir -Filter $Filter | Select-Object -First 1
+    if (-not $extracted) { throw "Arquivo nao encontrado apos extracao via 7-Zip." }
+    return $extracted.FullName
 }
 
 # Execucao de programa externo lendo stdout/stderr em paralelo (sem deadlock de
@@ -4971,21 +5079,29 @@ for ($compAttempt = 1; $compAttempt -le $maxCompAttempts; $compAttempt++) {
         
         $compressionSuccess = $false
         try {
-            try {
-                Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
-                Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
-            } catch {
-                [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression") | Out-Null
-                [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem") | Out-Null
+            $has7z = $false
+            if ($null -ne (Find-7zExe)) {
+                Log-Message "Tentando compactacao rapida com 7-Zip..."
+                $has7z = Compress-BackupWith7z -FbkPath $tempFbk -GzPath $tempGz
+                if ($has7z) { $compressionSuccess = $true }
             }
-            
-            $zip = [System.IO.Compression.ZipFile]::Open($tempGz, [System.IO.Compression.ZipArchiveMode]::Create)
-            $entryName = Split-Path $tempFbk -Leaf
-            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $tempFbk, $entryName, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
-            $zip.Dispose()
-            $compressionSuccess = $true
+            if (-not $has7z) {
+                try {
+                    Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+                    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+                } catch {
+                    [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression") | Out-Null
+                    [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem") | Out-Null
+                }
+                
+                $zip = [System.IO.Compression.ZipFile]::Open($tempGz, [System.IO.Compression.ZipArchiveMode]::Create)
+                $entryName = Split-Path $tempFbk -Leaf
+                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $tempFbk, $entryName, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+                $zip.Dispose()
+                $compressionSuccess = $true
+            }
         } catch {
-            Log-Message "Aviso: API de compactacao nativa falhou. Usando fallback Compress-Archive..."
+            Log-Message "Aviso: API de compactacao falhou ($($_.Exception.Message)). Usando fallback Compress-Archive..."
             if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
             Compress-Archive -Path $tempFbk -DestinationPath $tempGz -CompressionLevel Optimal -Force -ErrorAction Stop
             $compressionSuccess = $true
