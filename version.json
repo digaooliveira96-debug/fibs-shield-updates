@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.58",
-    "releaseDate":  "2026-10-09",
+    "version":  "2.2.59",
+    "releaseDate":  "2026-10-10",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Integracao nativa do 7-Zip (7z.exe e 7z.dll): eliminacao definitiva do limite de 2 GB em bancos Firebird grandes (Incidente SRVCC).\\n2. Correcao de precedencia no diagnostico de e-mail: tarefas de rede agora priorizam erros tecnicos locais em vez de falso alerta de rede.\\n3. Suporte nativo completo a bancos de dados Firebird de qualquer tamanho no Sismotel.",
-    "setupSha256":  "2BA52446919272A06D49CC2BE10677CF5471822F850489103FA2A1376D039428",
-    "engineSha256":  "6D81330A046DF6E4AA96E72E6E9B57A8CBDA255B04F595043D2BF280E47B27A6",
-    "signature":  "CideRH66VaM80+jXa1j1XZi+rJUq3/g9O6n7k/asd7OjHFEOF4c4Dncq3/cGLa/iKkVgh8fi7sc3tX1xWVyGGQIg08w6IhkN2rLnOVZcq0ifXlZbi8oKpdVNlo33iyYTr+EkAcKVnwOocBLlyqzQ0hz3HjChdXu+LdbfasxrHcWIhgkCylac2FzGbhrLYcFMIlRtWU28LE/4+sTNG12eq1qFks7CeAnxN7Qv+RgZMCKBvx79LN5I5gOQvlsS857J4ginTo+tU1BQtSRPIMKAxdWBc0CKxfxCp2PUm+ipo9rl7b+DQ9QYPAs9HGZ9/RoNiokNBBxuJhzzNvrNIk2hqa05OS1sjFZqiRat7ZTy0uENEaD2vVMP53hCHHIffxxUbBIfiS+kO4rGhxPeZ/QE5Tpz2Xe+7JBgIJDZrI7Cx5uOc7r6ceh6gTRi9LHRPG1irzt+RWq+yqlMqRuaEA+7+ioVtLB8CHq2B9yE1wnfQMMCK71RXswz+5pd3yNKZBu8"
+    "changelog":  "1. 7-Zip x86 universal: roda em Windows 32 e 64 bits (corrige falha de compactacao da 2.2.58 em Windows 32-bit).\\n2. Compactacao nunca usa Compress-Archive: se o 7-Zip nao executar, usa o ZipFile do .NET.\\n3. Bancos \u003e 2 GB: 2a tentativa com o outro compactador e conferencia independente pelo 7-Zip quando o leitor .NET da maquina diverge (SHA-256 identico exigido).\\n4. 7-Zip so da pasta do sistema, com checagem de arquitetura; extracao da auditoria nunca usa .fbk antigo; compatibilidade PS 3/4.",
+    "setupSha256":  "3D12171549691D77A8DFEA1F667C882C61EB60E7EBB1BA53E07976C6A4DC36AB",
+    "engineSha256":  "0F69D5DF134F392B3766F479261CEC4B482BA8DCDD79F52B2F1F0C0AA3B814C1",
+    "signature":  "PV/RmPssB99GiOMp4E0rcFI2D3WWnd9fQBGMxKujV/iuXQASE2V8X1FYKm+cxFef6AZyk3mOjJzWQS5eC6zVdwC3FAeRV4s2XWXGd4NFYaublqh2zkMBPzO8NbR3zsQSJHVyDIQaDFyKKCIKdBWwW7JsK378evFxq/mbMYojmq9NUedIB3e1sLxzbmV87yw0FAspIYXp64LcmYEO1Io9VAoegDL00DCsU+yPXavVp8Fx+VHWp54oXWpwh/eqBHq1uSrPXrYbrx3HGsOwzF2D1ZvSxevvfFwPRcEjwkXtV2Fvt6PVT/sAfwuzArFMRAySviVcfZVRy1pSruNiSrmiXBjzORh7jEOUgouSvFH5p5JuaOrYsLAoli6bYNEn0dUBEnessK2ex1U51h+Es06PKckfRE89JG69IDab1Ljd5Cd9aLR4DkvJyx19wszyKqI9l4JyvFHWxxGMaeyYffg+mxpAVj39mSlr18nzYsqZ7/0uA/Niyp0XAoIstIES2wqg"
 }

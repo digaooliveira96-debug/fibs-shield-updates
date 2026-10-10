@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.58"
+$script:EngineVersion = "2.2.59"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -1066,10 +1066,11 @@ function Find-WinRarExe {
     foreach ($c in $candidates) { if (Test-Path $c) { return $c } }
     # Tenta via PATH do sistema (PS 5.1 compativel - sem operador ?.)
     try {
+        # .Path (PS 3+); .Source so existe a partir do PS 5
         $cmd = Get-Command "rar.exe" -ErrorAction SilentlyContinue
-        if ($null -ne $cmd -and (Test-Path $cmd.Source)) { return $cmd.Source }
+        if ($null -ne $cmd -and $cmd.Path -and (Test-Path $cmd.Path)) { return $cmd.Path }
         $cmd = Get-Command "unrar.exe" -ErrorAction SilentlyContinue
-        if ($null -ne $cmd -and (Test-Path $cmd.Source)) { return $cmd.Source }
+        if ($null -ne $cmd -and $cmd.Path -and (Test-Path $cmd.Path)) { return $cmd.Path }
     } catch {}
     return $null
 }
@@ -3485,10 +3486,10 @@ function Invoke-DatabaseHealthAudit {
 
     try {
         if ($null -eq $dbPass) {
-            throw [System.InvalidOperationException]::new("A senha do banco (DbPassword) esta criptografada para outro computador e nao abre neste servidor.")
+            throw (New-Object System.InvalidOperationException("A senha do banco (DbPassword) esta criptografada para outro computador e nao abre neste servidor."))
         }
         if ([string]::IsNullOrWhiteSpace($gbakExe) -or -not (Test-Path $gbakExe) -or -not (Test-Path $gfixExe) -or -not (Test-Path $gstatExe)) {
-            throw [System.InvalidOperationException]::new("Ferramentas do Firebird (gbak/gfix/gstat) nao localizadas em '$fbBinDir'.")
+            throw (New-Object System.InvalidOperationException("Ferramentas do Firebird (gbak/gfix/gstat) nao localizadas em '$fbBinDir'."))
         }
 
         # 2. ETAPA 1: cabecalho e transacoes no banco ativo (gstat -h, leitura rapida)
@@ -3529,7 +3530,7 @@ function Invoke-DatabaseHealthAudit {
             if ($zips.Count -gt 0 -and ($null -eq $latestGz -or $zips[0].LastWriteTime -gt $latestGz.LastWriteTime)) { $latestGz = $zips[0] }
         }
         if ($null -eq $latestGz) {
-            throw [System.InvalidOperationException]::new("Nenhum arquivo .GZ de backup local foi encontrado para o teste de restauracao.")
+            throw (New-Object System.InvalidOperationException("Nenhum arquivo .GZ de backup local foi encontrado para o teste de restauracao."))
         }
         Log-Message "[AUDITORIA] Arquivo de backup selecionado: $($latestGz.FullName) ($([math]::Round($latestGz.Length / 1MB, 2)) MB)"
 
@@ -3539,7 +3540,7 @@ function Invoke-DatabaseHealthAudit {
         catch { $dbSizeMB = [math]::Round(($latestGz.Length / 1MB) * 1.3, 2) }
         $sandboxInfo = Get-OptimalSandboxDir -DbPath $liveDb -DbSizeMB $dbSizeMB -ConfiguredDestinations $task.Destinations
         if ($sandboxInfo.Status -eq "INSUFFICIENT_SPACE") {
-            throw [System.InvalidOperationException]::new("Nenhum disco com espaco suficiente (minimo $($sandboxInfo.RequiredMB) MB) e que aceite gravacao para a sandbox. O teste de restauracao nao foi feito.")
+            throw (New-Object System.InvalidOperationException("Nenhum disco com espaco suficiente (minimo $($sandboxInfo.RequiredMB) MB) e que aceite gravacao para a sandbox. O teste de restauracao nao foi feito."))
         }
         $sandboxDir = $sandboxInfo.Path
         Log-Message "[AUDITORIA] 3/4 - Ambiente Sandbox Isolado: $($sandboxInfo.Drive) | Caminho: $sandboxDir | Espaco Livre: $($sandboxInfo.FreeMB) MB"
@@ -3559,15 +3560,26 @@ function Invoke-DatabaseHealthAudit {
             Log-Message "[AUDITORIA] Formato detectado: $gzFmt ($($latestGz.Name))"
 
             if ($gzFmt -eq "ZIP") {
+                $extractedFbkPath = $null
                 if ($null -ne (Find-7zExe)) {
-                    Log-Message "[AUDITORIA] Extraindo com 7-Zip..."
-                    $extractedFbkPath = Expand-7zArchive -ArchivePath $latestGz.FullName -DestDir $sandboxDir -Filter "*.fbk"
-                } else {
+                    try {
+                        Log-Message "[AUDITORIA] Extraindo com 7-Zip..."
+                        $extractedFbkPath = Expand-7zArchive -ArchivePath $latestGz.FullName -DestDir $sandboxDir -Filter "*.fbk"
+                    } catch {
+                        Log-Message "[AUDITORIA] Aviso: Extracao com 7-Zip falhou ($($_.Exception.Message)). Usando fallback ZipFile..."
+                        $extractedFbkPath = $null
+                    }
+                }
+                if (-not $extractedFbkPath) {
                     $zip = [System.IO.Compression.ZipFile]::OpenRead($latestGz.FullName)
-                    $fbkEntry = $zip.Entries | Where-Object { $_.Name.EndsWith(".fbk", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
-                    if ($null -eq $fbkEntry) { throw "o arquivo .FBK nao existe dentro de $($latestGz.Name)" }
-                    $extractedFbkPath = Join-Path $sandboxDir $fbkEntry.Name
-                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($fbkEntry, $extractedFbkPath, $true)
+                    try {
+                        $fbkEntry = $zip.Entries | Where-Object { $_.Name.EndsWith(".fbk", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+                        if ($null -eq $fbkEntry) { throw "o arquivo .FBK nao existe dentro de $($latestGz.Name)" }
+                        $extractedFbkPath = Join-Path $sandboxDir $fbkEntry.Name
+                        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($fbkEntry, $extractedFbkPath, $true)
+                    } finally {
+                        $zip.Dispose()
+                    }
                 }
 
             } elseif ($gzFmt -eq "GZIP") {
@@ -4264,76 +4276,183 @@ function Select-FailSafeDirectory {
     return $null
 }
 
-function Find-7zExe {
-    $paths = @(
-        "$scriptDir\7z.exe",
-        "C:\Microtecs\FIBS\7z.exe",
-        "$env:ProgramFiles\7-Zip\7z.exe",
-        "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
-    )
-    foreach ($p in $paths) {
-        if (Test-Path $p) { return $p }
+# Le so o cabecalho PE do executavel. Um binario x64 (0x8664) nao roda em Windows
+# 32-bit: o Process.Start falha com o erro 193 (incidente da v2.2.58 na RECEPCAO).
+# x86 (0x014C) roda em todos (nativo no 32-bit, WoW64 no 64-bit).
+function Test-PeRunnableHere {
+    param([string]$Path)
+    $fs = $null
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $buf = New-Object byte[] 4096
+        $n = $fs.Read($buf, 0, $buf.Length)
+        if ($n -lt 64 -or $buf[0] -ne 0x4D -or $buf[1] -ne 0x5A) { return $false }
+        $pe = [BitConverter]::ToInt32($buf, 0x3C)
+        if ($pe -lt 0 -or ($pe + 6) -gt $n) { return $false }
+        if ($buf[$pe] -ne 0x50 -or $buf[$pe + 1] -ne 0x45) { return $false }
+        $machine = [BitConverter]::ToUInt16($buf, $pe + 4)
+        if ($machine -eq 0x014C) { return $true }
+        if ($machine -eq 0x8664) { return [Environment]::Is64BitOperatingSystem }
+        return $false
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $fs) { $fs.Close() }
     }
-    $inPath = Get-Command "7z.exe" -ErrorAction SilentlyContinue
-    if ($inPath) { return $inPath.Source }
+}
+
+# Somente o 7-Zip entregue pelo instalador, na pasta do sistema. Nunca um 7z.exe do
+# PATH ou de Program Files: o servico roda como SYSTEM (risco de executavel plantado)
+# e um 7-Zip antigo (< 15) nao aceita -bso0/-bsp0.
+function Find-7zExe {
+    foreach ($nome in @("7z.exe", "7za.exe")) {
+        $p = Join-Path $scriptDir $nome
+        if ((Test-Path $p) -and (Test-PeRunnableHere -Path $p)) { return $p }
+    }
     return $null
+}
+
+# Executa o 7-Zip lendo stdout/stderr em paralelo (sem deadlock de pipe cheio).
+# Nunca lanca excecao: devolve Started/ExitCode/StdErr/TimedOut.
+function Invoke-7zProcess {
+    param([string]$Arguments, [int]$TimeoutMs = 3600000)
+    $exe = Find-7zExe
+    if (-not $exe) { return @{ Started = $false; ExitCode = -1; StdErr = "7-Zip nao encontrado na pasta do sistema ou nao executavel neste Windows."; TimedOut = $false } }
+    $p = $null
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $exe
+        $psi.Arguments = $Arguments
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        if ($null -eq $p) { return @{ Started = $false; ExitCode = -1; StdErr = "Process.Start nao devolveu o processo do 7-Zip."; TimedOut = $false } }
+        try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
+        $outTask = $p.StandardOutput.ReadToEndAsync()
+        $errTask = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit($TimeoutMs)) {
+            try { $p.Kill() } catch {}
+            # Espera o processo morrer de fato: senao o arquivo parcial continua travado
+            try { $p.WaitForExit(60000) | Out-Null } catch {}
+            return @{ Started = $true; ExitCode = -1; StdErr = "Timeout de $([int]($TimeoutMs / 60000)) minutos excedido no 7-Zip."; TimedOut = $true }
+        }
+        $p.WaitForExit()
+        $err = ""
+        try { $err = "$($errTask.Result)".Trim() } catch {}
+        try { $null = $outTask.Result } catch {}
+        return @{ Started = $true; ExitCode = $p.ExitCode; StdErr = $err; TimedOut = $false }
+    } catch {
+        # Win32Exception (193 = binario de outra arquitetura, 5 = acesso negado, antivirus...)
+        return @{ Started = $false; ExitCode = -1; StdErr = "$($_.Exception.Message)"; TimedOut = $false }
+    } finally {
+        if ($null -ne $p) { try { $p.Dispose() } catch {} }
+    }
 }
 
 function Compress-BackupWith7z {
     param([string]$FbkPath, [string]$GzPath)
-    $exe = Find-7zExe
-    if (-not $exe) { return $false }
-    
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $exe
-    $psi.Arguments = "a -tzip -mx5 -bso0 -bsp0 -y `"$GzPath`" `"$FbkPath`""
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    
-    $p = [System.Diagnostics.Process]::Start($psi)
-    try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
-    
-    if (-not $p.WaitForExit(15 * 60 * 1000)) {
-        try { $p.Kill() } catch {}
-        throw "Timeout de 15 minutos excedido ao compactar com 7-Zip."
+    if (-not (Find-7zExe)) { return $false }
+    # 7z "a" num arquivo existente ACRESCENTA ao ZIP antigo: o destino precisa estar livre
+    if (Test-Path $GzPath) {
+        try { Remove-Item $GzPath -Force -ErrorAction Stop }
+        catch { Log-Message "Aviso: 7-Zip nao usado: o arquivo $GzPath ja existe e nao pode ser removido ($($_.Exception.Message))."; return $false }
     }
-    if ($p.ExitCode -ne 0) {
-        $err = $p.StandardError.ReadToEnd()
-        throw "Erro no 7-Zip (Codigo $($p.ExitCode)): $err"
-    }
+    $r = Invoke-7zProcess -Arguments "a -tzip -mx5 -mmt=on -bso0 -bsp0 -y `"$GzPath`" `"$FbkPath`""
+    if (-not $r.Started) { Log-Message "Aviso: Falha ao executar 7-Zip para compactacao ($($r.StdErr))."; return $false }
+    if ($r.TimedOut) { Log-Message "Aviso: $($r.StdErr)"; return $false }
+    if ($r.ExitCode -ne 0) { Log-Message "Aviso: Erro no 7-Zip (Codigo $($r.ExitCode)): $($r.StdErr)"; return $false }
     return ((Test-Path $GzPath) -and ((Get-Item $GzPath).Length -gt 0))
 }
 
 function Expand-7zArchive {
     param([string]$ArchivePath, [string]$DestDir, [string]$Filter = "*.fbk")
+    if (-not (Find-7zExe)) { throw "7-Zip nao encontrado na pasta do sistema ou nao executavel neste Windows." }
+    $DestDir = $DestDir.TrimEnd('\')
+    # Sobra de extracao anterior faria a auditoria restaurar o backup errado
+    foreach ($s in @(Get-ChildItem -Path $DestDir -Filter $Filter -File -ErrorAction SilentlyContinue)) {
+        Remove-Item $s.FullName -Force -ErrorAction Stop
+    }
+    $r = Invoke-7zProcess -Arguments "e -y -bso0 -bsp0 `"$ArchivePath`" `"$Filter`" -o`"$DestDir`""
+    if (-not $r.Started) { throw "7-Zip nao pode ser executado: $($r.StdErr)" }
+    if ($r.TimedOut) { throw "$($r.StdErr)" }
+    if ($r.ExitCode -ne 0) { throw "Erro no 7-Zip ao extrair (Codigo $($r.ExitCode)): $($r.StdErr)" }
+    $extracted = @(Get-ChildItem -Path $DestDir -Filter $Filter -File -ErrorAction SilentlyContinue)
+    if ($extracted.Count -ne 1) { throw "Esperado 1 arquivo $Filter apos extracao via 7-Zip; encontrados $($extracted.Count)." }
+    return $extracted[0].FullName
+}
+
+# Conferencia independente do conteudo de uma entrada do ZIP, descompactada pelo
+# proprio 7-Zip direto para a memoria (stdout), sem disco temporario. Usada so quando
+# o leitor .NET da maquina diverge (SRVCC, banco > 2 GB): o GZ so e aceito se o 7-Zip
+# devolver exatamente o mesmo tamanho e o mesmo SHA-256 do .fbk original.
+# Devolve @{ Hash; BytesRead } ou $null.
+function Get-ZipEntrySha256Via7z {
+    param([string]$ArchivePath, [string]$EntryName)
     $exe = Find-7zExe
-    if (-not $exe) { throw "7-Zip nao encontrado." }
-    
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $exe
-    $psi.Arguments = "e -y `"$ArchivePath`" $Filter -o`"$DestDir\`""
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    
-    $p = [System.Diagnostics.Process]::Start($psi)
-    try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
-    
-    if (-not $p.WaitForExit(15 * 60 * 1000)) {
-        try { $p.Kill() } catch {}
-        throw "Timeout de 15 minutos excedido ao extrair com 7-Zip."
+    if (-not $exe) { return $null }
+    $p = $null
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $exe
+        $psi.Arguments = "e -so -bsp0 -y `"$ArchivePath`" `"$EntryName`""
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        if ($null -eq $p) { return $null }
+        try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
+        $errTask = $p.StandardError.ReadToEndAsync()
+        $metrics = Get-Sha256OfStreamWithMetrics -Stream $p.StandardOutput.BaseStream
+        $p.WaitForExit()
+        if ($p.ExitCode -ne 0) {
+            $err = ""
+            try { $err = "$($errTask.Result)".Trim() } catch {}
+            Log-Message "Aviso: conferencia pelo 7-Zip retornou codigo $($p.ExitCode): $err"
+            return $null
+        }
+        return $metrics
+    } catch {
+        Log-Message "Aviso: conferencia pelo 7-Zip nao executou ($($_.Exception.Message))."
+        return $null
+    } finally {
+        if ($null -ne $p) { try { $p.Dispose() } catch {} }
     }
-    if ($p.ExitCode -ne 0) {
-        $err = $p.StandardError.ReadToEnd()
-        throw "Erro no 7-Zip ao extrair (Codigo $($p.ExitCode)): $err"
+}
+
+# Gera o .GZ (container ZIP, exigido pelo Sismotel) a partir do .fbk.
+#   Method AUTO   = 7-Zip da pasta do sistema; se nao houver ou falhar, ZipFile do .NET
+#   Method 7ZIP   = so 7-Zip (devolve "" se nao conseguir)
+#   Method DOTNET = so ZipFile do .NET
+# Devolve "7ZIP" ou "DOTNET" (metodo que gerou o arquivo). Nunca usa Compress-Archive
+# (nao existe no PS 4 e recusa extensao .GZ: incidente da v2.2.58).
+function New-BackupGzArchive {
+    param([string]$FbkPath, [string]$GzPath, [ValidateSet("AUTO", "7ZIP", "DOTNET")][string]$Method = "AUTO")
+    if ($Method -ne "DOTNET" -and $null -ne (Find-7zExe)) {
+        Log-Message "Tentando compactacao rapida com 7-Zip..."
+        if (Compress-BackupWith7z -FbkPath $FbkPath -GzPath $GzPath) { return "7ZIP" }
     }
-    
-    $extracted = Get-ChildItem -Path $DestDir -Filter $Filter | Select-Object -First 1
-    if (-not $extracted) { throw "Arquivo nao encontrado apos extracao via 7-Zip." }
-    return $extracted.FullName
+    if ($Method -eq "7ZIP") { return "" }
+    Log-Message "Compactando com motor nativo .NET ZipFile (fallback seguro)..."
+    if (Test-Path $GzPath) { Remove-Item $GzPath -Force -ErrorAction Stop }
+    try {
+        Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    } catch {
+        [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression") | Out-Null
+        [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem") | Out-Null
+    }
+    $zip = $null
+    try {
+        $zip = [System.IO.Compression.ZipFile]::Open($GzPath, [System.IO.Compression.ZipArchiveMode]::Create)
+        [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $FbkPath, (Split-Path $FbkPath -Leaf), [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+    } finally {
+        # Sem isto, uma falha no meio deixava o .GZ travado e a 2a tentativa nao conseguia apaga-lo
+        if ($null -ne $zip) { $zip.Dispose() }
+    }
+    return "DOTNET"
 }
 
 # Execucao de programa externo lendo stdout/stderr em paralelo (sem deadlock de
@@ -5072,40 +5191,26 @@ $zipSha = $null
 $maxCompAttempts = 2
 $compSuccessFinal = $false
 $lastCompError = ""
+$lastCompMethod = ""
 
 for ($compAttempt = 1; $compAttempt -le $maxCompAttempts; $compAttempt++) {
     try {
         if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
-        
-        $compressionSuccess = $false
-        try {
-            $has7z = $false
-            if ($null -ne (Find-7zExe)) {
-                Log-Message "Tentando compactacao rapida com 7-Zip..."
-                $has7z = Compress-BackupWith7z -FbkPath $tempFbk -GzPath $tempGz
-                if ($has7z) { $compressionSuccess = $true }
-            }
-            if (-not $has7z) {
-                try {
-                    Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
-                    Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
-                } catch {
-                    [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression") | Out-Null
-                    [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem") | Out-Null
-                }
-                
-                $zip = [System.IO.Compression.ZipFile]::Open($tempGz, [System.IO.Compression.ZipArchiveMode]::Create)
-                $entryName = Split-Path $tempFbk -Leaf
-                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $tempFbk, $entryName, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
-                $zip.Dispose()
-                $compressionSuccess = $true
-            }
-        } catch {
-            Log-Message "Aviso: API de compactacao falhou ($($_.Exception.Message)). Usando fallback Compress-Archive..."
-            if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
-            Compress-Archive -Path $tempFbk -DestinationPath $tempGz -CompressionLevel Optimal -Force -ErrorAction Stop
-            $compressionSuccess = $true
+
+        # 1a tentativa: 7-Zip da pasta do sistema (se houver), senao .NET.
+        # 2a tentativa: o OUTRO compactador, para nao repetir um defeito que seja do
+        # proprio compactador desta maquina (SRVCC, banco > 2 GB).
+        $metodoPedido = "AUTO"
+        if ($compAttempt -gt 1) {
+            if ($lastCompMethod -eq "7ZIP") { $metodoPedido = "DOTNET" }
+            elseif ($lastCompMethod -eq "DOTNET" -and $null -ne (Find-7zExe)) { $metodoPedido = "7ZIP" }
         }
+        $lastCompMethod = New-BackupGzArchive -FbkPath $tempFbk -GzPath $tempGz -Method $metodoPedido
+        if ([string]::IsNullOrEmpty($lastCompMethod)) {
+            # 7-Zip nao gerou nesta tentativa: volta ao .NET
+            $lastCompMethod = New-BackupGzArchive -FbkPath $tempFbk -GzPath $tempGz -Method "DOTNET"
+        }
+        $compressionSuccess = -not [string]::IsNullOrEmpty($lastCompMethod)
 
         if ($compressionSuccess -and (Test-Path $tempGz) -and ((Get-Item $tempGz).Length -gt 0)) {
             $gzSizeMB = [math]::Round(((Get-Item $tempGz).Length / 1MB), 2)
@@ -5121,11 +5226,22 @@ for ($compAttempt = 1; $compAttempt -le $maxCompAttempts; $compAttempt++) {
                 [System.GC]::Collect()
                 $verif = Test-BackupGzIntegrity -GzPath $tempGz -ExpectedEntryName $fbkEntryName -ExpectedSize $fbkSizeBytes -ExpectedSha256 $fbkSha
             }
+            if (-not $verif.Ok -and $null -ne (Find-7zExe)) {
+                # Segunda opiniao independente: o 7-Zip descompacta para a memoria e o
+                # conteudo precisa ter exatamente o tamanho e o SHA-256 do .fbk original.
+                Log-Message "Aviso: o leitor .NET desta maquina diverge ($($verif.Reason)). Conferindo o conteudo pelo 7-Zip..."
+                $m7 = Get-ZipEntrySha256Via7z -ArchivePath $tempGz -EntryName $fbkEntryName
+                if ($null -ne $m7 -and $m7.BytesRead -eq $fbkSizeBytes -and $m7.Hash -eq $fbkSha) {
+                    $verif = @{ Ok = $true; Reason = "Conteudo conferido por SHA-256 pelo 7-Zip (o leitor .NET desta maquina divergiu: $($verif.Reason))" }
+                } elseif ($null -ne $m7) {
+                    Log-Message "Aviso: a conferencia pelo 7-Zip tambem diverge: leu $($m7.BytesRead) de $fbkSizeBytes bytes."
+                }
+            }
 
             if (-not $verif.Ok) {
-                throw "GZ GERADO ESTA CORROMPIDO. $($verif.Reason)"
+                throw "GZ GERADO ESTA CORROMPIDO. $($verif.Reason) [compactador: $lastCompMethod]"
             }
-            Log-Message "Integridade do GZ CONFIRMADA: $($verif.Reason)"
+            Log-Message "Integridade do GZ CONFIRMADA: $($verif.Reason) [compactador: $lastCompMethod]"
 
             # Impressao digital do proprio GZ, usada para conferir cada copia nos destinos
             $zipSha = Get-Sha256OfFile -Path $tempGz
