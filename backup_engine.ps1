@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.59"
+$script:EngineVersion = "2.2.60"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -241,6 +241,11 @@ function Get-FailureDiagnosis {
            Titulo = "Motor desatualizado para o PowerShell deste servidor"
            Causa  = "O servidor tem um PowerShell antigo (ex.: Windows Server 2012) e esta vers&atilde;o do motor usou um recurso que ele n&atilde;o possui. O backup n&atilde;o foi gravado."
            Passos = @("Conferir a vers&atilde;o no rodap&eacute; deste e-mail e comparar com a &uacute;ltima publicada.", "Aguardar a atualiza&ccedil;&atilde;o autom&aacute;tica ou reinstalar com o Setup mais recente.", "Rodar a tarefa manualmente pelo painel e conferir se volta a gravar.") }
+        @{ Codigo = "HARDWARE_INSTAVEL"
+           Padrao = "LEITURA INSTAVEL"
+           Titulo = "Disco ou mem&oacute;ria do servidor devolvendo dados diferentes"
+           Causa  = "O mesmo arquivo de backup, lido duas vezes sem ningu&eacute;m gravar nele, deu resultados diferentes. Isso n&atilde;o &eacute; defeito do MEC Shield nem do compactador: &eacute; disco (SSD/HD, cabo, controladora) ou mem&oacute;ria RAM falhando. O MEC Shield refez o backup do zero e, se poss&iacute;vel, em outro disco."
+           Passos = @("Ver o bloco <b>SAUDE DO ARMAZENAMENTO</b> no detalhe t&eacute;cnico: disco de cada pasta, SMART e erros de disco registrados pelo Windows (evento 153/7/51 = disco; WHEA = mem&oacute;ria/placa).", "Abrir o CrystalDiskInfo e conferir todos os discos (Sa&uacute;de, setores realocados/pendentes, vida &uacute;til do SSD).", "Fora do hor&aacute;rio de pico, testar a mem&oacute;ria com <code>mdsched</code> (reinicia o servidor).", "Planejar a troca do disco com alerta. Enquanto isso, garantir uma c&oacute;pia externa (rede/outro computador).") }
         @{ Codigo = "BANCO_CORROMPIDO"
            Padrao = "database file appears corrupt|wrong page type|checksum error|consistency check|is of wrong type|record .* is corrupt"
            Titulo = "O banco de dados do Sismotel tem p&aacute;ginas danificadas"
@@ -290,7 +295,7 @@ function Get-FailureDiagnosis {
            Padrao = "ERRO na compactacao do GZ|GZ GERADO ESTA CORROMPIDO|Falha na Compactacao"
            Titulo = "Falha de integridade na compacta&ccedil;&atilde;o do backup"
            Causa  = "O arquivo compactado .GZ n&atilde;o passou na confer&ecirc;ncia rigorosa de integridade: o conte&uacute;do descompactado n&atilde;o confere com o .fbk original (SHA-256 divergente). O MEC Shield descartou o arquivo para n&atilde;o salvar um backup corrompido."
-           Passos = @("Verificar se o antiv&iacute;rus/Windows Defender bloqueou a pasta tempor&aacute;ria durante a compacta&ccedil;&atilde;o (adicionar <code>C:\Microtecs\FIBS</code> e pastas Temp nas exclus&otilde;es).", "Conferir a sa&uacute;de do disco local: no PowerShell como Administrador rodar <code>Get-Volume C | select HealthStatus</code>.", "Se o disco n&atilde;o estiver <code>Healthy</code>, rodar <code>chkdsk C: /f</code> fora do hor&aacute;rio de pico.", "Se o banco for muito grande (> 2 GB), rodar a tarefa manualmente pelo painel e acompanhar a compacta&ccedil;&atilde;o.") }
+           Passos = @("Verificar se o antiv&iacute;rus/Windows Defender bloqueou a pasta tempor&aacute;ria durante a compacta&ccedil;&atilde;o (adicionar <code>C:\Microtecs\FIBS</code> e pastas Temp nas exclus&otilde;es).", "Conferir a sa&uacute;de do disco local: ver o bloco <b>SAUDE DO ARMAZENAMENTO</b> no detalhe t&eacute;cnico e abrir o CrystalDiskInfo.", "Se o disco n&atilde;o estiver <code>Healthy</code>, rodar <code>chkdsk C: /f</code> fora do hor&aacute;rio de pico.", "Se o banco for muito grande (> 2 GB), rodar a tarefa manualmente pelo painel e acompanhar a compacta&ccedil;&atilde;o.") }
         @{ Codigo = "COPIA_LOCAL"
            Padrao = "nao confere com a origem|COPIA CORROMPIDA|Falha ao Gravar nos Discos Locais|Nao foi possivel gravar nos discos locais"
            Titulo = "A c&oacute;pia no disco de destino falhou ou chegou alterada"
@@ -1513,6 +1518,7 @@ function New-TaskNotificationState {
         LastWarningAlert    = $null
         ConsecutiveFailures = 0
         LastConfigWarning   = $null
+        LastHardwareWarning = $null
     }
 }
 
@@ -1696,13 +1702,26 @@ function Send-BackupNotification {
             $statusTitle = "ATENCAO: CONFIGURACAO PRECISA DE REVISAO"
             $bannerBg = "#d97706"
             $bannerType = "WARNING"
+        } elseif ($Status -eq "AVISO_HARDWARE") {
+            # Backup SALVO (2a rodada), mas o servidor deu leitura instavel de disco ou
+            # memoria. Avisa no maximo 1 vez a cada 24h por tarefa, sem estado de falha.
+            if ($pref.NotifyOnFailure -ne $true) { return }
+            if (Test-WithinCooldown -Timestamp $state.LastHardwareWarning -Hours 24) {
+                Log-Message "Aviso de hardware ja enviado nas ultimas 24h. E-mail suprimido (Zero Spam)."
+                return
+            }
+            $shouldSend = $true
+            $subjectTag = "[MEC AVISO HARDWARE]"
+            $statusTitle = "BACKUP SALVO, MAS O SERVIDOR TEM DISCO/MEMORIA INSTAVEL"
+            $bannerBg = "#d97706"
+            $bannerType = "WARNING"
         }
 
         if (-not $shouldSend) { return }
 
         # Tudo que vem de mensagens de erro, caminhos e config entra no HTML escapado.
         $clientNameHtml = ConvertTo-HtmlSafe $clientName
-        $diag = if ($Status -eq "FALHA" -or $Status -eq "AVISO") { Get-FailureDiagnosis -Text $BodyDetails -SubjectInfo $SubjectInfo } else { $null }
+        $diag = if ($Status -eq "FALHA" -or $Status -eq "AVISO" -or $Status -eq "AVISO_HARDWARE") { Get-FailureDiagnosis -Text $BodyDetails -SubjectInfo $SubjectInfo } else { $null }
         $BodyDetails = ConvertTo-HtmlSafe $BodyDetails
         $DbPath = ConvertTo-HtmlSafe $DbPath
         $SuccessDests = @($SuccessDests | ForEach-Object { ConvertTo-HtmlSafe $_ })
@@ -1930,7 +1949,7 @@ function Send-BackupNotification {
           </tr>
 
           <!-- CARD 3: DETALHES DE ERRO & CHECKLIST DO SUPORTE (SE FALHA CRITICA) -->
-          $(if (($Status -eq "FALHA" -or $Status -eq "AVISO") -and $BodyDetails) {
+          $(if (($Status -eq "FALHA" -or $Status -eq "AVISO" -or $Status -eq "AVISO_HARDWARE") -and $BodyDetails) {
           "<tr>
             <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
               <div style='background-color:#450a0a; border:1px solid #7f1d1d; border-left:4px solid #ef4444; border-radius:8px; padding:16px; font-size:13.5px; color:#fca5a5; line-height:1.6;'>
@@ -2064,6 +2083,9 @@ function Send-BackupNotification {
                 Log-Message "Cooldown anti-flood de ${cooldownHours}h armado (a partir da entrega confirmada)."
             } elseif ($Status -eq "AVISO") {
                 $state.LastConfigWarning = (Get-Date).ToString("o")
+                Save-TaskNotificationState -TaskName $TaskName -State $state
+            } elseif ($Status -eq "AVISO_HARDWARE") {
+                $state.LastHardwareWarning = (Get-Date).ToString("o")
                 Save-TaskNotificationState -TaskName $TaskName -State $state
             }
         } else {
@@ -4245,6 +4267,311 @@ function Clear-StaleBackupTemp {
     }
 }
 
+# ------------------------------------------------------------------------------
+# SAUDE DO ARMAZENAMENTO (v2.2.60)
+# SRVCC 11/10/2026: o mesmo .fbk lido duas vezes deu dois SHA-256 diferentes. Os
+# compactadores nao tinham culpa (o 7-Zip abriu os dois GZ sem erro de CRC): o SSD
+# registrava o evento 153 (I/O repetido) no fim do E: e o HD USB tinha 1400 setores
+# pendentes. Estas funcoes dizem em que disco fisico fica uma pasta, se o SMART do
+# Windows preve falha e quantos erros de disco o Windows registrou, para o e-mail
+# apontar a causa ao tecnico. So WMI e Get-WinEvent (Windows 7 / PS 2+), sempre em
+# try: diagnostico nunca derruba o backup.
+# ------------------------------------------------------------------------------
+function Get-PhysicalDiskOfPath {
+    param([string]$Path)
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+        $root = [System.IO.Path]::GetPathRoot($Path)
+        if ([string]::IsNullOrWhiteSpace($root) -or $root.StartsWith("\") -or $root.Length -lt 2) { return $null }
+        $letter = $root.Substring(0, 2).ToUpper()
+        $parts = @(Get-WmiObject -Query "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='$letter'} WHERE AssocClass=Win32_LogicalDiskToPartition" -ErrorAction Stop)
+        foreach ($p in $parts) {
+            $drives = @(Get-WmiObject -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($p.DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition" -ErrorAction Stop)
+            foreach ($d in $drives) {
+                return [PSCustomObject]@{
+                    Index     = [int]$d.Index
+                    Model     = "$($d.Model)".Trim()
+                    Interface = "$($d.InterfaceType)"
+                    Status    = "$($d.Status)"
+                    PnpId     = "$($d.PNPDeviceID)"
+                    Letter    = $letter
+                }
+            }
+        }
+    } catch {}
+    return $null
+}
+
+# InstanceName (PNPDeviceID + "_0") -> PredictFailure. Disco USB costuma nao responder.
+function Get-SmartPredictFailureMap {
+    $map = @{}
+    try {
+        $st = @(Get-WmiObject -Namespace "root\wmi" -Class MSStorageDriver_FailurePredictStatus -ErrorAction Stop)
+        foreach ($s in $st) { $map["$($s.InstanceName)".ToUpper()] = [bool]$s.PredictFailure }
+    } catch {}
+    return $map
+}
+
+# $true = SMART preve falha | $false = SMART ok | $null = sem leitura
+function Test-SmartPredictFailure {
+    param($Disk, [hashtable]$Map)
+    if ($null -eq $Disk -or $null -eq $Map -or [string]::IsNullOrWhiteSpace($Disk.PnpId)) { return $null }
+    $pnp = $Disk.PnpId.ToUpper()
+    foreach ($k in $Map.Keys) {
+        if ($k.StartsWith($pnp)) { return [bool]$Map[$k] }
+    }
+    return $null
+}
+
+function Get-DiskEventMeaning {
+    param([string]$Provider, [int]$Id)
+    if ($Provider -match "WHEA") { return "erro de HARDWARE (memoria RAM, CPU ou barramento)" }
+    if ($Provider -match "Ntfs") { return "sistema de arquivos (NTFS) com erro" }
+    switch ($Id) {
+        7   { return "SETOR DEFEITUOSO no disco" }
+        11  { return "erro de controladora/cabo do disco" }
+        15  { return "disco nao respondeu (nao pronto)" }
+        51  { return "erro de leitura/gravacao em disco (paginacao)" }
+        52  { return "SMART preve FALHA do disco" }
+        153 { return "leitura/gravacao precisou ser repetida (disco lento ou falhando)" }
+        154 { return "falha de hardware de I/O no disco" }
+    }
+    return "evento de disco"
+}
+
+# Erros de disco/NTFS/WHEA no log do Sistema dos ultimos $Days dias, agrupados.
+function Get-DiskErrorEventSummary {
+    param([int]$Days = 7)
+    $res = @()
+    $inicio = (Get-Date).AddDays(-$Days)
+    $fontes = @(
+        @{ P = "disk"; Ids = @(7, 11, 15, 51, 52, 153, 154) },
+        @{ P = "Ntfs"; Ids = @(55, 98, 137, 140) },
+        @{ P = "Microsoft-Windows-Ntfs"; Ids = @(55, 98, 137, 140) },
+        @{ P = "Microsoft-Windows-WHEA-Logger"; Ids = @() }
+    )
+    foreach ($f in $fontes) {
+        try {
+            $filtro = @{ LogName = "System"; ProviderName = $f.P; StartTime = $inicio }
+            if ($f.Ids.Count -gt 0) { $filtro.Id = $f.Ids }
+            $ev = @(Get-WinEvent -FilterHashtable $filtro -MaxEvents 1000 -ErrorAction Stop)
+            foreach ($g in ($ev | Group-Object Id)) {
+                $discos = @()
+                foreach ($e in $g.Group) {
+                    if ("$($e.Message)" -match '(?i)(?:Harddisk|Disk|Disco)\s*#?\s*(\d+)') {
+                        if ($discos -notcontains $matches[1]) { $discos += $matches[1] }
+                    }
+                }
+                $ultimo = ($g.Group | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
+                $res += [PSCustomObject]@{ Provider = $f.P; Id = [int]$g.Name; Count = $g.Count; Disks = $discos; Last = $ultimo }
+            }
+        } catch {}
+    }
+    return $res
+}
+
+# Texto (ASCII, varias linhas) para log e e-mail: disco fisico de cada pasta, SMART,
+# todos os discos do servidor e os erros de disco que o Windows registrou.
+function Get-StorageHealthReport {
+    param([string[]]$Paths, [int]$Days = 7)
+    $linhas = @()
+    try {
+        $smart = Get-SmartPredictFailureMap
+        $letras = @()
+        foreach ($p in $Paths) {
+            if ([string]::IsNullOrWhiteSpace($p) -or $p.StartsWith("\")) { continue }
+            $r = [System.IO.Path]::GetPathRoot($p)
+            if ([string]::IsNullOrWhiteSpace($r) -or $letras -contains $r) { continue }
+            $letras += $r
+            $d = Get-PhysicalDiskOfPath -Path $r
+            if ($null -eq $d) { $linhas += "$r -> disco fisico nao identificado"; continue }
+            $sm = Test-SmartPredictFailure -Disk $d -Map $smart
+            $smTxt = if ($sm -eq $true) { "SMART: FALHA PREVISTA" } elseif ($sm -eq $false) { "SMART: ok" } else { "SMART: sem leitura" }
+            $linhas += "$r -> Disco $($d.Index): $($d.Model) ($($d.Interface)) | status Windows: $($d.Status) | $smTxt"
+        }
+        try {
+            $todos = @(Get-WmiObject -Class Win32_DiskDrive -ErrorAction Stop | Sort-Object Index)
+            if ($todos.Count -gt 0) {
+                $lista = @()
+                foreach ($t in $todos) {
+                    $sm = Test-SmartPredictFailure -Disk ([PSCustomObject]@{ PnpId = "$($t.PNPDeviceID)" }) -Map $smart
+                    $smTxt = if ($sm -eq $true) { ", SMART FALHA PREVISTA" } else { "" }
+                    $lista += "Disco $($t.Index) $("$($t.Model)".Trim()) [$($t.InterfaceType), $([math]::Round($t.Size / 1GB)) GB, $($t.Status)$smTxt]"
+                }
+                $linhas += "Discos do servidor: $($lista -join ' | ')"
+            }
+        } catch {}
+        $ev = @(Get-DiskErrorEventSummary -Days $Days)
+        if ($ev.Count -eq 0) {
+            $linhas += "Eventos de disco/NTFS/WHEA nos ultimos $Days dias: nenhum"
+        } else {
+            foreach ($e in $ev) {
+                $dTxt = if ($e.Disks.Count -gt 0) { " no Disco $($e.Disks -join ',')" } else { "" }
+                $quando = try { $e.Last.ToString("dd/MM HH:mm") } catch { "?" }
+                $linhas += "Evento $($e.Provider) $($e.Id) x$($e.Count)$dTxt (ultimo $quando): $(Get-DiskEventMeaning -Provider $e.Provider -Id $e.Id)"
+            }
+        }
+        $linhas += "Recomendado: conferir os discos no CrystalDiskInfo e testar a memoria (mdsched) fora do horario de pico."
+    } catch {
+        $linhas += "Diagnostico de disco indisponivel: $($_.Exception.Message)"
+    }
+    return ($linhas -join "`n")
+}
+
+# Pastas temporarias que deram leitura instavel ficam "suspeitas" por alguns dias:
+# as rotinas seguintes preferem outra pasta e voltam a testar a original depois.
+function Get-SuspectTempDirs {
+    $f = Join-Path $scriptDir "temp_suspeito.json"
+    $out = @()
+    try {
+        if (Test-Path $f) {
+            $raw = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($e in @($raw.Pastas)) {
+                if ($null -eq $e -or [string]::IsNullOrWhiteSpace("$($e.Pasta)") -or [string]::IsNullOrWhiteSpace("$($e.Ate)")) { continue }
+                try { if ([DateTime]::Parse("$($e.Ate)") -gt (Get-Date)) { $out += $e } } catch {}
+            }
+        }
+    } catch {}
+    return $out
+}
+
+function Test-SuspectTempDir {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    foreach ($e in @(Get-SuspectTempDirs)) {
+        if ("$($e.Pasta)".TrimEnd('\') -ieq $Path.TrimEnd('\')) { return $true }
+    }
+    return $false
+}
+
+function Add-SuspectTempDir {
+    param([string]$Path, [int]$Days = 7, [string]$Motivo = "")
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $f = Join-Path $scriptDir "temp_suspeito.json"
+    $lista = @(Get-SuspectTempDirs | Where-Object { "$($_.Pasta)".TrimEnd('\') -ine $Path.TrimEnd('\') })
+    if ($Motivo.Length -gt 300) { $Motivo = $Motivo.Substring(0, 300) }
+    $lista += [PSCustomObject]@{ Pasta = $Path; Ate = (Get-Date).AddDays($Days).ToString("o"); Motivo = $Motivo }
+    try { Save-JsonState -Path $f -Data @{ Pastas = $lista } -Depth 4 } catch {
+        Log-Message "Aviso: nao foi possivel registrar a pasta suspeita '$Path': $_"
+    }
+}
+
+# Escolhe a pasta temporaria (FBK + GZ). Ordem:
+#   1) destino local em OUTRO DISCO FISICO que o do banco (e sem SMART acusando falha)
+#   2) destino local em outra particao (letra diferente do banco)
+#   3) qualquer destino local (inclusive o disco do banco, com a folga de 8 GB)
+#   4) a pasta do sistema (temp_backup)
+#   5) uma pasta suspeita, se for a unica com espaco (melhor que ficar sem backup)
+# Cada candidato so vale se tiver espaco e aceitar gravacao de fato. -ExcludeRoots
+# tira unidades da disputa (rodada 2 em outro disco/particao).
+function Select-BackupTempDir {
+    param([string[]]$Destinations, [string]$DbDrive, [double]$DbSizeMB, [string[]]$ExcludeRoots = @())
+    $recusadas = @()
+    $suspeitasPuladas = @()
+    $locais = @($Destinations | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("\") })
+    $dbDisk = Get-PhysicalDiskOfPath -Path $DbDrive
+    $smart = if ($null -ne $dbDisk) { Get-SmartPredictFailureMap } else { @{} }
+
+    foreach ($passo in @("DISCO_FISICO", "PARTICAO", "QUALQUER")) {
+        if ($passo -eq "DISCO_FISICO" -and $null -eq $dbDisk) { continue }
+        foreach ($candDest in $locais) {
+            $candDrive = [System.IO.Path]::GetPathRoot($candDest)
+            if ([string]::IsNullOrWhiteSpace($candDrive) -or -not (Test-Path $candDrive)) { continue }
+            if ($ExcludeRoots -contains $candDrive) { continue }
+            if ($passo -eq "DISCO_FISICO") {
+                $cd = Get-PhysicalDiskOfPath -Path $candDrive
+                if ($null -eq $cd -or $cd.Index -eq $dbDisk.Index) { continue }
+                if ((Test-SmartPredictFailure -Disk $cd -Map $smart) -eq $true) { continue }
+            } elseif ($passo -eq "PARTICAO") {
+                if ($candDrive -eq $DbDrive) { continue }
+            }
+            if ((Get-DriveFreeMB -Path $candDrive) -lt (Get-ProcessingRequiredMB -Path $candDrive -DbDrive $DbDrive -DbSizeMB $DbSizeMB -Factor 1.5)) { continue }
+            $candidateTemp = Join-Path $candDrive "FIBS_TEMP"
+            if ($recusadas -contains $candidateTemp) { continue }
+            if (Test-SuspectTempDir -Path $candidateTemp) {
+                if ($suspeitasPuladas -notcontains $candidateTemp) { $suspeitasPuladas += $candidateTemp }
+                continue
+            }
+            if (Test-WritableDirectory -Path $candidateTemp -Hide) {
+                return @{ Dir = $candidateTemp; Recusadas = $recusadas; Criterio = $passo }
+            }
+            $recusadas += $candidateTemp
+        }
+    }
+
+    $fallbackTemp = Join-Path $scriptDir "temp_backup"
+    $fbRoot = [System.IO.Path]::GetPathRoot($fallbackTemp)
+    if ($ExcludeRoots -notcontains $fbRoot) {
+        if ((Get-DriveFreeMB -Path $fallbackTemp) -ge (Get-ProcessingRequiredMB -Path $fallbackTemp -DbDrive $DbDrive -DbSizeMB $DbSizeMB -Factor 1.5)) {
+            if (Test-SuspectTempDir -Path $fallbackTemp) {
+                if ($suspeitasPuladas -notcontains $fallbackTemp) { $suspeitasPuladas += $fallbackTemp }
+            } elseif (Test-WritableDirectory -Path $fallbackTemp) {
+                return @{ Dir = $fallbackTemp; Recusadas = $recusadas; Criterio = "PASTA_DO_SISTEMA" }
+            }
+        }
+    }
+
+    foreach ($s in $suspeitasPuladas) {
+        $hide = ((Split-Path $s -Leaf) -eq "FIBS_TEMP")
+        if (Test-WritableDirectory -Path $s -Hide:$hide) {
+            return @{ Dir = $s; Recusadas = $recusadas; Criterio = "SUSPEITA" }
+        }
+    }
+    return @{ Dir = $null; Recusadas = $recusadas; Criterio = "" }
+}
+
+function Format-ShaShort {
+    param([string]$Hash)
+    if ([string]::IsNullOrWhiteSpace($Hash) -or $Hash.Length -lt 16) { return "(nao lido)" }
+    return $Hash.Substring(0, 16)
+}
+
+# PORTAO DE INTEGRIDADE do GZ contra o .fbk de origem:
+#   leitor .NET -> re-conferencia apos 3s -> 7-Zip (segunda opiniao independente).
+# Se tudo divergir, rele o .fbk do disco e diz se a ORIGEM mudou entre leituras
+# (disco/memoria instavel: SourceUnstable) ou se o defeito foi do compactador.
+# Devolve @{ Ok; Reason; SourceUnstable; Detail }.
+function Invoke-BackupGzIntegrityGate {
+    param([string]$GzPath, [string]$FbkPath, [string]$EntryName, [long]$Size, [string]$Sha)
+    $verif = Test-BackupGzIntegrity -GzPath $GzPath -ExpectedEntryName $EntryName -ExpectedSize $Size -ExpectedSha256 $Sha
+    if (-not $verif.Ok) {
+        # Pequena pausa (antivirus/flush de disco) e uma re-conferencia antes de descartar
+        Log-Message "Aviso: Primeira conferencia do GZ acusou divergencia ($($verif.Reason)). Aguardando 3s para re-conferencia..."
+        Start-Sleep -Seconds 3
+        [System.GC]::Collect()
+        $verif = Test-BackupGzIntegrity -GzPath $GzPath -ExpectedEntryName $EntryName -ExpectedSize $Size -ExpectedSha256 $Sha
+    }
+    if ($verif.Ok) { return @{ Ok = $true; Reason = $verif.Reason; SourceUnstable = $false; Detail = "" } }
+
+    $m7 = $null
+    if ($null -ne (Find-7zExe)) {
+        # O 7-Zip descompacta para a memoria (conferindo o CRC do ZIP) e o conteudo
+        # precisa ter exatamente o tamanho e o SHA-256 do .fbk original.
+        Log-Message "Aviso: o leitor .NET desta maquina diverge ($($verif.Reason)). Conferindo o conteudo pelo 7-Zip..."
+        $m7 = Get-ZipEntrySha256Via7z -ArchivePath $GzPath -EntryName $EntryName
+        if ($null -ne $m7 -and $m7.BytesRead -eq $Size -and $m7.Hash -eq $Sha) {
+            return @{ Ok = $true; Reason = "Conteudo conferido por SHA-256 pelo 7-Zip (o leitor .NET desta maquina divergiu: $($verif.Reason))"; SourceUnstable = $false; Detail = "" }
+        } elseif ($null -ne $m7) {
+            Log-Message "Aviso: a conferencia pelo 7-Zip tambem diverge: leu $($m7.BytesRead) de $Size bytes."
+        }
+    }
+
+    # Diagnostico: o .fbk ainda e o mesmo que foi medido antes de compactar?
+    $releitura = Get-Sha256OfFile -Path $FbkPath
+    $gzTxt = if ($null -ne $m7 -and -not [string]::IsNullOrWhiteSpace($m7.Hash)) { Format-ShaShort $m7.Hash } else { "(sem 7-Zip)" }
+    $instavel = $false
+    if (-not [string]::IsNullOrWhiteSpace($releitura) -and $releitura -ne $Sha) {
+        $instavel = $true
+        $detalhe = "LEITURA INSTAVEL DA ORIGEM: o mesmo .fbk, sem ninguem gravar nele, deu outro SHA-256 ao ser lido de novo (1a leitura $(Format-ShaShort $Sha)..., releitura $(Format-ShaShort $releitura)..., conteudo do GZ $gzTxt...). Disco ou memoria RAM devolvendo dados diferentes."
+    } elseif ([string]::IsNullOrWhiteSpace($releitura)) {
+        $detalhe = "Nao foi possivel reler o .fbk para diagnostico (conteudo do GZ $gzTxt...)."
+    } else {
+        $detalhe = "Origem estavel (releitura do .fbk igual a 1a leitura $(Format-ShaShort $Sha)...; conteudo do GZ $gzTxt...): o defeito ocorreu na compactacao/gravacao do GZ."
+    }
+    Log-Message "Diagnostico: $detalhe"
+    return @{ Ok = $false; Reason = $verif.Reason; SourceUnstable = $instavel; Detail = $detalhe }
+}
+
 # Pasta do fail-safe (ultima linha). Prefere um disco diferente do banco e so grava
 # no disco do banco se, apos a copia, sobrar a folga de 8 GB: encher o disco
 # do Firebird derrubaria o Sismotel. Em outro disco, sobra no minimo a reserva de 5 GB.
@@ -4966,36 +5293,14 @@ $dbDrive = [System.IO.Path]::GetPathRoot($dbPath)
 
 # Exige espaco para o FBK + GZ (1.5x o banco) mais a reserva do disco
 # (Get-ProcessingRequiredMB): 5 GB, ou 8 GB no disco do banco.
-$pastasRecusadas = @()
-
-# 1) Procura um destino local em particao diferente do banco para isolamento fisico de gravacao
-# 2) Nenhum destino isolado serviu: tenta qualquer outro destino local (inclusive o disco do banco)
-# Cada cliente tem um layout de discos. Nao se supoe nada: cada candidato so vale se
-# a pasta existir de fato e aceitar gravacao (Test-WritableDirectory).
-foreach ($isolado in @($true, $false)) {
-    if ($null -ne $tempDir) { break }
-    foreach ($candDest in $resolvedDestList) {
-        if ($candDest.StartsWith("\")) { continue } # NUNCA usar rede para temporario
-        $candDrive = [System.IO.Path]::GetPathRoot($candDest)
-        if (-not (Test-Path $candDrive)) { continue }
-        if ($isolado -and $candDrive -eq $dbDrive) { continue }
-        if ((Get-DriveFreeMB -Path $candDrive) -lt (Get-ProcessingRequiredMB -Path $candDrive -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5)) { continue }
-        $candidateTemp = Join-Path $candDrive "FIBS_TEMP"
-        if ($pastasRecusadas -contains $candidateTemp) { continue }
-        if (Test-WritableDirectory -Path $candidateTemp -Hide) {
-            $tempDir = $candidateTemp
-            break
-        }
-        $pastasRecusadas += $candidateTemp
-    }
-}
-
-# 3) Fallback final: a propria pasta do script FIBS
-if ($null -eq $tempDir) {
-    $fallbackTemp = Join-Path $scriptDir "temp_backup"
-    if ((Get-DriveFreeMB -Path $fallbackTemp) -ge (Get-ProcessingRequiredMB -Path $fallbackTemp -DbDrive $dbDrive -DbSizeMB $dbSizeMB -Factor 1.5)) {
-        if (Test-WritableDirectory -Path $fallbackTemp) { $tempDir = $fallbackTemp }
-    }
+# Ordem (Select-BackupTempDir): destino local em OUTRO DISCO FISICO -> outra particao
+# -> qualquer destino local -> pasta do sistema. Pastas marcadas como suspeitas
+# (leitura instavel nos ultimos 7 dias) so sao usadas se nada mais servir.
+$selTemp = Select-BackupTempDir -Destinations $resolvedDestList -DbDrive $dbDrive -DbSizeMB $dbSizeMB
+$tempDir = $selTemp.Dir
+$pastasRecusadas = @($selTemp.Recusadas)
+if ($selTemp.Criterio -eq "SUSPEITA") {
+    Log-Message "Aviso: so a pasta temporaria marcada como suspeita ($tempDir) tem espaco. Usando mesmo assim (melhor que ficar sem backup)."
 }
 
 if ($null -eq $tempDir) {
@@ -5097,6 +5402,19 @@ $confSeq = if ($null -ne $task.NextSequenceNumber -and $task.NextSequenceNumber 
 $seqNumber = Get-NextBackupSequenceNumber -Prefix $basePrefix -DestinationPaths $resolvedDestList -ConfiguredNextNumber $confSeq -SequenceFilePath $seqFile
 $seqStr = "{0:D4}" -f $seqNumber
 
+# Rodadas completas (gbak + compactacao + conferencia). A 2a so acontece se a 1a
+# falhar na integridade (SRVCC 11/10/2026: leitura instavel de SSD/RAM). O laco fecha
+# logo antes da FASE 5.
+$rodadaMax = 2
+$rodada1Temp = ""
+$rodada1Falha = ""
+$rodada1Instavel = $false
+$rodada1Diag = ""
+for ($rodada = 1; $rodada -le $rodadaMax; $rodada++) {
+if ($rodada -gt 1) {
+    Log-Message "=== RODADA $rodada de $rodadaMax (gbak novo) | Diretorio temporario de processamento I/O: $tempDir ==="
+}
+
 $tempFbk    = Join-Path $tempDir "$basePrefix-$seqStr.fbk"
 $tempGz    = Join-Path $tempDir "$basePrefix-$seqStr.GZ"
 $gbakLog    = Join-Path $tempDir "gbak_$($TaskName)_log.txt"
@@ -5192,6 +5510,8 @@ $maxCompAttempts = 2
 $compSuccessFinal = $false
 $lastCompError = ""
 $lastCompMethod = ""
+$origemInstavel = $false
+$diagOrigem = ""
 
 for ($compAttempt = 1; $compAttempt -le $maxCompAttempts; $compAttempt++) {
     try {
@@ -5218,27 +5538,11 @@ for ($compAttempt = 1; $compAttempt -le $maxCompAttempts; $compAttempt++) {
             # PORTAO DE INTEGRIDADE: le o GZ de volta e confere o conteudo contra o .fbk.
             # So passando daqui o .fbk original pode ser descartado.
             Log-Message "Verificando integridade do GZ gerado (releitura + SHA-256)..."
-            $verif = Test-BackupGzIntegrity -GzPath $tempGz -ExpectedEntryName $fbkEntryName -ExpectedSize $fbkSizeBytes -ExpectedSha256 $fbkSha
-            if (-not $verif.Ok) {
-                # Se falhou, da uma pequena pausa (antivirus/flush de disco) e tenta re-conferir uma vez antes de descartar
-                Log-Message "Aviso: Primeira conferencia do GZ acusou divergencia ($($verif.Reason)). Aguardando 3s para re-conferencia..."
-                Start-Sleep -Seconds 3
-                [System.GC]::Collect()
-                $verif = Test-BackupGzIntegrity -GzPath $tempGz -ExpectedEntryName $fbkEntryName -ExpectedSize $fbkSizeBytes -ExpectedSha256 $fbkSha
-            }
-            if (-not $verif.Ok -and $null -ne (Find-7zExe)) {
-                # Segunda opiniao independente: o 7-Zip descompacta para a memoria e o
-                # conteudo precisa ter exatamente o tamanho e o SHA-256 do .fbk original.
-                Log-Message "Aviso: o leitor .NET desta maquina diverge ($($verif.Reason)). Conferindo o conteudo pelo 7-Zip..."
-                $m7 = Get-ZipEntrySha256Via7z -ArchivePath $tempGz -EntryName $fbkEntryName
-                if ($null -ne $m7 -and $m7.BytesRead -eq $fbkSizeBytes -and $m7.Hash -eq $fbkSha) {
-                    $verif = @{ Ok = $true; Reason = "Conteudo conferido por SHA-256 pelo 7-Zip (o leitor .NET desta maquina divergiu: $($verif.Reason))" }
-                } elseif ($null -ne $m7) {
-                    Log-Message "Aviso: a conferencia pelo 7-Zip tambem diverge: leu $($m7.BytesRead) de $fbkSizeBytes bytes."
-                }
-            }
+            $verif = Invoke-BackupGzIntegrityGate -GzPath $tempGz -FbkPath $tempFbk -EntryName $fbkEntryName -Size $fbkSizeBytes -Sha $fbkSha
 
             if (-not $verif.Ok) {
+                if ($verif.SourceUnstable) { $origemInstavel = $true }
+                if (-not [string]::IsNullOrEmpty($verif.Detail)) { $diagOrigem = $verif.Detail }
                 throw "GZ GERADO ESTA CORROMPIDO. $($verif.Reason) [compactador: $lastCompMethod]"
             }
             Log-Message "Integridade do GZ CONFIRMADA: $($verif.Reason) [compactador: $lastCompMethod]"
@@ -5260,6 +5564,12 @@ for ($compAttempt = 1; $compAttempt -le $maxCompAttempts; $compAttempt++) {
         }
     } catch {
         $lastCompError = "$_"
+        if ($origemInstavel) {
+            # O proprio .fbk mudou entre leituras: outro compactador conferido contra a
+            # mesma impressao digital nao resolve. A rodada e refeita do zero (gbak novo).
+            Log-Message "Aviso: Tentativa $compAttempt falhou com LEITURA INSTAVEL da origem. Nao adianta trocar de compactador: a rodada sera refeita do zero."
+            break
+        }
         if ($compAttempt -lt $maxCompAttempts) {
             Log-Message "Aviso: Tentativa $compAttempt de compactacao/verificacao falhou ($lastCompError). Aguardando 5s para retentar..."
             if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
@@ -5270,13 +5580,61 @@ for ($compAttempt = 1; $compAttempt -le $maxCompAttempts; $compAttempt++) {
 }
 
 if (-not $compSuccessFinal) {
-    $errMsg = "ERRO na compactacao do GZ: $lastCompError"
-    Log-Message $errMsg
-    Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha na Compactacao ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
     if (Test-Path $tempFbk) { Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue }
     if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $gbakLog) { Remove-Item $gbakLog -Force -ErrorAction SilentlyContinue }
+
+    if ($rodada -lt $rodadaMax) {
+        # SRVCC 11/10/2026: falha esporadica de leitura (SSD/RAM). Uma rodada nova, de
+        # preferencia em outro disco/particao, normalmente passa. Sem e-mail ainda.
+        $rodada1Temp = $tempDir
+        $rodada1Falha = $lastCompError
+        $rodada1Instavel = $origemInstavel
+        $rodada1Diag = $diagOrigem
+        Log-Message "RODADA $rodada de $rodadaMax falhou na integridade ($lastCompError). Refazendo a rodada completa (gbak + compactacao) para nao ficar sem backup..."
+        $alt = Select-BackupTempDir -Destinations $resolvedDestList -DbDrive $dbDrive -DbSizeMB $dbSizeMB -ExcludeRoots @([System.IO.Path]::GetPathRoot($tempDir))
+        if ($null -ne $alt.Dir) {
+            $tempDir = $alt.Dir
+            Log-Message "Rodada $($rodada + 1): usando pasta temporaria alternativa em outro disco/particao: $tempDir"
+        } else {
+            Log-Message "Rodada $($rodada + 1): nenhuma outra pasta temporaria com espaco; refazendo em $tempDir"
+        }
+        continue
+    }
+
+    $errMsg = "ERRO na compactacao do GZ: $lastCompError"
+    if ($origemInstavel -or $rodada1Instavel) {
+        $errMsg = "LEITURA INSTAVEL DO DISCO/MEMORIA DO SERVIDOR. $errMsg"
+    }
+    if ($rodadaMax -gt 1) {
+        $pastasUsadas = @($rodada1Temp, $tempDir) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+        $errMsg += "`nRodadas completas (gbak + compactacao): $rodadaMax | pastas temporarias: $($pastasUsadas -join ', ')"
+    }
+    if (-not [string]::IsNullOrEmpty($rodada1Diag)) { $errMsg += "`nRodada 1: $rodada1Diag" }
+    if (-not [string]::IsNullOrEmpty($diagOrigem)) { $errMsg += "`nRodada ${rodada}: $diagOrigem" }
+    $saudeDiscos = Get-StorageHealthReport -Paths @($rodada1Temp, $tempDir, $dbPath)
+    $errMsg += "`n`nSAUDE DO ARMAZENAMENTO:`n$saudeDiscos"
+    Log-Message $errMsg
+    Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha na Compactacao ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
     Exit-BackupLock
     exit 1
+}
+
+if ($rodada -gt 1) {
+    # Backup salvo na 2a rodada: registra a pasta suspeita (as proximas rotinas usam
+    # outra por 7 dias) e avisa o tecnico do hardware, no maximo 1 vez a cada 24h.
+    if (-not [string]::IsNullOrWhiteSpace($rodada1Temp) -and $rodada1Temp -ne $tempDir) {
+        Add-SuspectTempDir -Path $rodada1Temp -Days 7 -Motivo $rodada1Falha
+        Log-Message "Pasta temporaria '$rodada1Temp' marcada como suspeita por 7 dias: as proximas rotinas usam outra pasta."
+    }
+    $avisoHw = if ($rodada1Instavel) { "LEITURA INSTAVEL DO DISCO/MEMORIA DO SERVIDOR." } else { "Falha de integridade contornada." }
+    $avisoHw += " O backup foi SALVO e CONFERIDO na rodada $rodada (pasta $tempDir), mas a rodada 1 (pasta $rodada1Temp) falhou: $rodada1Falha"
+    if (-not [string]::IsNullOrEmpty($rodada1Diag)) { $avisoHw += "`nDiagnostico da rodada 1: $rodada1Diag" }
+    $avisoHw += "`n`nSAUDE DO ARMAZENAMENTO:`n$(Get-StorageHealthReport -Paths @($rodada1Temp, $tempDir, $dbPath))"
+    Log-Message $avisoHw
+    Send-BackupNotification -Status "AVISO_HARDWARE" -SubjectInfo "Instabilidade de Disco ou Memoria ($TaskName)" -BodyDetails $avisoHw -DbPath $dbPath -DbSize "$dbSizeMB"
+}
+break
 }
 
 # --- FASE 5: DISTRIBUICAO PARA DESTINOS E EXPURGO AUTOMATICO ---

@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.59",
-    "releaseDate":  "2026-10-10",
+    "version":  "2.2.60",
+    "releaseDate":  "2026-10-11",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. 7-Zip x86 universal: roda em Windows 32 e 64 bits (corrige falha de compactacao da 2.2.58 em Windows 32-bit).\\n2. Compactacao nunca usa Compress-Archive: se o 7-Zip nao executar, usa o ZipFile do .NET.\\n3. Bancos \u003e 2 GB: 2a tentativa com o outro compactador e conferencia independente pelo 7-Zip quando o leitor .NET da maquina diverge (SHA-256 identico exigido).\\n4. 7-Zip so da pasta do sistema, com checagem de arquitetura; extracao da auditoria nunca usa .fbk antigo; compatibilidade PS 3/4.",
-    "setupSha256":  "3D12171549691D77A8DFEA1F667C882C61EB60E7EBB1BA53E07976C6A4DC36AB",
-    "engineSha256":  "0F69D5DF134F392B3766F479261CEC4B482BA8DCDD79F52B2F1F0C0AA3B814C1",
-    "signature":  "PV/RmPssB99GiOMp4E0rcFI2D3WWnd9fQBGMxKujV/iuXQASE2V8X1FYKm+cxFef6AZyk3mOjJzWQS5eC6zVdwC3FAeRV4s2XWXGd4NFYaublqh2zkMBPzO8NbR3zsQSJHVyDIQaDFyKKCIKdBWwW7JsK378evFxq/mbMYojmq9NUedIB3e1sLxzbmV87yw0FAspIYXp64LcmYEO1Io9VAoegDL00DCsU+yPXavVp8Fx+VHWp54oXWpwh/eqBHq1uSrPXrYbrx3HGsOwzF2D1ZvSxevvfFwPRcEjwkXtV2Fvt6PVT/sAfwuzArFMRAySviVcfZVRy1pSruNiSrmiXBjzORh7jEOUgouSvFH5p5JuaOrYsLAoli6bYNEn0dUBEnessK2ex1U51h+Es06PKckfRE89JG69IDab1Ljd5Cd9aLR4DkvJyx19wszyKqI9l4JyvFHWxxGMaeyYffg+mxpAVj39mSlr18nzYsqZ7/0uA/Niyp0XAoIstIES2wqg"
+    "changelog":  "1. Disco/memoria instavel: se a copia GZ divergir, o motor rele o .fbk; se a releitura mudar, avisa LEITURA INSTAVEL DO DISCO/MEMORIA e refaz o backup inteiro em outra pasta.\\n2. Pasta temporaria automatica: prefere outro disco fisico que o do banco, sem alerta SMART; pasta que falhou fica em quarentena por 7 dias.\\n3. E-mail de falha traz SAUDE DO ARMAZENAMENTO: disco fisico de cada pasta, SMART e erros de disco/NTFS/WHEA dos ultimos 7 dias.\\n4. Novo aviso [MEC AVISO HARDWARE] (1 por dia) quando o backup so passou na 2a rodada.\\n5. Mantem as correcoes da 2.2.59 (7-Zip x86 universal, sem Compress-Archive).",
+    "setupSha256":  "E1A473E1C5A74EB0D69216A9270EB31A90E54699C471541C8F73F22F95FFAE9B",
+    "engineSha256":  "931F6EF9CE6D893E4F6DEAA54CC66ACCF1A8BC769838A0104992AAD0A43A59A9",
+    "signature":  "UK365YSHkHgoQZqWqmkzTnMYUjR/WTT1mHYUDC/byqZRVoQAWVVyZmkd9dhp+8W9eBh1Qg7Xs+dQ8BMIgBPHpDLH/MG/IqPtjidIbWXWduOeurK0T8IEuMdcrIafFlHCwnqNdKPGwJev7ewxsKEXfbfpHkfUPbd8cvl4D+hDN5NiNwK41R++RT6vl5i4FaB6+xtI5mE6W02fgqmrtdFpOWxbUe1Yd+2foFi2r5bvtubGmwkNZnfeaoJ1eqoEL1KCBHwn5WT6wJ6r5LrOW7eLj9eEJpwi5N9az3UeK6D96sji7BdcaOiydZ8ngM4QxnpYkNcGzMcUysLUWGlK7trmxMywAF33cHt9KwMy4s062e4oxImrWh7vox9hL4Y798+1+Eyl2fFFAnMdHR7SsXk0VT9Okk8e1/pwL0p1T7HNN4PjR17G2ug2w1gXIFzvWYSsU3Jl3CkWeRUsWe25GI7sHSMeMefiqE++/hLKvuacjNPxWuGsTBlzNmiuY+BFrHS+"
 }
