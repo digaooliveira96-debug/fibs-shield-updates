@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.60"
+$script:EngineVersion = "2.2.61"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -1398,6 +1398,180 @@ function Get-FirebirdEnvironment {
     return @{ ISC_USER = $User; ISC_PASSWORD = $Password }
 }
 
+# ------------------------------------------------------------------------------
+# v2.2.61: E-MAILS CLAROS, SEM FLOOD E FORA DO SPAM
+# ------------------------------------------------------------------------------
+# Parte text/plain gerada do HTML: filtros anti-spam pontuam mensagens so-HTML.
+function ConvertTo-MailPlainText {
+    param([string]$Html)
+    if ([string]::IsNullOrEmpty($Html)) { return "" }
+    $t = $Html
+    $t = [regex]::Replace($t, '(?is)<(style|script|head|title)[^>]*>.*?</\1>', '')
+    $t = [regex]::Replace($t, '(?is)<!--.*?-->', '')
+    $t = [regex]::Replace($t, '(?i)<br\s*/?>', "`n")
+    $t = [regex]::Replace($t, '(?i)</(p|div|tr|li|h[1-6]|table)>', "`n")
+    $t = [regex]::Replace($t, '(?i)<li[^>]*>', '- ')
+    $t = [regex]::Replace($t, '(?i)</td>', ' ')
+    $t = [regex]::Replace($t, '<[^>]+>', '')
+    $t = [System.Net.WebUtility]::HtmlDecode($t)
+    $linhas = @()
+    $ultimaVazia = $true
+    foreach ($l in ($t -split "`r?`n")) {
+        $x = [regex]::Replace($l, '[ \t\u00a0]+', ' ').Trim()
+        if ($x.Length -gt 0) { $linhas += $x; $ultimaVazia = $false }
+        elseif (-not $ultimaVazia) { $linhas += ""; $ultimaVazia = $true }
+    }
+    return (($linhas -join "`r`n").Trim())
+}
+
+function Get-MailDomainOf {
+    param([string]$Address)
+    $a = "$Address".Trim().TrimEnd('>')
+    $i = $a.LastIndexOf('@')
+    if ($i -lt 0 -or $i -ge $a.Length - 1) { return "" }
+    return $a.Substring($i + 1).Trim().ToLowerInvariant()
+}
+
+# Cabecalhos de e-mail automatico + parte texto. Chamar DEPOIS de adicionar a parte
+# HTML: o texto entra na posicao 0 (multipart/alternative: o ultimo e o preferido).
+function Add-MecMailDeliverability {
+    param([System.Net.Mail.MailMessage]$Mail, [string]$Sender, [string]$HtmlBody, [string]$PlainText = "")
+    if ($null -eq $Mail) { return }
+    try {
+        $dom = Get-MailDomainOf -Address $Sender
+        if ([string]::IsNullOrEmpty($dom)) { $dom = "mecshield.local" }
+        $Mail.Headers["Message-ID"] = ("<{0}.{1}@{2}>" -f (Get-Date -Format "yyyyMMddHHmmss"), [Guid]::NewGuid().ToString("N"), $dom)
+        $Mail.Headers["Auto-Submitted"] = "auto-generated"
+        $Mail.Headers["X-Auto-Response-Suppress"] = "All"
+        $Mail.Headers["X-Mailer"] = "MEC Shield $($script:EngineVersion)"
+    } catch {}
+    try {
+        if ([string]::IsNullOrWhiteSpace($PlainText)) { $PlainText = ConvertTo-MailPlainText -Html $HtmlBody }
+        if (-not [string]::IsNullOrWhiteSpace($PlainText)) {
+            $txt = [System.Net.Mail.AlternateView]::CreateAlternateViewFromString($PlainText, [System.Text.Encoding]::UTF8, "text/plain")
+            $Mail.AlternateViews.Insert(0, $txt)
+        }
+    } catch {}
+}
+
+# Limite global por servidor (todas as tarefas e tipos somados): no maximo N e-mails
+# em 24h (padrao 4, Preferences.MaxEmailsPerDay). O 1o alerta de uma falha real nova,
+# o "Resolvido" e as boas-vindas passam sempre (-Essential).
+function Get-MailBudgetFile { return (Join-Path $scriptDir "email_limite.json") }
+
+function Get-MailDailyLimit {
+    $lim = 4
+    try {
+        if ($null -ne $global:configData -and $null -ne $global:configData.Preferences -and [int]$global:configData.Preferences.MaxEmailsPerDay -gt 0) {
+            $lim = [int]$global:configData.Preferences.MaxEmailsPerDay
+        }
+    } catch {}
+    return $lim
+}
+
+function Get-MailBudgetState {
+    $st = [PSCustomObject]@{ Envios = @(); Suprimidos = 0 }
+    $f = Get-MailBudgetFile
+    try {
+        if (Test-Path $f) {
+            $raw = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
+            $agora = Get-Date
+            $validos = @()
+            foreach ($e in @($raw.Envios)) {
+                try {
+                    $dt = [DateTime]::Parse("$e")
+                    if ($dt -gt $agora.AddHours(-24) -and $dt -le $agora.AddMinutes(5)) { $validos += "$e" }
+                } catch {}
+            }
+            $st.Envios = $validos
+            if ($null -ne $raw.Suprimidos) { $st.Suprimidos = [int]$raw.Suprimidos }
+        }
+    } catch {}
+    return $st
+}
+
+function Test-MailBudget {
+    return (@((Get-MailBudgetState).Envios).Count -lt (Get-MailDailyLimit))
+}
+
+function Register-MailBudget {
+    param([switch]$Sent, [switch]$Suppressed)
+    $f = Get-MailBudgetFile
+    try {
+        Invoke-WithMecLock -Name "MailBudget" -Script {
+            $st = Get-MailBudgetState
+            $envios = @($st.Envios)
+            $sup = [int]$st.Suprimidos
+            if ($Sent) { $envios += (Get-Date).ToString("o"); $sup = 0 }
+            if ($Suppressed) { $sup++ }
+            Save-JsonState -Path $f -Data @{ Envios = $envios; Suprimidos = $sup } -Depth 3
+        }
+    } catch { Log-Message "Aviso: nao foi possivel registrar o limite diario de e-mails: $_" }
+}
+
+# Escada de avisos de hardware (backup SALVO, disco/memoria instavel):
+# 1o na hora, 2o apos 3 dias, 3o apos mais 7 dias, depois silencio (lembrete a cada 30 dias).
+function Get-HardwareWarningDue {
+    param([int]$Sent, $LastWarning, [datetime]$Now = (Get-Date))
+    if ($Sent -le 0) { return $true }
+    if ($null -eq $LastWarning -or [string]::IsNullOrWhiteSpace("$LastWarning")) { return $true }
+    try { $dias = ($Now - [DateTime]::Parse("$LastWarning")).TotalDays } catch { return $true }
+    if ($dias -lt 0) { return $false }
+    $prazo = if ($Sent -eq 1) { 3 } elseif ($Sent -eq 2) { 7 } else { 30 }
+    return ($dias -ge $prazo)
+}
+
+# Escada de alertas de falha real (backup NAO salvo): 1o imediato, 2o apos o cooldown
+# (12h), depois 1 por dia enquanto continuar.
+function Get-FailureAlertIntervalHours {
+    param([int]$Sent, [int]$CooldownHours = 12)
+    if ($Sent -le 0) { return 0 }
+    if ($Sent -eq 1) { return $CooldownHours }
+    return [Math]::Max(24, $CooldownHours)
+}
+
+function Format-ElapsedPt {
+    param([TimeSpan]$Span)
+    if ($Span.TotalHours -lt 1) { return "$([int][Math]::Max(1, [Math]::Floor($Span.TotalMinutes))) min" }
+    if ($Span.TotalHours -lt 48) { return "$([int][Math]::Floor($Span.TotalHours)) h" }
+    return "$([int][Math]::Floor($Span.TotalDays)) dias"
+}
+
+# Ultimo backup valido (sequencia normal do prefixo) nos destinos LOCAIS da tarefa.
+function Get-LastGoodBackupText {
+    param([string]$Prefix, [string[]]$Destinations)
+    if ([string]::IsNullOrWhiteSpace($Prefix)) { return "" }
+    $melhor = $null
+    foreach ($d in @($Destinations)) {
+        if ([string]::IsNullOrWhiteSpace($d) -or $d.StartsWith("\\")) { continue }
+        try {
+            if (-not (Test-Path $d)) { continue }
+            $f = @(Get-PrefixBackupFiles -Directory $d -Prefix $Prefix) | Select-Object -First 1
+            if ($null -ne $f -and ($null -eq $melhor -or $f.LastWriteTime -gt $melhor.LastWriteTime)) { $melhor = $f }
+        } catch {}
+    }
+    if ($null -eq $melhor) { return "" }
+    $hoje = (Get-Date).Date
+    $quando = if ($melhor.LastWriteTime.Date -eq $hoje) { "hoje " + $melhor.LastWriteTime.ToString("HH:mm") }
+              elseif ($melhor.LastWriteTime.Date -eq $hoje.AddDays(-1)) { "ontem " + $melhor.LastWriteTime.ToString("HH:mm") }
+              else { $melhor.LastWriteTime.ToString("dd/MM/yyyy HH:mm") }
+    return "$quando - $($melhor.Name) ($([math]::Round($melhor.Length / 1MB, 1)) MB) em $(Split-Path $melhor.FullName -Parent)"
+}
+
+# Algum disco das pastas informadas com SMART acusando falha? (piora = reinicia a escada)
+function Test-AnySmartFailure {
+    param([string[]]$Paths)
+    try {
+        $map = Get-SmartPredictFailureMap
+        foreach ($p in @($Paths)) {
+            if ([string]::IsNullOrWhiteSpace($p) -or $p.StartsWith("\\")) { continue }
+            $d = Get-PhysicalDiskOfPath -Path ([System.IO.Path]::GetPathRoot($p))
+            if ($null -ne $d -and (Test-SmartPredictFailure -Disk $d -Map $map) -eq $true) { return $true }
+        }
+    } catch {}
+    return $false
+}
+
 # Funcao de Envio de Notificacao por E-mail (SMTP)
 # Envio de e-mail com retentativas. O resultado sai em $global:mailSent.
 # Isso importa porque os cooldowns anti-flood (12h para falha, prazo do monitor para
@@ -1411,11 +1585,33 @@ function Send-MailWithRetry {
         [int]$Port,
         [bool]$UseSsl,
         $Pref,
-        [int]$Attempts = 3
+        [int]$Attempts = 3,
+        [switch]$Essential
     )
     # IMPORTANTE: o resultado sai por $global:mailSent, NAO pelo valor de retorno
     # (padrao mantido por compatibilidade com os chamadores).
     $global:mailSent = $false
+    $global:mailSuppressedByBudget = $false
+
+    # Limite global por servidor (v2.2.61). Suprimido = nao entregue: o chamador nao arma
+    # cooldown e a proxima rotina tenta de novo quando a janela de 24h liberar.
+    if (-not $Essential -and -not (Test-MailBudget)) {
+        $global:mailSuppressedByBudget = $true
+        Register-MailBudget -Suppressed
+        Log-Message "LIMITE DIARIO DE E-MAILS: este servidor ja enviou $(Get-MailDailyLimit) e-mail(s) nas ultimas 24h. Aviso '$($Mail.Subject)' suprimido para nao lotar a caixa de entrada (a proxima rotina tenta de novo)."
+        return
+    }
+
+    # Anti-spam: remetente de dominio diferente do usuario SMTP reprova no DMARC do
+    # provedor do destinatario (vai para o lixo eletronico).
+    try {
+        $domFrom = Get-MailDomainOf -Address "$($Mail.From.Address)"
+        $domUser = Get-MailDomainOf -Address "$($Pref.SmtpUser)"
+        if ($domFrom -and $domUser -and $domFrom -ne $domUser) {
+            Log-Message "Aviso anti-spam: o remetente ($($Mail.From.Address)) e de dominio diferente do usuario SMTP ($($Pref.SmtpUser)). Provedores com DMARC podem mandar o e-mail para o SPAM; use um remetente @$domUser."
+        }
+    } catch {}
+
     # webmail.mectelecom.com.br apresenta o certificado *.hostgator.com.br (nome nao
     # confere). mail.mectelecom.com.br e o nome oficial do cPanel e tem certificado
     # *.mectelecom.com.br valido na 587. Configs antigos seguem funcionando sem editar.
@@ -1467,6 +1663,7 @@ function Send-MailWithRetry {
                 $smtp.Timeout = 25000
                 $smtp.Send($Mail)
                 $global:mailSent = $true
+                Register-MailBudget -Sent
                 return
             } catch {
                 $inner = if ($_.Exception -and $_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
@@ -1519,6 +1716,14 @@ function New-TaskNotificationState {
         ConsecutiveFailures = 0
         LastConfigWarning   = $null
         LastHardwareWarning = $null
+        # v2.2.61: escadas de aviso
+        FailureAlertsSent   = 0
+        FailureEpisodeStart = $null
+        LastSuccess         = $null
+        HwWarningsSent      = 0
+        HwLastWarning       = $null
+        HwLastEvent         = $null
+        HwSmartFail         = $false
     }
 }
 
@@ -1588,7 +1793,9 @@ function Send-BackupNotification {
         [string]$CompressionRatio = "",
         [string]$FreeSpaceInfo = "",
         [string[]]$SuccessDests = @(),
-        [string[]]$WarningDests = @()
+        [string[]]$WarningDests = @(),
+        [bool]$HardwareSmartFail = $false,
+        [string]$UnverifiedCopy = ""
     )
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
@@ -1625,18 +1832,41 @@ function Send-BackupNotification {
         $bannerBg = "#10b981"
         $statusTitle = ""
         $bannerType = "OK"
+        # v2.2.61: assunto em frase normal, escadas de aviso e "Resolvido"
+        $assunto = ""
+        $essencial = $false
+        $hwOrdem = 0
+        $semBackupTxt = ""
+        $falhasAntes = 0
+        $agora = Get-Date
 
         if ($Status -eq "SUCESSO") {
+            $falhasAntes = [int]$state.ConsecutiveFailures
             $state.ConsecutiveFailures = 0
+            $state.LastSuccess = $agora.ToString("o")
 
             if ($state.InFailureState -eq $true) {
-                # RECUPERADO de falha critica - silencioso, apenas limpa o estado
+                # RECUPERADO de falha: 1 e-mail "Resolvido" SO se um alerta de falha chegou
+                # a ser entregue neste episodio. Sem alerta enviado, segue silencioso.
+                $alertaSaiu = ([int]$state.FailureAlertsSent -gt 0) -or -not [string]::IsNullOrWhiteSpace("$($state.LastFailureAlert)")
                 $state.InFailureState = $false
                 $state.LastFailureAlert = $null
+                $state.FailureAlertsSent = 0
+                $state.FailureEpisodeStart = $null
                 if ($WarningDests.Count -gt 0) { $state.InWarningState = $true }
-                Log-Message "Sistema recuperado de falha anterior. Backup voltou a funcionar normalmente (notificacao suprimida - Zero Spam)."
                 Save-TaskNotificationState -TaskName $TaskName -State $state
-                return
+                if (-not $alertaSaiu -or $pref.NotifyOnFailure -ne $true) {
+                    Log-Message "Sistema recuperado de falha anterior. Backup voltou a funcionar normalmente (nenhum alerta havia sido enviado: notificacao suprimida - Zero Spam)."
+                    return
+                }
+                Log-Message "Sistema recuperado de falha anterior: enviando 1 e-mail de RESOLVIDO (o cliente tinha recebido alerta de falha)."
+                $Status = "RESOLVIDO"
+                $isRecovery = $true
+                $shouldSend = $true
+                $essencial = $true
+                $subjectTag = "[MEC RESOLVIDO]"
+                $statusTitle = "RESOLVIDO: O BACKUP VOLTOU AO NORMAL"
+                $assunto = "[MEC Shield] Resolvido: backup voltou ao normal - $TaskName"
             } elseif ($WarningDests.Count -eq 0 -and $state.InWarningState -eq $true) {
                 # RECUPERADO de destino de rede offline - silencioso, apenas limpa o estado
                 $state.InWarningState = $false
@@ -1665,28 +1895,44 @@ function Send-BackupNotification {
         } elseif ($Status -eq "FALHA") {
             $state.InFailureState = $true
             $state.ConsecutiveFailures++
+            if ([string]::IsNullOrWhiteSpace("$($state.FailureEpisodeStart)")) { $state.FailureEpisodeStart = $agora.ToString("o") }
 
             if ($pref.NotifyOnFailure -ne $true) {
                 Save-TaskNotificationState -TaskName $TaskName -State $state
                 return
             }
 
-            # Validacao de Cooldown Anti-Flood (nao mandar a cada hora se falhar repetidamente)
-            if (Test-WithinCooldown -Timestamp $state.LastFailureAlert -Hours $cooldownHours) {
+            # Escada anti-flood (v2.2.61): 1o alerta imediato, 2o apos o cooldown (12h),
+            # depois 1 por dia enquanto continuar sem backup.
+            $enviados = [int]$state.FailureAlertsSent
+            if ($enviados -le 0 -and -not [string]::IsNullOrWhiteSpace("$($state.LastFailureAlert)")) { $enviados = 1 }  # estado gravado por versao anterior
+            $state.FailureAlertsSent = $enviados
+            $intervalo = Get-FailureAlertIntervalHours -Sent $enviados -CooldownHours $cooldownHours
+            if ($intervalo -gt 0 -and (Test-WithinCooldown -Timestamp $state.LastFailureAlert -Hours $intervalo)) {
                 $hoursSince = ((Get-Date) - [DateTime]::Parse("$($state.LastFailureAlert)")).TotalHours
-                Log-Message "ANTI-FLOOD ATIVO: Alerta de falha ja enviado ha $([Math]::Round($hoursSince, 1))h. E-mail suprimido para nao lotar a caixa de entrada (Cooldown: ${cooldownHours}h)."
+                Log-Message "ANTI-FLOOD ATIVO: Alerta de falha ja enviado ha $([Math]::Round($hoursSince, 1))h ($enviados alerta(s) neste episodio). Proximo lembrete so apos ${intervalo}h. E-mail suprimido para nao lotar a caixa de entrada."
                 Save-TaskNotificationState -TaskName $TaskName -State $state
                 return
             }
 
             $shouldSend = $true
+            # O 1o alerta de uma falha nova passa mesmo com o limite diario estourado.
+            $essencial = ($enviados -le 0)
             $subjectTag = "[MEC ALERTA CRITICO]"
-            $statusTitle = "FALHA CRITICA NA ROTINA DE BACKUP"
             $bannerBg = "#dc2626"
             $bannerType = "ALERT"
+            $baseSemBackup = if (-not [string]::IsNullOrWhiteSpace("$($state.LastSuccess)")) { "$($state.LastSuccess)" } else { "$($state.FailureEpisodeStart)" }
+            try { $semBackupTxt = Format-ElapsedPt ($agora - [DateTime]::Parse($baseSemBackup)) } catch { $semBackupTxt = "" }
+            if ($enviados -le 0 -or [string]::IsNullOrWhiteSpace($semBackupTxt)) {
+                $statusTitle = "FALHA: O BACKUP NAO FOI SALVO"
+                $assunto = "[MEC Shield] Alerta: backup nao foi salvo - $SubjectInfo"
+            } else {
+                $statusTitle = "FALHA CONTINUA: SEM BACKUP HA $($semBackupTxt.ToUpperInvariant())"
+                $assunto = "[MEC Shield] Alerta: ainda sem backup ha $semBackupTxt - $SubjectInfo"
+            }
 
-            # NAO armar $state.LastFailureAlert aqui: o cooldown de ${cooldownHours}h so e
-            # gravado depois que o envio for confirmado, la no fim desta funcao.
+            # NAO armar $state.LastFailureAlert aqui: o cooldown so e gravado depois que o
+            # envio for confirmado, la no fim desta funcao.
             Save-TaskNotificationState -TaskName $TaskName -State $state
         } elseif ($Status -eq "AVISO") {
             # Problema de configuracao que NAO impediu o backup (ex.: banco encontrado
@@ -1700,21 +1946,59 @@ function Send-BackupNotification {
             $shouldSend = $true
             $subjectTag = "[MEC AVISO]"
             $statusTitle = "ATENCAO: CONFIGURACAO PRECISA DE REVISAO"
+            $assunto = "[MEC Shield] Aviso: $SubjectInfo"
             $bannerBg = "#d97706"
             $bannerType = "WARNING"
         } elseif ($Status -eq "AVISO_HARDWARE") {
             # Backup SALVO (2a rodada), mas o servidor deu leitura instavel de disco ou
-            # memoria. Avisa no maximo 1 vez a cada 24h por tarefa, sem estado de falha.
+            # memoria. Escada (v2.2.61): 1o agora, 2o apos 3 dias, 3o apos mais 7 dias,
+            # depois silencio (lembrete a cada 30 dias). Recomeca se PIORAR (SMART passou a
+            # acusar falha) ou se o problema voltar depois de 14 dias sem acontecer.
+            $enviadosHw = [int]$state.HwWarningsSent
+            if ($enviadosHw -le 0 -and (Test-WithinCooldown -Timestamp $state.LastHardwareWarning -Hours 336)) {
+                # estado gravado pela 2.2.60 (so tinha LastHardwareWarning)
+                $enviadosHw = 1
+                if ([string]::IsNullOrWhiteSpace("$($state.HwLastWarning)")) { $state.HwLastWarning = $state.LastHardwareWarning }
+            }
+            $ultimoEvento = $null
+            try { if (-not [string]::IsNullOrWhiteSpace("$($state.HwLastEvent)")) { $ultimoEvento = [DateTime]::Parse("$($state.HwLastEvent)") } } catch {}
+            if ($null -ne $ultimoEvento -and ($agora - $ultimoEvento).TotalDays -ge 14) {
+                if ($enviadosHw -gt 0) { Log-Message "Instabilidade de hardware voltou apos 14+ dias sem ocorrencia: escada de avisos reiniciada." }
+                $enviadosHw = 0
+                $state.HwSmartFail = $false
+            }
+            if ($HardwareSmartFail -and -not [bool]$state.HwSmartFail) {
+                if ($enviadosHw -gt 0) { Log-Message "PIOROU: o SMART passou a acusar falha num disco do servidor. Escada de avisos de hardware reiniciada." }
+                $enviadosHw = 0
+            }
+            $state.HwSmartFail = ([bool]$state.HwSmartFail -or $HardwareSmartFail)
+            $state.HwLastEvent = $agora.ToString("o")
+            $state.HwWarningsSent = $enviadosHw
+            Save-TaskNotificationState -TaskName $TaskName -State $state
+
             if ($pref.NotifyOnFailure -ne $true) { return }
-            if (Test-WithinCooldown -Timestamp $state.LastHardwareWarning -Hours 24) {
-                Log-Message "Aviso de hardware ja enviado nas ultimas 24h. E-mail suprimido (Zero Spam)."
+            if (-not (Get-HardwareWarningDue -Sent $enviadosHw -LastWarning $state.HwLastWarning -Now $agora)) {
+                Log-Message "Aviso de hardware suprimido (Zero Spam): $([Math]::Min($enviadosHw, 3)) de 3 aviso(s) ja enviado(s). Proximo so no prazo da escada ou se piorar."
                 return
             }
+            $hwOrdem = $enviadosHw + 1
             $shouldSend = $true
             $subjectTag = "[MEC AVISO HARDWARE]"
-            $statusTitle = "BACKUP SALVO, MAS O SERVIDOR TEM DISCO/MEMORIA INSTAVEL"
             $bannerBg = "#d97706"
             $bannerType = "WARNING"
+            if ($hwOrdem -eq 1) {
+                $statusTitle = "BACKUP SALVO, MAS O SERVIDOR TEM DISCO/MEMORIA INSTAVEL"
+                $assunto = "[MEC Shield] Aviso: backup salvo, mas o disco/memoria do servidor esta instavel"
+            } elseif ($hwOrdem -eq 2) {
+                $statusTitle = "LEMBRETE (2 DE 3): DISCO/MEMORIA DO SERVIDOR CONTINUA INSTAVEL"
+                $assunto = "[MEC Shield] Lembrete (2 de 3): disco/memoria do servidor continua instavel"
+            } elseif ($hwOrdem -eq 3) {
+                $statusTitle = "ULTIMO AVISO (3 DE 3): DISCO/MEMORIA DO SERVIDOR INSTAVEL"
+                $assunto = "[MEC Shield] Ultimo aviso (3 de 3): disco/memoria instavel - nao vamos repetir este alerta"
+            } else {
+                $statusTitle = "LEMBRETE MENSAL: DISCO/MEMORIA DO SERVIDOR CONTINUA INSTAVEL"
+                $assunto = "[MEC Shield] Lembrete mensal: disco/memoria do servidor continua instavel"
+            }
         }
 
         if (-not $shouldSend) { return }
@@ -1722,6 +2006,59 @@ function Send-BackupNotification {
         # Tudo que vem de mensagens de erro, caminhos e config entra no HTML escapado.
         $clientNameHtml = ConvertTo-HtmlSafe $clientName
         $diag = if ($Status -eq "FALHA" -or $Status -eq "AVISO" -or $Status -eq "AVISO_HARDWARE") { Get-FailureDiagnosis -Text $BodyDetails -SubjectInfo $SubjectInfo } else { $null }
+        $bodyDetailsRaw = "$BodyDetails"
+
+        # ---- TOPO (v2.2.61): 3 respostas antes de qualquer detalhe tecnico ----
+        $pfxTopo = Get-Variable -Name basePrefix -ValueOnly -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace("$pfxTopo")) { $pfxTopo = $TaskName }
+        $destTopo = @(Get-Variable -Name resolvedDestList -ValueOnly -ErrorAction SilentlyContinue | Where-Object { $_ })
+        if ($destTopo.Count -eq 0) {
+            try {
+                $tkTopo = @($global:configData.Tasks | Where-Object { $_.TaskName -eq $TaskName }) | Select-Object -First 1
+                if ($null -ne $tkTopo -and $null -ne $tkTopo.Destinations) { $destTopo = @($tkTopo.Destinations) }
+            } catch {}
+        }
+        $ultimoBom = ""
+        try { $ultimoBom = Get-LastGoodBackupText -Prefix "$pfxTopo" -Destinations $destTopo } catch {}
+        $ultimoBomHtml = ConvertTo-HtmlSafe $ultimoBom
+        $topoCor = "#d97706"
+        $topoSeguroCor = "#fde68a"
+        $topoAconteceu = ""
+        $topoSeguro = ""
+        $topoFazer = ""
+        $topoNota = ""
+        $primeiroPasso = if ($null -ne $diag -and @($diag.Passos).Count -gt 0) { @($diag.Passos)[0] } else { "" }
+        if ($Status -eq "FALHA") {
+            $topoCor = "#dc2626"
+            $topoSeguroCor = "#fecaca"
+            $topoAconteceu = if ($null -ne $diag) { $diag.Titulo } else { ConvertTo-HtmlSafe $SubjectInfo }
+            if ([int]$state.FailureAlertsSent -gt 0 -and $semBackupTxt) { $topoAconteceu += " (sem backup h&aacute; $semBackupTxt)" }
+            $topoSeguro = "<strong>N&Atilde;O.</strong> O backup desta rotina n&atilde;o foi salvo."
+            if ($ultimoBomHtml) { $topoSeguro += " O &uacute;ltimo backup v&aacute;lido continua guardado: $ultimoBomHtml." }
+            if (-not [string]::IsNullOrWhiteSpace($UnverifiedCopy)) { $topoSeguro += " Uma c&oacute;pia N&Atilde;O conferida (&uacute;ltimo recurso) ficou em $(ConvertTo-HtmlSafe $UnverifiedCopy): use s&oacute; se nenhum backup v&aacute;lido restaurar." }
+            $topoFazer = if ($primeiroPasso) { $primeiroPasso } else { "Acessar o servidor e seguir os passos de A&Ccedil;&Atilde;O RECOMENDADA abaixo." }
+            if ([int]$state.FailureAlertsSent -gt 0) { $topoNota = "Lembrete de uma falha que continua. Enquanto n&atilde;o for resolvida, o MEC Shield avisa no m&aacute;ximo 1 vez por dia." }
+        } elseif ($Status -eq "AVISO_HARDWARE") {
+            $topoAconteceu = "O disco ou a mem&oacute;ria do servidor deu leitura inst&aacute;vel. O MEC Shield percebeu, descartou a c&oacute;pia duvidosa e refez o backup em outra pasta."
+            $topoSeguro = "<strong>SIM.</strong> O backup foi salvo e conferido (SHA-256 id&ecirc;ntico ao banco)."
+            if ($ultimoBomHtml) { $topoSeguro += " &Uacute;ltimo backup v&aacute;lido: $ultimoBomHtml." }
+            $topoFazer = "Trocar o disco indicado em SA&Uacute;DE DO ARMAZENAMENTO (abaixo) ou testar a mem&oacute;ria (mdsched). N&atilde;o &eacute; urgente hoje: o MEC Shield est&aacute; contornando sozinho."
+            $topoNota = if ($hwOrdem -le 3) { "Aviso $hwOrdem de 3. Depois do 3&ordm; o MEC Shield para de repetir este alerta e s&oacute; volta a avisar se piorar." } else { "Lembrete mensal: o problema continua. O MEC Shield segue contornando sozinho." }
+        } elseif ($Status -eq "AVISO") {
+            $topoAconteceu = if ($null -ne $diag) { $diag.Titulo } else { ConvertTo-HtmlSafe $SubjectInfo }
+            $topoSeguro = "<strong>SIM.</strong> Este aviso n&atilde;o impede o backup: a rotina continua normalmente."
+            $topoFazer = if ($primeiroPasso) { $primeiroPasso } else { "Revisar a configura&ccedil;&atilde;o da tarefa no painel do MEC Shield." }
+        } elseif ($Status -eq "RESOLVIDO") {
+            $topoCor = "#10b981"
+            $topoSeguroCor = "#a7f3d0"
+            $topoAconteceu = "O backup da tarefa $(ConvertTo-HtmlSafe $TaskName) voltou a funcionar depois de $falhasAntes rotina(s) com falha."
+            $topoSeguro = "<strong>SIM.</strong>"
+            if ($ultimoBomHtml) { $topoSeguro += " &Uacute;ltimo backup v&aacute;lido: $ultimoBomHtml." }
+            $topoFazer = "Nada. Os alertas anteriores est&atilde;o encerrados."
+        }
+        $suprimidosHoje = 0
+        try { $suprimidosHoje = [int](Get-MailBudgetState).Suprimidos } catch {}
+
         $BodyDetails = ConvertTo-HtmlSafe $BodyDetails
         $DbPath = ConvertTo-HtmlSafe $DbPath
         $SuccessDests = @($SuccessDests | ForEach-Object { ConvertTo-HtmlSafe $_ })
@@ -1837,6 +2174,22 @@ function Send-BackupNotification {
           <tr>
             <td bgcolor="$bannerBg" style="background-color:$bannerBg; color:#ffffff; padding:13px 28px; font-weight:800; font-size:14.5px; letter-spacing:0.5px; text-transform:uppercase;">
               &#9679; $statusTitle
+            </td>
+          </tr>
+
+          <!-- TOPO v2.2.61: 3 RESPOSTAS ANTES DO DETALHE TECNICO -->
+          <tr>
+            <td bgcolor="#111827" style="background-color:#111827; padding:18px 28px 6px 28px;">
+              <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#0f172a" style="background-color:#0f172a; border:1px solid #334155; border-left:6px solid $topoCor; border-radius:8px;">
+                <tr><td style="padding:14px 18px 2px 18px; color:#94a3b8; font-size:12px; font-weight:800; letter-spacing:0.6px;">O QUE ACONTECEU</td></tr>
+                <tr><td style="padding:0 18px 12px 18px; color:#ffffff; font-size:16px; line-height:1.5;">$topoAconteceu</td></tr>
+                <tr><td style="padding:2px 18px 2px 18px; color:#94a3b8; font-size:12px; font-weight:800; letter-spacing:0.6px;">O BACKUP EST&Aacute; SEGURO?</td></tr>
+                <tr><td style="padding:0 18px 12px 18px; color:$topoSeguroCor; font-size:16px; line-height:1.5;">$topoSeguro</td></tr>
+                <tr><td style="padding:2px 18px 2px 18px; color:#94a3b8; font-size:12px; font-weight:800; letter-spacing:0.6px;">O QUE FAZER AGORA</td></tr>
+                <tr><td style="padding:0 18px 14px 18px; color:#ffffff; font-size:16px; line-height:1.5;">$topoFazer</td></tr>
+                $(if ($topoNota) { "<tr><td style='padding:0 18px 14px 18px; color:#94a3b8; font-size:12.5px; font-style:italic;'>$topoNota</td></tr>" })
+                $(if ($suprimidosHoje -gt 0) { "<tr><td style='padding:0 18px 14px 18px; color:#94a3b8; font-size:12.5px; font-style:italic;'>Outros $suprimidosHoje aviso(s) foram segurados pelo limite di&aacute;rio de e-mails deste servidor (est&atilde;o no log da rotina).</td></tr>" })
+              </table>
             </td>
           </tr>
 
@@ -2055,7 +2408,8 @@ function Send-BackupNotification {
             }
         }
         if ($mail.To.Count -eq 0) { Log-Message "ERRO: nenhum destinatario valido em '$recipient'. E-mail nao enviado."; return }
-        $mail.Subject = "$subjectTag $SubjectInfo - $clientName ($hostName)"
+        if ([string]::IsNullOrWhiteSpace($assunto)) { $assunto = "[MEC Shield] $SubjectInfo" }
+        $mail.Subject = "$assunto - $clientName ($hostName)"
         $mail.SubjectEncoding = [System.Text.Encoding]::UTF8
         $mail.BodyEncoding = [System.Text.Encoding]::UTF8
         $mail.HeadersEncoding = [System.Text.Encoding]::UTF8
@@ -2072,22 +2426,57 @@ function Send-BackupNotification {
         }
         $mail.AlternateViews.Add($altView)
 
-        Send-MailWithRetry -Mail $mail -SmtpServer $smtpServer -Port $port -UseSsl $useSsl -Pref $pref
+        # Parte texto puro (v2.2.61): as mesmas 3 respostas do topo + o detalhe tecnico.
+        $txt = @()
+        $txt += "MEC Shield - $statusTitle"
+        $txt += ""
+        $txt += "O QUE ACONTECEU"
+        $txt += (ConvertTo-MailPlainText -Html $topoAconteceu)
+        $txt += ""
+        $txt += "O BACKUP ESTA SEGURO?"
+        $txt += (ConvertTo-MailPlainText -Html $topoSeguro)
+        $txt += ""
+        $txt += "O QUE FAZER AGORA"
+        $txt += (ConvertTo-MailPlainText -Html $topoFazer)
+        if ($topoNota) { $txt += ""; $txt += (ConvertTo-MailPlainText -Html $topoNota) }
+        if ($suprimidosHoje -gt 0) { $txt += "Outros $suprimidosHoje aviso(s) foram segurados pelo limite diario de e-mails deste servidor." }
+        $txt += ""
+        $txt += "Cliente: $clientName | Servidor: $hostName | Tarefa: $TaskName | $timestampNow"
+        $txt += "AnyDesk: $(ConvertTo-MailPlainText -Html $anyDeskId) | TeamViewer: $(ConvertTo-MailPlainText -Html $teamViewerId)"
+        if ($Status -ne "RESOLVIDO" -and -not [string]::IsNullOrWhiteSpace($bodyDetailsRaw)) {
+            $detTxt = $bodyDetailsRaw
+            if ($detTxt.Length -gt 8000) { $detTxt = $detTxt.Substring(0, 8000) + " [...]" }
+            $txt += ""
+            $txt += "DETALHE TECNICO (para o suporte):"
+            $txt += $detTxt
+        }
+        $txt += ""
+        $txt += "MEC Shield Enterprise v$($script:EngineVersion) - mensagem automatica, nao responda."
+        Add-MecMailDeliverability -Mail $mail -Sender $sender -HtmlBody $htmlBody -PlainText ($txt -join "`r`n")
+
+        Send-MailWithRetry -Mail $mail -SmtpServer $smtpServer -Port $port -UseSsl $useSsl -Pref $pref -Essential:$essencial
         try { $mail.Dispose() } catch {}
 
         if ($global:mailSent) {
             Log-Message "E-mail de notificacao ($subjectTag) enviado com sucesso para: $recipient"
             if ($Status -eq "FALHA") {
                 $state.LastFailureAlert = (Get-Date).ToString("o")
+                $state.FailureAlertsSent = [int]$state.FailureAlertsSent + 1
                 Save-TaskNotificationState -TaskName $TaskName -State $state
-                Log-Message "Cooldown anti-flood de ${cooldownHours}h armado (a partir da entrega confirmada)."
+                $proximo = Get-FailureAlertIntervalHours -Sent ([int]$state.FailureAlertsSent) -CooldownHours $cooldownHours
+                Log-Message "Cooldown anti-flood armado (a partir da entrega confirmada): proximo lembrete desta falha so apos ${proximo}h."
             } elseif ($Status -eq "AVISO") {
                 $state.LastConfigWarning = (Get-Date).ToString("o")
                 Save-TaskNotificationState -TaskName $TaskName -State $state
             } elseif ($Status -eq "AVISO_HARDWARE") {
                 $state.LastHardwareWarning = (Get-Date).ToString("o")
+                $state.HwLastWarning = $state.LastHardwareWarning
+                $state.HwWarningsSent = [Math]::Min(3, $hwOrdem)
                 Save-TaskNotificationState -TaskName $TaskName -State $state
+                Log-Message "Aviso de hardware $([Math]::Min(3, $hwOrdem)) de 3 enviado (escada: +3 dias, +7 dias, depois silencio; lembrete a cada 30 dias)."
             }
+        } elseif ($global:mailSuppressedByBudget) {
+            Log-Message "Aviso segurado pelo limite diario de e-mails. O cooldown nao foi armado: a proxima rotina tenta de novo."
         } else {
             Log-Message "ATENCAO: o e-mail de notificacao NAO pode ser entregue. O cooldown nao sera armado, para que a proxima rotina tente avisar novamente."
         }
@@ -2379,7 +2768,7 @@ function Send-WelcomeEmail {
             }
         }
         if ($mail.To.Count -eq 0) { Log-Message "ERRO: nenhum destinatario valido em '$recipient'. E-mail nao enviado."; return }
-        $mail.Subject = "[NOVA INSTALACAO] FIBS MEC Shield Ativado - $clientName ($hostName)"
+        $mail.Subject = "[MEC Shield] Nova instalacao: protecao ativada - $clientName ($hostName)"
         $mail.SubjectEncoding = [System.Text.Encoding]::UTF8
         $mail.BodyEncoding = [System.Text.Encoding]::UTF8
         $mail.HeadersEncoding = [System.Text.Encoding]::UTF8
@@ -2395,8 +2784,9 @@ function Send-WelcomeEmail {
             $altView.LinkedResources.Add($res)
         }
         $mail.AlternateViews.Add($altView)
+        Add-MecMailDeliverability -Mail $mail -Sender $sender -HtmlBody $htmlBody
 
-        Send-MailWithRetry -Mail $mail -SmtpServer $smtpServer -Port $port -UseSsl $useSsl -Pref $pref
+        Send-MailWithRetry -Mail $mail -SmtpServer $smtpServer -Port $port -UseSsl $useSsl -Pref $pref -Essential
         try { $mail.Dispose() } catch {}
 
         if ($global:mailSent) {
@@ -2700,7 +3090,7 @@ function Send-NetworkFailureAlert {
         $identificacao = if ($rotulo -ne $TaskName -and -not [string]::IsNullOrWhiteSpace($TerminalName)) {
             "$rotulo / $TaskName"
         } else { $TaskName }
-        $mail.Subject = "[MEC ALERTA] $identificacao sem backup ha ${daysStr} - $clientName ($hostName)"
+        $mail.Subject = "[MEC Shield] Alerta: $identificacao sem backup ha ${daysStr} - $clientName ($hostName)"
         $mail.SubjectEncoding = [System.Text.Encoding]::UTF8
         $mail.BodyEncoding = [System.Text.Encoding]::UTF8
         $mail.HeadersEncoding = [System.Text.Encoding]::UTF8
@@ -2716,6 +3106,7 @@ function Send-NetworkFailureAlert {
             $altView.LinkedResources.Add($res)
         }
         $mail.AlternateViews.Add($altView)
+        Add-MecMailDeliverability -Mail $mail -Sender $sender -HtmlBody $htmlBody
 
         Send-MailWithRetry -Mail $mail -SmtpServer $smtpServer -Port $port -UseSsl $useSsl -Pref $pref
         try { $mail.Dispose() } catch {}
@@ -3281,7 +3672,7 @@ function Send-AuditAlertNotification {
             }
         }
         if ($mail.To.Count -eq 0) { Log-Message "ERRO: nenhum destinatario valido em '$recipient'. E-mail nao enviado."; return }
-        $mail.Subject = "[ALERTA DE BANCO SISMOTEL] $Headline - $cleanClient ($hostName)"
+        $mail.Subject = "[MEC Shield] Alerta do banco Sismotel: $Headline - $cleanClient ($hostName)"
         $mail.SubjectEncoding = [System.Text.Encoding]::UTF8
         $mail.BodyEncoding = [System.Text.Encoding]::UTF8
         $mail.HeadersEncoding = [System.Text.Encoding]::UTF8
@@ -3297,8 +3688,9 @@ function Send-AuditAlertNotification {
             $altView.LinkedResources.Add($res)
         }
         $mail.AlternateViews.Add($altView)
+        Add-MecMailDeliverability -Mail $mail -Sender $sender -HtmlBody $htmlBody
 
-        Send-MailWithRetry -Mail $mail -SmtpServer $smtpServer -Port $port -UseSsl $useSsl -Pref $pref
+        Send-MailWithRetry -Mail $mail -SmtpServer $smtpServer -Port $port -UseSsl $useSsl -Pref $pref -Essential
         try { $mail.Dispose() } catch {}
 
         if ($global:mailSent) {
@@ -4520,6 +4912,45 @@ function Select-BackupTempDir {
     return @{ Dir = $null; Recusadas = $recusadas; Criterio = "" }
 }
 
+# Ultimo recurso (v2.2.61): quando todas as rodadas falham na conferencia, guarda o GZ
+# mesmo assim como "<prefixo>-<seq>.GZ.NAO_CONFERIDO" no 1o destino LOCAL com espaco.
+# A extensao propositalmente NAO e .GZ/.zip: fica fora da retencao, da auditoria, do
+# monitor de destinos e da numeracao. So o mais recente por pasta (substitui o anterior).
+function Save-UnverifiedBackupCopy {
+    param([string]$GzPath, [string]$Prefix, [string]$Seq, [string[]]$Destinations)
+    try {
+        if ([string]::IsNullOrWhiteSpace($GzPath) -or -not (Test-Path $GzPath)) { return "" }
+        $len = (Get-Item $GzPath).Length
+        if ($len -le 0) { return "" }
+        $nome = "$Prefix-$Seq.GZ.NAO_CONFERIDO"
+        foreach ($d in @($Destinations)) {
+            if ([string]::IsNullOrWhiteSpace($d) -or $d.StartsWith("\\")) { continue }
+            if (-not (Test-Path $d)) { continue }
+            $raiz = [System.IO.Path]::GetPathRoot($d)
+            $totalMB = 0
+            try { $totalMB = (New-Object System.IO.DriveInfo($raiz)).TotalSize / 1MB } catch {}
+            $precisaMB = [math]::Ceiling($len / 1MB) + (Get-DiskReserveMB -TotalMB $totalMB -IsDbDrive $false)
+            if ((Get-DriveFreeMB -Path $raiz) -lt $precisaMB) {
+                Log-Message "Copia NAO conferida: sem espaco com folga em $d (precisa ~$precisaMB MB). Tentando o proximo destino."
+                continue
+            }
+            $alvo = Join-Path $d $nome
+            Copy-Item -Path $GzPath -Destination $alvo -Force -ErrorAction Stop
+            if ((Get-Item $alvo).Length -ne $len) {
+                Remove-Item $alvo -Force -ErrorAction SilentlyContinue
+                continue
+            }
+            Get-ChildItem -Path $d -Filter "$Prefix-*.NAO_CONFERIDO" -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -ne $nome } |
+                ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+            return $alvo
+        }
+    } catch {
+        Log-Message "Aviso: nao foi possivel guardar a copia NAO conferida: $_"
+    }
+    return ""
+}
+
 function Format-ShaShort {
     param([string]$Hash)
     if ([string]::IsNullOrWhiteSpace($Hash) -or $Hash.Length -lt 16) { return "(nao lido)" }
@@ -5406,6 +5837,8 @@ $seqStr = "{0:D4}" -f $seqNumber
 # falhar na integridade (SRVCC 11/10/2026: leitura instavel de SSD/RAM). O laco fecha
 # logo antes da FASE 5.
 $rodadaMax = 2
+$avisoHwPendente = ""
+$hwSmartFail = $false
 $rodada1Temp = ""
 $rodada1Falha = ""
 $rodada1Instavel = $false
@@ -5580,6 +6013,13 @@ for ($compAttempt = 1; $compAttempt -le $maxCompAttempts; $compAttempt++) {
 }
 
 if (-not $compSuccessFinal) {
+    # Ultima rodada: antes de limpar, guarda o GZ como copia NAO conferida (ultimo
+    # recurso para o dia em que nenhum backup valido restaurar).
+    $copiaNaoConferida = ""
+    if ($rodada -ge $rodadaMax) {
+        $copiaNaoConferida = Save-UnverifiedBackupCopy -GzPath $tempGz -Prefix $basePrefix -Seq $seqStr -Destinations $resolvedDestList
+        if ($copiaNaoConferida) { Log-Message "Copia NAO conferida (ultimo recurso) guardada em: $copiaNaoConferida. Ela NAO conta como backup valido." }
+    }
     if (Test-Path $tempFbk) { Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue }
     if (Test-Path $tempGz) { Remove-Item $tempGz -Force -ErrorAction SilentlyContinue }
     if (Test-Path $gbakLog) { Remove-Item $gbakLog -Force -ErrorAction SilentlyContinue }
@@ -5612,17 +6052,19 @@ if (-not $compSuccessFinal) {
     }
     if (-not [string]::IsNullOrEmpty($rodada1Diag)) { $errMsg += "`nRodada 1: $rodada1Diag" }
     if (-not [string]::IsNullOrEmpty($diagOrigem)) { $errMsg += "`nRodada ${rodada}: $diagOrigem" }
+    if ($copiaNaoConferida) { $errMsg += "`nCOPIA NAO CONFERIDA (ultimo recurso, use so se nenhum backup valido restaurar): $copiaNaoConferida" }
     $saudeDiscos = Get-StorageHealthReport -Paths @($rodada1Temp, $tempDir, $dbPath)
     $errMsg += "`n`nSAUDE DO ARMAZENAMENTO:`n$saudeDiscos"
     Log-Message $errMsg
-    Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha na Compactacao ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB"
+    Send-BackupNotification -Status "FALHA" -SubjectInfo "Falha na Compactacao ($TaskName)" -BodyDetails $errMsg -DbPath $dbPath -DbSize "$dbSizeMB" -UnverifiedCopy $copiaNaoConferida
     Exit-BackupLock
     exit 1
 }
 
 if ($rodada -gt 1) {
     # Backup salvo na 2a rodada: registra a pasta suspeita (as proximas rotinas usam
-    # outra por 7 dias) e avisa o tecnico do hardware, no maximo 1 vez a cada 24h.
+    # outra por 7 dias). O aviso de hardware so sai DEPOIS que o backup estiver gravado
+    # nos destinos (fim da rotina), seguindo a escada de avisos (v2.2.61).
     if (-not [string]::IsNullOrWhiteSpace($rodada1Temp) -and $rodada1Temp -ne $tempDir) {
         Add-SuspectTempDir -Path $rodada1Temp -Days 7 -Motivo $rodada1Falha
         Log-Message "Pasta temporaria '$rodada1Temp' marcada como suspeita por 7 dias: as proximas rotinas usam outra pasta."
@@ -5632,7 +6074,8 @@ if ($rodada -gt 1) {
     if (-not [string]::IsNullOrEmpty($rodada1Diag)) { $avisoHw += "`nDiagnostico da rodada 1: $rodada1Diag" }
     $avisoHw += "`n`nSAUDE DO ARMAZENAMENTO:`n$(Get-StorageHealthReport -Paths @($rodada1Temp, $tempDir, $dbPath))"
     Log-Message $avisoHw
-    Send-BackupNotification -Status "AVISO_HARDWARE" -SubjectInfo "Instabilidade de Disco ou Memoria ($TaskName)" -BodyDetails $avisoHw -DbPath $dbPath -DbSize "$dbSizeMB"
+    $avisoHwPendente = $avisoHw
+    $hwSmartFail = Test-AnySmartFailure -Paths @($rodada1Temp, $tempDir, $dbPath)
 }
 break
 }
@@ -5951,6 +6394,7 @@ Causas mais frequentes para verificar:
         $subjectInfo = "Falha ao Gravar nos Discos Locais ($TaskName)"
         $errMsg = "ERRO CRITICO: Nao foi possivel gravar nos discos locais do servidor ($($failedDestinations -join ', ')). Verifique se as unidades locais estao cheias ou sem permissao de gravacao."
     }
+    if (-not [string]::IsNullOrEmpty($avisoHwPendente)) { $errMsg += "`n`nATENCAO - NESTA ROTINA TAMBEM HOUVE: $avisoHwPendente" }
     Log-Message $errMsg
     Send-BackupNotification -Status "FALHA" -SubjectInfo $subjectInfo -BodyDetails $errMsg -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo
     if ($TaskName -match "EXTERN" -or $isNetTask) {
@@ -6048,6 +6492,12 @@ $($failedDestinations -join "`r`n")
     Send-BackupNotification -Status "SUCESSO" -SubjectInfo "Backup $TaskName Concluido Parcialmente ($gzSizeMB MB) [Alerta Destino]" -BodyDetails $bodyReport -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo -SuccessDests $allSuccessList -WarningDests $failedDestinations
 } else {
     Send-BackupNotification -Status "SUCESSO" -SubjectInfo "Backup $TaskName Concluido com Sucesso ($gzSizeMB MB)" -BodyDetails $bodyReport -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo -SuccessDests $allSuccessList -WarningDests @()
+}
+
+# Backup salvo so na 2a rodada: agora que ja esta gravado nos destinos, o aviso de
+# hardware segue a escada (1o agora, 2o +3 dias, 3o +7 dias, depois silencio).
+if (-not [string]::IsNullOrEmpty($avisoHwPendente)) {
+    Send-BackupNotification -Status "AVISO_HARDWARE" -SubjectInfo "Instabilidade de Disco ou Memoria ($TaskName)" -BodyDetails $avisoHwPendente -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -SuccessDests $allSuccessList -HardwareSmartFail $hwSmartFail
 }
 
 # A auditoria diaria NAO roda mais dentro da rotina de backup: ela e disparada so

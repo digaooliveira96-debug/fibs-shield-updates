@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.60",
+    "version":  "2.2.61",
     "releaseDate":  "2026-10-11",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Disco/memoria instavel: se a copia GZ divergir, o motor rele o .fbk; se a releitura mudar, avisa LEITURA INSTAVEL DO DISCO/MEMORIA e refaz o backup inteiro em outra pasta.\\n2. Pasta temporaria automatica: prefere outro disco fisico que o do banco, sem alerta SMART; pasta que falhou fica em quarentena por 7 dias.\\n3. E-mail de falha traz SAUDE DO ARMAZENAMENTO: disco fisico de cada pasta, SMART e erros de disco/NTFS/WHEA dos ultimos 7 dias.\\n4. Novo aviso [MEC AVISO HARDWARE] (1 por dia) quando o backup so passou na 2a rodada.\\n5. Mantem as correcoes da 2.2.59 (7-Zip x86 universal, sem Compress-Archive).",
-    "setupSha256":  "E1A473E1C5A74EB0D69216A9270EB31A90E54699C471541C8F73F22F95FFAE9B",
-    "engineSha256":  "931F6EF9CE6D893E4F6DEAA54CC66ACCF1A8BC769838A0104992AAD0A43A59A9",
-    "signature":  "UK365YSHkHgoQZqWqmkzTnMYUjR/WTT1mHYUDC/byqZRVoQAWVVyZmkd9dhp+8W9eBh1Qg7Xs+dQ8BMIgBPHpDLH/MG/IqPtjidIbWXWduOeurK0T8IEuMdcrIafFlHCwnqNdKPGwJev7ewxsKEXfbfpHkfUPbd8cvl4D+hDN5NiNwK41R++RT6vl5i4FaB6+xtI5mE6W02fgqmrtdFpOWxbUe1Yd+2foFi2r5bvtubGmwkNZnfeaoJ1eqoEL1KCBHwn5WT6wJ6r5LrOW7eLj9eEJpwi5N9az3UeK6D96sji7BdcaOiydZ8ngM4QxnpYkNcGzMcUysLUWGlK7trmxMywAF33cHt9KwMy4s062e4oxImrWh7vox9hL4Y798+1+Eyl2fFFAnMdHR7SsXk0VT9Okk8e1/pwL0p1T7HNN4PjR17G2ug2w1gXIFzvWYSsU3Jl3CkWeRUsWe25GI7sHSMeMefiqE++/hLKvuacjNPxWuGsTBlzNmiuY+BFrHS+"
+    "changelog":  "1. E-mails claros: no topo O QUE ACONTECEU / O BACKUP ESTA SEGURO? / O QUE FAZER AGORA, com o ultimo backup valido.\\n2. Sem flood: aviso de disco/memoria instavel sai 3 vezes (no dia, +3 dias, +7 dias) e para; volta so se piorar ou 1 lembrete a cada 30 dias. Falha real: imediato, +12 h, depois 1 por dia com \"sem backup ha X\".\\n3. Um unico e-mail de RESOLVIDO quando o backup volta (so se houve alerta). Limite de 4 e-mails por dia por servidor (alerta novo de falha sempre passa).\\n4. Anti-spam: parte texto puro, Message-ID, cabecalhos de e-mail automatico, assuntos sem caixa alta; aviso no log se o remetente nao for do dominio do usuario SMTP.\\n5. Ultimo recurso: se todas as rodadas falharem, guarda o GZ como .NAO_CONFERIDO (fora da retencao e da auditoria).",
+    "setupSha256":  "5CC55DDAF0CC76505394859673C677CE98CCBACFD82437C803E6A2F47D5675EB",
+    "engineSha256":  "6E090CD751404ECB497B544B166655EBC31CF4AD3906849D961A5026D661EEB5",
+    "signature":  "J15DSg0vuZUoTD+p48rFWLpHX3Lc2KuZLk/ZyOQfp1N23ilOi8BI1RkXXabIAcZWwSyK9gKL3M0UPEj+38m+gqJY7T+OtSQ6Cm51jA+eD5R/lU3jgeKloeEGIbgzPZBH9o90neSp7dbpjFKO7FDWY+VTxwV6jLx3VdE32hNmmkYZsayOXKnWlXo9XcZKFYP6tAuoNd8nr4r657z+LAn/nyLF4x2G8dLSiPUTIyaU5DXvw2ex9SdNEjW3me01veGSTdZD2iLRBQ4bXjaTQpjlfxk4jNPks/2tPbvPE/V0GNnw7ADUiFVh6t56IxOIqjDB0vv5gnIRUI24R9o52JcgyVRmAFgVJ1i1whjrXfhfzzDBegv6yOY1HsiQAACnQkT4PKRlOFFkxtU8Q553Kc7QjAv46HGI++drqJSHjVvQVK2rRf/molUe2rYHmZg+IJ1fhH9W43UdCUkqqwsf86eAUm1vnxt9rzs/iJOCO45UQfypZD0MShdOU0qs2uR8FCNp"
 }
