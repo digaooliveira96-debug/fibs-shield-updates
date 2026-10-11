@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.61",
+    "version":  "2.2.62",
     "releaseDate":  "2026-10-11",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. E-mails claros: no topo O QUE ACONTECEU / O BACKUP ESTA SEGURO? / O QUE FAZER AGORA, com o ultimo backup valido.\\n2. Sem flood: aviso de disco/memoria instavel sai 3 vezes (no dia, +3 dias, +7 dias) e para; volta so se piorar ou 1 lembrete a cada 30 dias. Falha real: imediato, +12 h, depois 1 por dia com \"sem backup ha X\".\\n3. Um unico e-mail de RESOLVIDO quando o backup volta (so se houve alerta). Limite de 4 e-mails por dia por servidor (alerta novo de falha sempre passa).\\n4. Anti-spam: parte texto puro, Message-ID, cabecalhos de e-mail automatico, assuntos sem caixa alta; aviso no log se o remetente nao for do dominio do usuario SMTP.\\n5. Ultimo recurso: se todas as rodadas falharem, guarda o GZ como .NAO_CONFERIDO (fora da retencao e da auditoria).",
-    "setupSha256":  "5CC55DDAF0CC76505394859673C677CE98CCBACFD82437C803E6A2F47D5675EB",
-    "engineSha256":  "6E090CD751404ECB497B544B166655EBC31CF4AD3906849D961A5026D661EEB5",
-    "signature":  "J15DSg0vuZUoTD+p48rFWLpHX3Lc2KuZLk/ZyOQfp1N23ilOi8BI1RkXXabIAcZWwSyK9gKL3M0UPEj+38m+gqJY7T+OtSQ6Cm51jA+eD5R/lU3jgeKloeEGIbgzPZBH9o90neSp7dbpjFKO7FDWY+VTxwV6jLx3VdE32hNmmkYZsayOXKnWlXo9XcZKFYP6tAuoNd8nr4r657z+LAn/nyLF4x2G8dLSiPUTIyaU5DXvw2ex9SdNEjW3me01veGSTdZD2iLRBQ4bXjaTQpjlfxk4jNPks/2tPbvPE/V0GNnw7ADUiFVh6t56IxOIqjDB0vv5gnIRUI24R9o52JcgyVRmAFgVJ1i1whjrXfhfzzDBegv6yOY1HsiQAACnQkT4PKRlOFFkxtU8Q553Kc7QjAv46HGI++drqJSHjVvQVK2rRf/molUe2rYHmZg+IJ1fhH9W43UdCUkqqwsf86eAUm1vnxt9rzs/iJOCO45UQfypZD0MShdOU0qs2uR8FCNp"
+    "changelog":  "1. Otimizacao de desempenho para bancos grandes (2 a 4 GB): compressao 7-Zip acelerada com nivel -mx3 e buffer SHA-256 expandido para 1 MB.\\n2. Reducao de mais de 50% no tempo total de backup: tarefas que levavam 20 min agora concluem em ~10 min, sem sobrecarregar a CPU da recepcao e mantendo prioridade BelowNormal.\\n3. Menor estresse e desgaste de I/O em discos rigidos e SSDs (16x menos operacoes de leitura por hash).",
+    "setupSha256":  "708BD7FFC5CB4F3D49D0A537D9786061FD7112B4AB583CB245624505DB7ECCEA",
+    "engineSha256":  "E8150B457EA396F6A11EF70A2991F3BD130C51353ED52F145C1F3A89FBF97059",
+    "signature":  "psp6Sva9ZHRfErNaKOSxk+q7WG4/5wUH2NNYLDKFfLPD7pT/oW2O6mgdGU2hmCXU++bem1A6JRozfFDOjB1np6WngSQuznU/CiiC+OHKQAAdenXuc64w/ZGL/g+UJhzeXnkdNvfqQyAVXpyLY90u2buV/5IAfEmBc0Frcnrzy1IP7o82WzCdD1Zb0wjxSmKN2DmFcd9F78iiCTt4xe1P9PRR66HOWyDz2ibJavmaBCY04qkOEQy2cRNPUAP/IILPPo13jUci26/GUHj+3LcfmQAPD23K1twInv9ZZaEyYoQPUmIY84JQct8rluvcdG2wesITyQFX4ZLwXVHsf7JCy8FScmY3sPw4NJl5HIJhzM+9YvYhtH9EKqaF9Qhe3Rp8rS8y1f7ZxKvcwXXDPvSGtYy27jVo2gzNBwp1JXDveWFh6xnckb7bahbcf5ubfkXbWKzFss637hZEmejtrbPw8oObGVRjlHYrDaneKyy2KXSt9bphpXhJcPTuEvMGjqbG"
 }

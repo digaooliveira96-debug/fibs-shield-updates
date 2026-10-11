@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.61"
+$script:EngineVersion = "2.2.62"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -1002,7 +1002,7 @@ function Get-Sha256OfStream {
 function Get-Sha256OfStreamWithMetrics {
     param([System.IO.Stream]$Stream)
     $alg = [System.Security.Cryptography.SHA256]::Create()
-    $buf = New-Object byte[] (64 * 1024)
+    $buf = New-Object byte[] (1024 * 1024)
     [long]$total = 0
     try {
         while (($read = $Stream.Read($buf, 0, $buf.Length)) -gt 0) {
@@ -1918,7 +1918,7 @@ function Send-BackupNotification {
             $shouldSend = $true
             # O 1o alerta de uma falha nova passa mesmo com o limite diario estourado.
             $essencial = ($enviados -le 0)
-            $subjectTag = "[MEC ALERTA CRITICO]"
+            $subjectTag = "[MEC ALERTA]"
             $bannerBg = "#dc2626"
             $bannerType = "ALERT"
             $baseSemBackup = if (-not [string]::IsNullOrWhiteSpace("$($state.LastSuccess)")) { "$($state.LastSuccess)" } else { "$($state.FailureEpisodeStart)" }
@@ -5117,7 +5117,7 @@ function Compress-BackupWith7z {
         try { Remove-Item $GzPath -Force -ErrorAction Stop }
         catch { Log-Message "Aviso: 7-Zip nao usado: o arquivo $GzPath ja existe e nao pode ser removido ($($_.Exception.Message))."; return $false }
     }
-    $r = Invoke-7zProcess -Arguments "a -tzip -mx5 -mmt=on -bso0 -bsp0 -y `"$GzPath`" `"$FbkPath`""
+    $r = Invoke-7zProcess -Arguments "a -tzip -mx3 -mmt=on -bso0 -bsp0 -y `"$GzPath`" `"$FbkPath`""
     if (-not $r.Started) { Log-Message "Aviso: Falha ao executar 7-Zip para compactacao ($($r.StdErr))."; return $false }
     if ($r.TimedOut) { Log-Message "Aviso: $($r.StdErr)"; return $false }
     if ($r.ExitCode -ne 0) { Log-Message "Aviso: Erro no 7-Zip (Codigo $($r.ExitCode)): $($r.StdErr)"; return $false }
