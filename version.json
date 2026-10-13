@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.62",
-    "releaseDate":  "2026-10-11",
+    "version":  "2.2.63",
+    "releaseDate":  "2026-10-13",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Otimizacao de desempenho para bancos grandes (2 a 4 GB): compressao 7-Zip acelerada com nivel -mx3 e buffer SHA-256 expandido para 1 MB.\\n2. Reducao de mais de 50% no tempo total de backup: tarefas que levavam 20 min agora concluem em ~10 min, sem sobrecarregar a CPU da recepcao e mantendo prioridade BelowNormal.\\n3. Menor estresse e desgaste de I/O em discos rigidos e SSDs (16x menos operacoes de leitura por hash).",
-    "setupSha256":  "708BD7FFC5CB4F3D49D0A537D9786061FD7112B4AB583CB245624505DB7ECCEA",
-    "engineSha256":  "E8150B457EA396F6A11EF70A2991F3BD130C51353ED52F145C1F3A89FBF97059",
-    "signature":  "psp6Sva9ZHRfErNaKOSxk+q7WG4/5wUH2NNYLDKFfLPD7pT/oW2O6mgdGU2hmCXU++bem1A6JRozfFDOjB1np6WngSQuznU/CiiC+OHKQAAdenXuc64w/ZGL/g+UJhzeXnkdNvfqQyAVXpyLY90u2buV/5IAfEmBc0Frcnrzy1IP7o82WzCdD1Zb0wjxSmKN2DmFcd9F78iiCTt4xe1P9PRR66HOWyDz2ibJavmaBCY04qkOEQy2cRNPUAP/IILPPo13jUci26/GUHj+3LcfmQAPD23K1twInv9ZZaEyYoQPUmIY84JQct8rluvcdG2wesITyQFX4ZLwXVHsf7JCy8FScmY3sPw4NJl5HIJhzM+9YvYhtH9EKqaF9Qhe3Rp8rS8y1f7ZxKvcwXXDPvSGtYy27jVo2gzNBwp1JXDveWFh6xnckb7bahbcf5ubfkXbWKzFss637hZEmejtrbPw8oObGVRjlHYrDaneKyy2KXSt9bphpXhJcPTuEvMGjqbG"
+    "changelog":  "1. Suporte inteligente ao Google Drive Desktop (15 GB): deteccao automatica da subpasta real (My Drive em Windows em ingles / Meu Drive em portugues), auto-cura do config.json e reserva de seguranca dedicada de 512 MB.\\n2. Blindagem das particoes locais fisicas (C:, D:, E:, System Reserved) 100% preservada com reservas de 8 GB (disco do banco) e 5 GB (demais discos).\\n3. Fallback automatico para sessao do usuario logado com conferencia SHA-256 em unidades virtuais.",
+    "setupSha256":  "7685B0D881DE9A9D0CE0F36ECE5C21106075D36C846C7810FC5E26667E053EB7",
+    "engineSha256":  "83D50C0682DA4FED17D69994592139F5E1ECB51BD1F91E6CF7C7CCD290D4A349",
+    "signature":  "U4ZIeI4oom8PEFjckR9emRyl/1uvNfWGNKIPGrwnuFzmCdezRlkam8DZ+9yLsHvpQMRuP8beuuV/b+8uVv2xuotdp+5rnx7AWpw3XSdmb+VoKU1LGThpmzxatb8081AZivFFRGH4AYLODRNwIZiFlejk00AijzZOtErz5Ilnfle69OIzbhYoROpwsw/00Nwu0pJgP0u2IYTNiKA5fnOMBEYfN4a+fnmJh0feAz2PdJzOwKUpye7WHZYnspny5qjUy29YkhusPvRnO1F5rU6s/fwi+1R3UBU3bkrOb3hLyrpp/qF6/zQZ7b2JU+UfYbYe1sOONV2rzoyCVs3UuZbXvqDd9xbsqy2EU8OvwRFFC2B6jNybB8gJbU0sjabgJ9tSA6d63A1hUuyjDSrDFKEMi8yCLb+jssuO3okGHTgMrMuo+Svd0OoXpfBQW6nvsCqGAiqXE+riFUzwkOSEk3nx6wDvTyJaDIm7W91b0ol+7YngFJon60TFXBsolGtDCwuH"
 }

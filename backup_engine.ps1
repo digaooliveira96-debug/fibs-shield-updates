@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.62"
+$script:EngineVersion = "2.2.63"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -672,6 +672,102 @@ function Test-IsSystemReservedDrive {
     return $false
 }
 
+# Localiza a subpasta raiz gravavel do Google Drive Desktop (My Drive em Windows em
+# ingles, Meu Drive em portugues, etc.). A raiz X:\ do Google Drive virtual nao aceita
+# criacao de pastas diretamente (erro Could not find file 'G:\BKP_SISMOTEL').
+function Get-GoogleDriveRootSubfolder {
+    param([string]$DriveRoot)
+    if ([string]::IsNullOrWhiteSpace($DriveRoot) -or $DriveRoot.StartsWith("\\")) { return $null }
+    try {
+        $root = [System.IO.Path]::GetPathRoot($DriveRoot)
+        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) { return $null }
+        foreach ($nome in @("My Drive", "Meu Drive", "Mi unidad", "Mon Drive", "Meine Ablage", "Il mio Drive")) {
+            $cand = Join-Path $root $nome
+            if (Test-Path -LiteralPath $cand -PathType Container) { return $cand }
+        }
+    } catch {}
+    return $null
+}
+
+function Test-IsGoogleDrivePath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path.StartsWith("\\")) { return $false }
+    if ($Path -match '(?i)(\\|/)(My Drive|Meu Drive|Mi unidad|Mon Drive|Meine Ablage|Il mio Drive)(\\|/|$)') { return $true }
+    try {
+        $root = [System.IO.Path]::GetPathRoot($Path)
+        if ([string]::IsNullOrWhiteSpace($root)) { return $false }
+        if ($null -ne (Get-GoogleDriveRootSubfolder -DriveRoot $root)) { return $true }
+        $di = New-Object System.IO.DriveInfo($root.TrimEnd('\', '/'))
+        if ($di.IsReady -and "$($di.VolumeLabel)" -match '(?i)Google\s*Drive') { return $true }
+    } catch {}
+    return $false
+}
+
+# Traduz G:\BKP_SISMOTEL (ou G:\Meu Drive\BKP_SISMOTEL num Windows em ingles) para a
+# subpasta real do Google Drive naquela maquina (ex: G:\My Drive\BKP_SISMOTEL). Discos
+# locais comuns (C:, D:, E:) nao possuem My Drive/Meu Drive na raiz e ficam intocados.
+function Resolve-GoogleDriveDestinationPath {
+    param([string]$Path, [string]$DefaultFolder = "BKP_SISMOTEL")
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path.StartsWith("\\")) { return $Path }
+    if ([string]::IsNullOrWhiteSpace($DefaultFolder)) { $DefaultFolder = "BKP_SISMOTEL" }
+    $p = $Path.Trim().Trim('"', "'").TrimEnd('\', '/')
+    if ($p -notmatch '^([A-Za-z]:)(?:\\(.*))?$') { return $Path }
+    $drive = $matches[1].ToUpper() + "\"
+    $rel = if ($matches[2]) { $matches[2].TrimStart('\', '/') } else { "" }
+    $gdRoot = Get-GoogleDriveRootSubfolder -DriveRoot $drive
+    if ([string]::IsNullOrWhiteSpace($gdRoot)) { return $Path }
+    $gdLeaf = Split-Path $gdRoot -Leaf
+
+    if ([string]::IsNullOrWhiteSpace($rel) -or ($rel -ieq $gdLeaf)) {
+        return (Join-Path $gdRoot $DefaultFolder)
+    }
+    if ($rel.StartsWith("$gdLeaf\", [System.StringComparison]::OrdinalIgnoreCase)) {
+        return (Join-Path $gdRoot ($rel.Substring($gdLeaf.Length + 1)))
+    }
+    if ($rel -match '^(?i)(My Drive|Meu Drive|Mi unidad|Mon Drive|Meine Ablage|Il mio Drive)(?:\\(.*))?$') {
+        $sub = $matches[2]
+        if ([string]::IsNullOrWhiteSpace($sub)) { return (Join-Path $gdRoot $DefaultFolder) }
+        return (Join-Path $gdRoot $sub)
+    }
+    if (-not (Test-Path -LiteralPath $p)) {
+        return (Join-Path $gdRoot $rel)
+    }
+    return $Path
+}
+
+function Update-GoogleDriveDestinationInConfig {
+    param([string]$OldPath, [string]$NewPath)
+    if ([string]::IsNullOrWhiteSpace($OldPath) -or [string]::IsNullOrWhiteSpace($NewPath) -or ($OldPath -ieq $NewPath)) { return }
+    try {
+        if (-not (Test-Path $configFile)) { return }
+        Invoke-WithMecLock -Name "Config" -Script {
+            $cfg = Read-ConfigData
+            if ($null -eq $cfg -or $null -eq $cfg.Tasks) { return }
+            $changed = $false
+            foreach ($t in @($cfg.Tasks)) {
+                if ($null -eq $t.Destinations) { continue }
+                $newDests = @()
+                $taskChanged = $false
+                foreach ($d in @($t.Destinations)) {
+                    if ("$d".Trim().TrimEnd('\', '/') -ieq $OldPath.Trim().TrimEnd('\', '/')) {
+                        if ($newDests -notcontains $NewPath) { $newDests += $NewPath }
+                        $taskChanged = $true
+                        $changed = $true
+                    } else {
+                        if ($newDests -notcontains $d) { $newDests += $d }
+                    }
+                }
+                if ($taskChanged) { $t.Destinations = $newDests }
+            }
+            if ($changed) {
+                $json = $cfg | ConvertTo-Json -Depth 10
+                Write-TextFileAtomic -Path $configFile -Content $json -BackupPath "$configFile.bak"
+                Log-Message "Configuracao atualizada automaticamente: '$OldPath' -> '$NewPath'"
+            }
+        }
+    } catch {}
+}
+
 # ==============================================================================
 # BACKUP EM REDE: o acesso e escolhido sozinho, por destino UNC
 # O servico roda como SYSTEM (Sessao 0), onde drives mapeados e credenciais do
@@ -749,6 +845,24 @@ try {
     foreach ($l in (Get-Content -LiteralPath $JobFile -Encoding UTF8)) { $p = $l.Split("`t", 2); if ($p.Count -eq 2) { $job[$p[0]] = $p[1] } }
     $res = $job["RESULT"]
     $dest = $job["DESTDIR"]
+    if ($dest -match '^([A-Za-z]:)(?:\\(.*))?$' -and -not (Test-Path -LiteralPath $dest)) {
+        $drv = $matches[1].ToUpper() + "\"
+        $rel = if ($matches[2]) { $matches[2].TrimStart('\', '/') } else { "" }
+        foreach ($gd in @("My Drive", "Meu Drive", "Mi unidad", "Mon Drive", "Meine Ablage", "Il mio Drive")) {
+            $gdPath = Join-Path $drv $gd
+            if (Test-Path -LiteralPath $gdPath -PathType Container) {
+                if ([string]::IsNullOrWhiteSpace($rel) -or ($rel -ieq $gd)) {
+                    $dest = Join-Path $gdPath "BKP_SISMOTEL"
+                } elseif ($rel -match '^(?i)(My Drive|Meu Drive|Mi unidad|Mon Drive|Meine Ablage|Il mio Drive)(?:\\(.*))?$') {
+                    $sub = if ($matches[2]) { $matches[2] } else { "BKP_SISMOTEL" }
+                    $dest = Join-Path $gdPath $sub
+                } else {
+                    $dest = Join-Path $gdPath $rel
+                }
+                break
+            }
+        }
+    }
     if (-not (Test-Path -LiteralPath $dest)) {
         # \\terminal\pasta que nao abre: New-Item na raiz do compartilhamento so devolve
         # "The path is not of a legal form" e esconde a causa real.
@@ -767,8 +881,23 @@ try {
             [IO.File]::WriteAllText($probe, "MEC Shield")
             if ([IO.File]::ReadAllText($probe) -ne "MEC Shield") { throw "arquivo de teste lido com conteudo diferente" }
         } finally { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
-        $r = "OK`t$quem`t`t0"
+        $r = "OK`t$quem`t$dest`t0"
     } else {
+        $pfx = [regex]::Escape($job["PREFIX"])
+        try {
+            $srcLen = (Get-Item -LiteralPath $job["SRC"]).Length
+            $di = New-Object System.IO.DriveInfo([System.IO.Path]::GetPathRoot($dest))
+            if ($di.IsReady -and $di.AvailableFreeSpace -lt ($srcLen + 536870912)) {
+                $antigosGuard = @(Get-ChildItem -LiteralPath $dest -File -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Name -match "^${pfx}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${pfx}[-_]\d{8}_\d{6}\.(GZ|zip)$"
+                } | Sort-Object LastWriteTime -Descending | Select-Object -Skip 3)
+                [array]::Reverse($antigosGuard)
+                foreach ($fg in $antigosGuard) {
+                    if ($di.AvailableFreeSpace -ge ($srcLen + 536870912)) { break }
+                    Remove-Item -LiteralPath $fg.FullName -Force -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {}
         $final = Join-Path $dest (Split-Path $job["SRC"] -Leaf)
         Copy-Item -LiteralPath $job["SRC"] -Destination $final -Force -ErrorAction Stop
         # SHA-256 pelo .NET: Get-FileHash nao existe no PowerShell 2/3
@@ -779,7 +908,6 @@ try {
             Remove-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue
             throw "SHA-256 da copia nao confere com a origem (arquivo chegou alterado)"
         }
-        $pfx = [regex]::Escape($job["PREFIX"])
         $keep = 30; [void][int]::TryParse($job["KEEP"], [ref]$keep); if ($keep -lt 1) { $keep = 1 }
         $velhos = @(Get-ChildItem -LiteralPath $dest -File -ErrorAction SilentlyContinue | Where-Object {
             $_.Name -match "^${pfx}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${pfx}[-_]\d{8}_\d{6}\.(GZ|zip)$"
@@ -905,6 +1033,7 @@ function Invoke-NetworkAccessTest {
     foreach ($d in $Destinations) {
         if ([string]::IsNullOrWhiteSpace($d)) { continue }
         $dest = (Resolve-MappedDrivePath $d.Trim()).TrimEnd('\', '/')
+        $dest = (Resolve-GoogleDriveDestinationPath -Path $dest).TrimEnd('\', '/')
         $direto = Test-WriteProbe -Dir $dest
         if ([string]::IsNullOrWhiteSpace($direto)) {
             $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Gravacao direta pelo servico, sem senha: OK (funciona 24h, mesmo sem ninguem logado)." }
@@ -3209,6 +3338,10 @@ function Test-ExternalDestinationsHealth {
             if ($destResolved -ne $destTrim) {
                 $destTrim = $destResolved.TrimEnd('\', '/')
             }
+            $destGd = Resolve-GoogleDriveDestinationPath -Path $destTrim
+            if ($destGd -ne $destTrim) {
+                $destTrim = $destGd.TrimEnd('\', '/')
+            }
 
             if (-not $netTracker.ContainsKey($destTrim)) { $netTracker[$destTrim] = @{} }
             $touchedKeys += $destTrim
@@ -3341,12 +3474,13 @@ function Get-OptimalSandboxDir {
         foreach ($dest in $ConfiguredDestinations) {
             if ([string]::IsNullOrWhiteSpace($dest)) { continue }
             if ($dest.StartsWith("\\")) { continue } # Nunca usar rede para sandbox temporario
+            if (Test-IsGoogleDrivePath -Path $dest) { continue } # Nunca usar Google Drive para sandbox temporario
             $root = [System.IO.Path]::GetPathRoot($dest)
             if (Test-Path $root) { $candidates += $dest }
         }
     }
     
-    $drives = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and ($_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable') -and -not (Test-IsSystemReservedDrive -Path $_.Name) }
+    $drives = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and ($_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable') -and -not (Test-IsSystemReservedDrive -Path $_.Name) -and -not (Test-IsGoogleDrivePath -Path $_.Name) }
     
     # Prioridade 1: Disco INTERNO (Fixed) diferente do disco do banco (ex: D: quando banco esta em C:)
     foreach ($d in ($drives | Where-Object { $_.DriveType -eq 'Fixed' -and $_.Name -ne $dbDrive })) {
@@ -4587,7 +4721,8 @@ function Invoke-DestinationSpaceGuard {
     if ($null -eq $info) {
         return [PSCustomObject]@{ Ok = $true; Removed = 0; FreeMB = -1; RequiredMB = 0; Message = "Espaco livre nao informado pelo Windows; copia segue." }
     }
-    $required = [math]::Round($IncomingMB + (Get-DiskReserveMB -TotalMB $info.TotalMB -IsDbDrive $IsDbDrive), 0)
+    $reserveMB = if (Test-IsGoogleDrivePath -Path $Directory) { 512 } else { Get-DiskReserveMB -TotalMB $info.TotalMB -IsDbDrive $IsDbDrive }
+    $required = [math]::Round($IncomingMB + $reserveMB, 0)
     $removed = 0
     if ($info.FreeMB -lt $required) {
         $antigos = @(Get-PrefixBackupFiles -Directory $Directory -Prefix $Prefix | Select-Object -Skip ([Math]::Max(0, $MinKeep)))
@@ -4860,7 +4995,7 @@ function Select-BackupTempDir {
     param([string[]]$Destinations, [string]$DbDrive, [double]$DbSizeMB, [string[]]$ExcludeRoots = @())
     $recusadas = @()
     $suspeitasPuladas = @()
-    $locais = @($Destinations | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("\") })
+    $locais = @($Destinations | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and -not $_.StartsWith("\") -and -not (Test-IsGoogleDrivePath -Path $_) })
     $dbDisk = Get-PhysicalDiskOfPath -Path $DbDrive
     $smart = if ($null -ne $dbDisk) { Get-SmartPredictFailureMap } else { @{} }
 
@@ -5681,6 +5816,14 @@ foreach ($dest in $destList) {
         $destTrimmed = $destResolved
     }
 
+    # Redirecionamento automatico do Google Drive (ex: G:\BKP_SISMOTEL -> G:\My Drive\BKP_SISMOTEL ou G:\Meu Drive\BKP_SISMOTEL)
+    $destGDrive = Resolve-GoogleDriveDestinationPath -Path $destTrimmed -DefaultFolder $TaskName
+    if ($destGDrive -ne $destTrimmed) {
+        Log-Message "Google Drive detectado: '$destTrimmed' ajustado automaticamente para '$destGDrive'"
+        Update-GoogleDriveDestinationInConfig -OldPath $destTrimmed -NewPath $destGDrive
+        $destTrimmed = $destGDrive
+    }
+
     if ($destTrimmed.StartsWith("\\")) {
         # Destino de rede UNC
         $resolvedDestList += $destTrimmed
@@ -5761,7 +5904,7 @@ Log-Message "Diretorio temporario de processamento I/O: $tempDir"
 # para sempre dentro de uma pasta oculta. Com a trava em maos, e seguro limpar.
 $pastasTemp = @($tempDir, (Join-Path $scriptDir "temp_backup"))
 foreach ($candDest in $resolvedDestList) {
-    if (-not $candDest.StartsWith("\")) {
+    if (-not $candDest.StartsWith("\") -and -not (Test-IsGoogleDrivePath -Path $candDest)) {
         $pastasTemp += (Join-Path ([System.IO.Path]::GetPathRoot($candDest)) "FIBS_TEMP")
     }
 }
@@ -6227,6 +6370,7 @@ foreach ($destTrimmed in $resolvedDestList) {
             # proximo acesso (usuario de rede, depois usuario logado).
             $semPermissao = ($isNetwork -and (Test-IsSystemAccount) -and ((Test-IsAccessDeniedError $_) -or (Test-IsNetworkLogonFailure $_)))
             $acessoNegado = $semPermissao
+            $semPermissaoLocal = (-not $isNetwork -and (Test-IsSystemAccount) -and ((Test-IsAccessDeniedError $_) -or ("$_" -match "Could not find file|Nao foi possivel localizar o arquivo|nao pode encontrar")))
             # Nao deixar arquivo reprovado na pasta: ele seria contado como "backup
             # existente" pelo monitor e pela numeracao sequencial, mascarando a falha.
             try {
@@ -6235,7 +6379,7 @@ foreach ($destTrimmed in $resolvedDestList) {
                     Log-Message "Copia reprovada removida do destino para nao mascarar a falha: $finalPath"
                 }
             } catch {}
-            if ($semPermissao) { break }
+            if ($semPermissao -or $semPermissaoLocal) { break }
         }
 
         if ($attempt -lt $retryCount) {
@@ -6279,6 +6423,22 @@ foreach ($destTrimmed in $resolvedDestList) {
         }
     }
 
+    # Unidade virtual (Google Drive G:) que apareceu como existente para o servico (Test-Path G:\ = True),
+    # mas cuja subpasta (My Drive / Meu Drive) so aceita gravacao na sessao do usuario logado.
+    if (-not $destSuccess -and -not $isNetwork -and (Test-IsSystemAccount) -and ([System.IO.Path]::GetPathRoot($destTrimmed) -ne $dbDrive)) {
+        Log-Message "Unidade '$destTrimmed': o servico nao gravou diretamente. Tentando copiar pela sessao do usuario logado (Google Drive / unidade do usuario)..."
+        $viaUserLocal = Copy-ViaLoggedOnUser -DestDir ($destTrimmed.Trim().TrimEnd('\', '/')) -SourceFile $tempGz -Prefix $basePrefix -Keep $keepBackupsCount -ExpectedSha $zipSha -NivelNormal
+        if ($viaUserLocal.Ok) {
+            $destSuccess = $true
+            $localSuccessList += $viaUserLocal.FinalPath
+            $viaUserDir = Split-Path $viaUserLocal.FinalPath -Parent
+            if (-not [string]::IsNullOrWhiteSpace($viaUserDir) -and $viaUserDir -ne $destTrimmed) {
+                Update-GoogleDriveDestinationInConfig -OldPath $destTrimmed -NewPath $viaUserDir
+            }
+            Log-Message "Backup GZ gravado e CONFERIDO em: $($viaUserLocal.FinalPath) pelo usuario logado $($viaUserLocal.User) (SHA-256 identico a origem; $($viaUserLocal.Removed) backup(s) antigo(s) removido(s) pela retencao)"
+        }
+    }
+
     if (-not $destSuccess) {
         if (-not [string]::IsNullOrWhiteSpace($destinationFailureReason)) {
             $destinationFailureReasons[$destTrimmed] = $destinationFailureReason
@@ -6301,6 +6461,10 @@ foreach ($destTrimmed in $userDriveDests) {
     $viaUser = Copy-ViaLoggedOnUser -DestDir ($destTrimmed.TrimEnd('\', '/')) -SourceFile $tempGz -Prefix $basePrefix -Keep $keepBackupsCount -ExpectedSha $zipSha -NivelNormal
     if ($viaUser.Ok) {
         $networkSuccessList += $viaUser.FinalPath
+        $viaUserDir = Split-Path $viaUser.FinalPath -Parent
+        if (-not [string]::IsNullOrWhiteSpace($viaUserDir) -and $viaUserDir -ne $destTrimmed) {
+            Update-GoogleDriveDestinationInConfig -OldPath $destTrimmed -NewPath $viaUserDir
+        }
         Log-Message "Backup GZ gravado e CONFERIDO em: $($viaUser.FinalPath) pelo usuario logado $($viaUser.User) (SHA-256 identico a origem; $($viaUser.Removed) backup(s) antigo(s) removido(s) pela retencao)"
     } else {
         $motivoUnidade = "a unidade $([System.IO.Path]::GetPathRoot($destTrimmed)) so existe com um usuario logado (Google Drive, OneDrive ou unidade do usuario) e a copia pela sessao dele falhou: $($viaUser.Message)"
