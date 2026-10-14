@@ -1,11 +1,11 @@
 {
-  "version": "2.2.66",
-  "releaseDate": "2026-10-14",
-  "minEngineVersion": "2.1.0",
-  "downloadUrl": "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
-  "setupUrl": "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-  "changelog": "1. Compatibilidade total com Windows 7 SP1 (PowerShell 2.0 + .NET Framework 4.0) preservando 100% do funcionamento no Windows 10/11 e Windows Server 2012-2025.\\n2. Correcao da deteccao automatica do Nome do Motel (Sismotel.chv com leitura ISO-8859-1 byte a byte e multiplos discos) e da descoberta de compartilhamentos de rede no instalador e no painel.\\n3. Polyfills nativos para PowerShell 2.0 (ConvertFrom-Json, ConvertTo-Json, Get-CimInstance, 7-Zip fallback, COMPLUS_Version v4.0.30319) e validacao estrita de producao de log antes de reportar sucesso no painel.",
-  "setupSha256": "3AC957ADFF6048D53CD4EAC809460920F45653D288957B36690399A8F13F87E0",
-  "engineSha256": "163B6C44878CBA0CCF09C6DF00D0C4B325F915EBDF902634D3EFECE759E06941",
-  "signature": "oS6WGSX0XoI0iNxR9fjcw5liXaEpY9BmQP1veaoR61XWIXTMEAeUM9d36iX3sXcPmIvOPTSZVChV6kMexD4kG9/mbV74fJWQRi3wB9UXZfHJdiPbu4HAi7KQnWOcxFKwsT08N2BbRMPQ8YKG031cZhnJKwlscdY2SSX8Ek+5CM103hZLI+G3JCsdE8r5c7K4rYhHk1hudwuwNdUNxJ8nPPFDqHYuMEEuKsLoPnf0lr3AVjh3azdbzrIL5vs0xSHDWuXYwEgiDPTZ1VIeJIJFKtVCVgVkntJaE6fpc+xVtx8l0CFWqIIh9gDAVsQb2pB23NklEnnYwkEAWJxPfrDv3BKNwS1ubqGQKtxGs1lOxUM75HbpDf+yXEuWbwF+54gxQkxdkogr4YfPdzAoLI9dFERobCMt8w3SpcHF9WeU6+Nm/AuT+VOqUwqLO23+UQbENpHC8QFHq9pqCFa5dwSYlgMWRMGHpu9CrrmCVNydR5wpFNDQ7AxPEM66DfJDU/yd"
+    "version":  "2.2.67",
+    "releaseDate":  "2026-10-14",
+    "minEngineVersion":  "2.1.0",
+    "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
+    "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
+    "changelog":  "1. Correcao definitiva do ParserError no PowerShell 2.0 (Windows 7 SP1) na linha 229 (substituicao de chamada dinamica $InputObject.$MethodName() por PSObject.Methods[MethodName].Invoke()).\\n2. Eliminacao de enumeracao de membros PS 3.0+ (.PSObject.Properties.Name) e acessos dinamicos a propriedades em backup_engine.ps1 e startup_guard.ps1, validados por AST no Pester.\\n3. Compatibilidade total Windows 7 a Windows 11 / Server 2012-2025 (Sismotel.chv ISO-8859-1, descoberta de rede, polyfills JSON/WMI e CLR 4.0).",
+    "setupSha256":  "C0907EE38FBC7AF9E5493302F8ADCDF08A41033FD6E30D7E2BAAEE6DC86011F9",
+    "engineSha256":  "169100DFA2634F9DD851986F432D3F22612FE8DD92C3F3257A911DCA8260B072",
+    "signature":  "nJNjFTIiVJaWTbtsTF1ACVWnQJB3spg5bbvpRHIVF52Gu9ZUec1RsUZ95XlgHYVnK4DfeRO0WC1ZYNoroaToHd61hy9CQ2hTepDbsYDa5nXDkTLhTOVTnOW/9Yq31r5Y22i+WuCn+bAp66DXVDMcUzapx3J5sWW9tXYeotZIrBAtYuUrxvwMYRua9vxyMCY8Gp0GOk2msiljx5W/vXdbhAup5xpKTcn2erVmkJl1eAs1oSRd/L8eNEfL8BxQ4Fs34X3aiP32vbRtMsIDS/zgGDKHou3U9z454/BdG/lxDK+jh0zZrtAoAQ0TlADcupN4deU6jkEFPVHkHzeJeo72FhOzLI/k/MuO25lLMbC6vYrkbS45qK7rVPHu1G2sueIYYZ+R/Oi1E+yoIJk8fjjohxBV2bHwUdcsktk1p++UTlj4mUeWfEQCUxQ7CdRkTnLOHrE6TRKFRXu33AGnr5dv4QZds+xZV4A7Y8SqM937nmKlFEhfFGyK/DWHGIsM2+2c"
 }

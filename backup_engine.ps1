@@ -44,10 +44,13 @@ if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.66"
+$script:EngineVersion = "2.2.67"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
+try { Add-Type -AssemblyName System.Web.Extensions -ErrorAction SilentlyContinue } catch {}
+try { Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue } catch {}
+try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue } catch {}
 
 # Leitura assincrona de stdout/stderr compativel com .NET 3.5/4.0/4.5/4.8 (Windows 7 a Windows 11).
 function Start-StreamReadToEnd {
@@ -225,8 +228,12 @@ if (-not (Get-Command Invoke-CimMethod -ErrorAction SilentlyContinue)) {
             [string]$MethodName,
             $ErrorAction = "Continue"
         )
-        if ($null -eq $InputObject) { return $null }
-        return $InputObject.$MethodName()
+        if ($null -eq $InputObject -or [string]::IsNullOrWhiteSpace($MethodName)) { return $null }
+        $m = $InputObject.PSObject.Methods[$MethodName]
+        if ($null -ne $m) {
+            return $m.Invoke()
+        }
+        return $InputObject.InvokeMethod($MethodName, $null, $null)
     }
 }
 
@@ -539,14 +546,17 @@ function Convert-PlainPasswordsInConfig {
                 $cfg.Preferences.SmtpPass = Protect-String $cfg.Preferences.SmtpPass
                 $mudou = $true; $campos += "SmtpPass"
             }
-            foreach ($t in $cfg.Tasks) {
+            foreach ($t in @($cfg.Tasks)) {
                 # A credencial de rede NAO e mais embutida neste motor (que e publico): o Setup TECNICO grava
                 # NetworkUser/NetworkPassword (cifrada via DPAPI) e NetworkCredentialCustom=true na instalacao.
                 # Tarefa sem credencial segue pelas tentativas 1 (conta do servidor) e 3 (usuario logado).
                 foreach ($nome in @("DbPassword", "NetworkPassword")) {
-                    $valor = $t.$nome
+                    $propObj = $t.PSObject.Properties[$nome]
+                    $valor = if ($null -ne $propObj) { "$($propObj.Value)" } else { "" }
                     if (-not [string]::IsNullOrWhiteSpace($valor) -and -not (Test-IsDpapiBlob $valor)) {
-                        $t.$nome = Protect-String $valor
+                        $protegido = Protect-String $valor
+                        if ($null -ne $propObj) { $propObj.Value = $protegido }
+                        else { $t | Add-Member -MemberType NoteProperty -Name $nome -Value $protegido -Force }
                         $mudou = $true; $campos += "$($t.TaskName).$nome"
                     }
                 }
@@ -1533,7 +1543,7 @@ function Test-BackupGzIntegrity {
         $fmt = Get-GzFileFormat -Path $GzPath
 
         if ($fmt -eq "ZIP") {
-            if ($null -eq ([System.IO.Compression.ZipFile] -as [type]) -and $null -ne (Find-7zExe)) {
+            if ($null -eq ("System.IO.Compression.ZipFile" -as [type]) -and $null -ne (Find-7zExe)) {
                 $m7 = Get-ZipEntrySha256Via7z -ArchivePath $GzPath -EntryName $ExpectedEntryName
                 if ($null -eq $m7) {
                     return @{ Ok = $false; Reason = "Falha ao ler o GZ (ZIP) pelo 7-Zip." }
@@ -1722,7 +1732,7 @@ function Invoke-RetentionPolicy {
         $backupFiles = @(Get-PrefixBackupFiles -Directory $Directory -Prefix $Prefix)
 
         if ($backupFiles.Count -gt $Keep) {
-            foreach ($oldFile in ($backupFiles | Select-Object -Skip $Keep)) {
+            foreach ($oldFile in @($backupFiles | Select-Object -Skip $Keep)) {
                 Log-Message "Excluindo backup excedente antigo: $($oldFile.Name)"
                 Remove-Item $oldFile.FullName -Force -ErrorAction SilentlyContinue
             }
@@ -2145,14 +2155,15 @@ function Get-TaskNotificationState {
         if (Test-Path $stateFile) {
             $raw = [System.IO.File]::ReadAllText($stateFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
             $src = $null
-            if ($null -ne $raw.Tasks -and $null -ne $raw.Tasks.$TaskName) {
-                $src = $raw.Tasks.$TaskName
+            if ($null -ne $raw.Tasks -and $null -ne $raw.Tasks.PSObject.Properties[$TaskName]) {
+                $src = $raw.Tasks.PSObject.Properties[$TaskName].Value
             } elseif ($null -eq $raw.Tasks -and $null -ne $raw.PSObject.Properties["InFailureState"]) {
                 $src = $raw
             }
             if ($null -ne $src) {
-                foreach ($prop in $state.PSObject.Properties.Name) {
-                    if ($null -ne $src.PSObject.Properties[$prop]) { $state.$prop = $src.$prop }
+                foreach ($p in @($state.PSObject.Properties)) {
+                    $prop = $p.Name
+                    if ($null -ne $src.PSObject.Properties[$prop]) { $state.PSObject.Properties[$prop].Value = $src.PSObject.Properties[$prop].Value }
                 }
             }
         }
@@ -3759,10 +3770,10 @@ function Get-OptimalSandboxDir {
         }
     }
     
-    $drives = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and ($_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable') -and -not (Test-IsSystemReservedDrive -Path $_.Name) -and -not (Test-IsGoogleDrivePath -Path $_.Name) }
+    $drives = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and ($_.DriveType -eq 'Fixed' -or $_.DriveType -eq 'Removable') -and -not (Test-IsSystemReservedDrive -Path $_.Name) -and -not (Test-IsGoogleDrivePath -Path $_.Name) })
     
     # Prioridade 1: Disco INTERNO (Fixed) diferente do disco do banco (ex: D: quando banco esta em C:)
-    foreach ($d in ($drives | Where-Object { $_.DriveType -eq 'Fixed' -and $_.Name -ne $dbDrive })) {
+    foreach ($d in @($drives | Where-Object { $_.DriveType -eq 'Fixed' -and $_.Name -ne $dbDrive })) {
         $freeMB = [math]::Round($d.AvailableFreeSpace / 1MB, 0)
         if ($freeMB -ge $minRequiredMB) {
             foreach ($c in $candidates) {
@@ -3781,7 +3792,7 @@ function Get-OptimalSandboxDir {
     }
     
     # Prioridade 2: O mesmo disco do banco (ex: C: quando so existe C:), DESDE QUE tenha espaco com folga
-    $sameDrive = $drives | Where-Object { $_.Name -eq $dbDrive }
+    $sameDrive = $drives | Where-Object { $_.Name -eq $dbDrive } | Select-Object -First 1
     if ($null -ne $sameDrive) {
         $freeMB = [math]::Round($sameDrive.AvailableFreeSpace / 1MB, 0)
         $reqDbDrive = Get-RequiredFreeMB -DbSizeMB $DbSizeMB -Factor 2.5 -MinMB 4096 -DriveTotalMB ($sameDrive.TotalSize / 1MB) -IsDbDrive $true
@@ -3794,7 +3805,7 @@ function Get-OptimalSandboxDir {
     }
     
     # Prioridade 3: Disco removivel (HD externo USB E:) como ultimo recurso
-    foreach ($d in ($drives | Where-Object { $_.DriveType -eq 'Removable' })) {
+    foreach ($d in @($drives | Where-Object { $_.DriveType -eq 'Removable' })) {
         $freeMB = [math]::Round($d.AvailableFreeSpace / 1MB, 0)
         if ($freeMB -ge $minRequiredMB) {
             $sandboxPath = Join-Path $d.Name "BKP_SISMOTEL\_temp_audit"
@@ -3816,8 +3827,9 @@ function Get-AuditState {
     try {
         if (Test-Path $f) {
             $raw = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-            foreach ($prop in $st.PSObject.Properties.Name) {
-                if ($null -ne $raw.PSObject.Properties[$prop]) { $st.$prop = $raw.$prop }
+            foreach ($p in @($st.PSObject.Properties)) {
+                $prop = $p.Name
+                if ($null -ne $raw.PSObject.Properties[$prop]) { $st.PSObject.Properties[$prop].Value = $raw.PSObject.Properties[$prop].Value }
             }
         } elseif ($null -ne $global:configData -and $null -ne $global:configData.Preferences -and -not [string]::IsNullOrWhiteSpace($global:configData.Preferences.LastAuditDate)) {
             # Migracao: instalacoes antigas guardavam a data no config.json
@@ -5169,9 +5181,9 @@ function Get-DiskErrorEventSummary {
             $filtro = @{ LogName = "System"; ProviderName = $f.P; StartTime = $inicio }
             if ($f.Ids.Count -gt 0) { $filtro.Id = $f.Ids }
             $ev = @(Get-WinEvent -FilterHashtable $filtro -MaxEvents 1000 -ErrorAction Stop)
-            foreach ($g in ($ev | Group-Object Id)) {
+            foreach ($g in @($ev | Group-Object Id)) {
                 $discos = @()
-                foreach ($e in $g.Group) {
+                foreach ($e in @($g.Group)) {
                     if ("$($e.Message)" -match '(?i)(?:Harddisk|Disk|Disco)\s*#?\s*(\d+)') {
                         if ($discos -notcontains $matches[1]) { $discos += $matches[1] }
                     }
@@ -5943,7 +5955,8 @@ if (-not $Manual) {
     try {
         if (Test-Path $lastRunFile) {
             $lastRuns = [System.IO.File]::ReadAllText($lastRunFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-            $prev = $lastRuns.$TaskName
+            $prevProp = if ($null -ne $lastRuns) { $lastRuns.PSObject.Properties[$TaskName] } else { $null }
+            $prev = if ($null -ne $prevProp) { "$($prevProp.Value)" } else { $null }
             if (-not [string]::IsNullOrWhiteSpace($prev)) {
                 $minutosDesde = ((Get-Date) - [DateTime]::Parse("$prev")).TotalMinutes
                 if ($minutosDesde -ge 0 -and $minutosDesde -lt $dedupeMinutes) {
@@ -5987,7 +6000,7 @@ $maxBootWaitSec = 45
 $bootWaited = 0
 
 # 1.1 Garante que o servico Firebird esteja em execucao e configurado para Automatico
-$fbServerSrv = Get-Service -Name *firebird* -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "Server" }
+$fbServerSrv = Get-Service -Name *firebird* -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "Server" } | Select-Object -First 1
 if ($null -ne $fbServerSrv) {
     try { Set-Service -Name $fbServerSrv.Name -StartupType Automatic -ErrorAction SilentlyContinue } catch {}
     if ($fbServerSrv.Status -ne "Running") {
