@@ -44,7 +44,7 @@ if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.68"
+$script:EngineVersion = "2.2.69"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -62,7 +62,7 @@ function Start-StreamReadToEnd {
 }
 
 function Complete-StreamReadToEnd {
-    param($TaskOrState)
+    param([Parameter(Position = 0)][Alias("TaskInfo")]$TaskOrState)
     if ($null -eq $TaskOrState) { return "" }
     try {
         return "$($TaskOrState.Delegate.EndInvoke($TaskOrState.AsyncResult))"
@@ -106,7 +106,7 @@ function Invoke-MecConvertFromJson {
         $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
         $ser.MaxJsonLength = 67108864
         $parsed = $ser.DeserializeObject($raw)
-        return (ConvertFrom-MecJsonDict -Val $parsed)
+        return ,(ConvertFrom-MecJsonDict -Val $parsed)
     }
 }
 
@@ -114,7 +114,7 @@ function ConvertTo-MecJsonText {
     param($Val, [int]$Depth = 10, [int]$Level = 0)
     if ($Level -gt $Depth -or $null -eq $Val) { return "null" }
     if ($Val -is [bool]) { if ($Val) { return "true" } else { return "false" } }
-    if ($Val -is [int] -or $Val -is [long] -or $Val -is [double] -or $Val -is [decimal] -or $Val -is [float]) {
+    if ($Val -is [int] -or $Val -is [long] -or $Val -is [double] -or $Val -is [decimal] -or $Val -is [float] -or $Val -is [uint32] -or $Val -is [uint64] -or $Val -is [int16] -or $Val -is [uint16] -or $Val -is [byte]) {
         return [System.Convert]::ToString($Val, [System.Globalization.CultureInfo]::InvariantCulture)
     }
     if ($Val -is [datetime]) {
@@ -190,7 +190,7 @@ function Invoke-MecConvertToJson {
 if (-not (Get-Command ConvertFrom-Json -ErrorAction SilentlyContinue)) {
     function ConvertFrom-Json {
         param([Parameter(ValueFromPipeline = $true)]$InputObject)
-        process { return (Invoke-MecConvertFromJson -InputObject $InputObject) }
+        process { return ,(Invoke-MecConvertFromJson -InputObject $InputObject) }
     }
 }
 
@@ -1796,14 +1796,16 @@ function Get-BestBannerPath([string]$preferredType) {
 }
 
 function Get-RemoteBadgesHtml([string]$anyDeskId, [string]$teamViewerId) {
-    $adBadge = if (-not [string]::IsNullOrWhiteSpace($anyDeskId) -and $anyDeskId -notmatch "N.o configurado") {
-        "<span style='background-color:#064e3b; color:#34d399; padding:5px 12px; border-radius:4px; font-family:Consolas,monospace; font-weight:800; font-size:15px; border:1px solid #059669; display:inline-block; letter-spacing:0.5px;'>$anyDeskId</span>"
+    $adClean = "$anyDeskId".Trim()
+    $adBadge = if (-not [string]::IsNullOrWhiteSpace($adClean) -and $adClean -notmatch '(?i)^n(.|&atilde;)o\s+(configurado|informado)$') {
+        "<span style='background-color:#064e3b; color:#34d399; padding:5px 12px; border-radius:4px; font-family:Consolas,monospace; font-weight:800; font-size:15px; border:1px solid #059669; display:inline-block; letter-spacing:0.5px;'>$(ConvertTo-HtmlSafe $adClean)</span>"
     } else {
         "<span style='color:#94a3b8; font-style:italic; font-size:13.5px;'>N&atilde;o informado</span>"
     }
     
-    $tvBadge = if (-not [string]::IsNullOrWhiteSpace($teamViewerId) -and $teamViewerId -notmatch "N.o configurado") {
-        "<span style='background-color:#1e3a8a; color:#93c5fd; padding:5px 12px; border-radius:4px; font-family:Consolas,monospace; font-weight:700; font-size:14.5px; border:1px solid #2563eb; display:inline-block; letter-spacing:0.5px;'>$teamViewerId</span>"
+    $tvClean = "$teamViewerId".Trim()
+    $tvBadge = if (-not [string]::IsNullOrWhiteSpace($tvClean) -and $tvClean -notmatch '(?i)^n(.|&atilde;)o\s+(configurado|informado)$') {
+        "<span style='background-color:#1e3a8a; color:#93c5fd; padding:5px 12px; border-radius:4px; font-family:Consolas,monospace; font-weight:700; font-size:14.5px; border:1px solid #2563eb; display:inline-block; letter-spacing:0.5px;'>$(ConvertTo-HtmlSafe $tvClean)</span>"
     } else {
         "<span style='color:#94a3b8; font-style:italic; font-size:13.5px;'>N&atilde;o informado</span>"
     }
@@ -2065,6 +2067,9 @@ function Send-MailWithRetry {
             -bor [System.Net.SecurityProtocolType]::Tls12 `
             -bor [System.Net.SecurityProtocolType]::Tls11
     } catch {}
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072 -bor 768
+    } catch {}
 
     try {
         if ($allowInvalidCert) {
@@ -2275,8 +2280,8 @@ function Send-BackupNotification {
                 $state.FailureAlertsSent = 0
                 $state.FailureEpisodeStart = $null
                 if ($WarningDests.Count -gt 0) { $state.InWarningState = $true }
-                Save-TaskNotificationState -TaskName $TaskName -State $state
                 if (-not $alertaSaiu -or $pref.NotifyOnFailure -ne $true) {
+                    Save-TaskNotificationState -TaskName $TaskName -State $state
                     Log-Message "Sistema recuperado de falha anterior. Backup voltou a funcionar normalmente (nenhum alerta havia sido enviado: notificacao suprimida - Zero Spam)."
                     return
                 }
@@ -2480,18 +2485,14 @@ function Send-BackupNotification {
         $suprimidosHoje = 0
         try { $suprimidosHoje = [int](Get-MailBudgetState).Suprimidos } catch {}
 
-        $BodyDetails = ConvertTo-HtmlSafe $BodyDetails
-        $DbPath = ConvertTo-HtmlSafe $DbPath
-        $SuccessDests = @($SuccessDests | ForEach-Object { ConvertTo-HtmlSafe $_ })
-        $WarningDests = @($WarningDests | ForEach-Object { ConvertTo-HtmlSafe $_ })
-
-        # Auto-preenchimento inteligente de telemetria se nao passado pelo chamador
-        if ([string]::IsNullOrWhiteSpace($DurationStr) -and $null -ne $global:routineTimer -and $global:routineTimer.IsRunning) {
+        # Auto-preenchimento inteligente de telemetria se nao passado pelo chamador (antes do escape HTML)
+        $rawDbPath = "$DbPath"
+        if ([string]::IsNullOrWhiteSpace($DurationStr) -and $null -ne $global:routineTimer -and $global:routineTimer.ElapsedMilliseconds -gt 0) {
             $DurationStr = Format-DurationText $global:routineTimer.Elapsed
         }
         if ([string]::IsNullOrWhiteSpace($FreeSpaceInfo)) {
             try {
-                $targetPath = if (-not [string]::IsNullOrWhiteSpace($DbPath)) { $DbPath } else { "C:\" }
+                $targetPath = if (-not [string]::IsNullOrWhiteSpace($rawDbPath)) { $rawDbPath } else { "C:\" }
                 $driveLetter = [System.IO.Path]::GetPathRoot($targetPath)
                 if (-not [string]::IsNullOrWhiteSpace($driveLetter)) {
                     $dInfo = New-Object System.IO.DriveInfo($driveLetter)
@@ -2503,16 +2504,22 @@ function Send-BackupNotification {
                 }
             } catch {}
         }
-        if ([string]::IsNullOrWhiteSpace($CompressionRatio) -and [double]::TryParse($DbSize, [ref]$null) -and [double]::TryParse($ZipSize, [ref]$null)) {
-            $dSize = [double]$DbSize
-            $zSize = [double]$ZipSize
-            if ($dSize -gt 0 -and $zSize -gt 0) {
-                $pct = [Math]::Round((1.0 - ($zSize / $dSize)) * 100, 1)
-                if ($pct -gt 0) {
-                    $CompressionRatio = "$pct% menor"
-                }
+        $dSize = $DbSize -as [double]
+        $zSize = $ZipSize -as [double]
+        if ([string]::IsNullOrWhiteSpace($CompressionRatio) -and $null -ne $dSize -and $null -ne $zSize -and $dSize -gt 0 -and $zSize -gt 0) {
+            $pct = [Math]::Round((1.0 - ($zSize / $dSize)) * 100, 1)
+            if ($pct -gt 0) {
+                $CompressionRatio = "$pct% menor"
             }
         }
+
+        $BodyDetails = ConvertTo-HtmlSafe $BodyDetails
+        $DbPath = ConvertTo-HtmlSafe $DbPath
+        $TaskNameHtml = ConvertTo-HtmlSafe $TaskName
+        $FreeSpaceInfoHtml = ConvertTo-HtmlSafe $FreeSpaceInfo
+        $ZipFileLeafHtml = if (-not [string]::IsNullOrWhiteSpace($ZipFile)) { ConvertTo-HtmlSafe (Split-Path $ZipFile -Leaf) } else { "" }
+        $SuccessDests = @($SuccessDests | ForEach-Object { ConvertTo-HtmlSafe $_ })
+        $WarningDests = @($WarningDests | ForEach-Object { ConvertTo-HtmlSafe $_ })
 
         $remoteBadges = Get-RemoteBadgesHtml -anyDeskId $anyDeskId -teamViewerId $teamViewerId
         $port = if ($pref.SmtpPort -gt 0) { [int]$pref.SmtpPort } else { 587 }
@@ -2567,6 +2574,16 @@ function Send-BackupNotification {
             </div>
 "@
         }
+
+        $durParts = @()
+        if (-not [string]::IsNullOrWhiteSpace($GbakDurationStr) -and $GbakDurationStr -ne "N/A") { $durParts += "$(ConvertTo-HtmlSafe $GbakDurationStr) (GBAK)" }
+        if (-not [string]::IsNullOrWhiteSpace($ZipDurationStr) -and $ZipDurationStr -ne "N/A") { $durParts += "$(ConvertTo-HtmlSafe $ZipDurationStr) (.GZ)" }
+        $gbakZipRowHtml = if ($durParts.Count -gt 0) {
+            "<tr>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Extra&ccedil;&atilde;o &bull; Compress&atilde;o:</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#cbd5e1; font-size:14px;'>$($durParts -join ' &bull; ')</td>
+                      </tr>"
+        } else { "" }
 
         $htmlBody = @"
 <!DOCTYPE html>
@@ -2667,42 +2684,37 @@ function Send-BackupNotification {
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#e2e8f0;">
                       <tr>
                         <td width="38%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Tarefa Executada:</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:15px;">$TaskName $taskBadgeHtml</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:15px;">$TaskNameHtml $taskBadgeHtml</td>
                       </tr>
                       $(if ($DurationStr) {
                       "<tr>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Dura&ccedil;&atilde;o da Rotina:</td>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-weight:800; color:#38bdf8; font-size:15.5px;'>$DurationStr</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-weight:800; color:#38bdf8; font-size:15.5px;'>$(ConvertTo-HtmlSafe $DurationStr)</td>
                       </tr>"
                       })
-                      $(if ($GbakDurationStr -or $ZipDurationStr) {
-                      "<tr>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Extra&ccedil;&atilde;o &bull; Compress&atilde;o:</td>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#cbd5e1; font-size:14px;'>$GbakDurationStr (GBAK) &bull; $ZipDurationStr (.GZ)</td>
-                      </tr>"
-                      })
+                      $gbakZipRowHtml
                       $(if ($DbPath) {
                       "<tr>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Banco Firebird:</td>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-size:13.5px; color:#cbd5e1;'>$DbPath $(if ($DbSize) { "<span style='color:#94a3b8; font-size:12.5px;'>($DbSize MB)</span>" })</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-size:13.5px; color:#cbd5e1;'>$DbPath $(if ($DbSize) { "<span style='color:#94a3b8; font-size:12.5px;'>($(ConvertTo-HtmlSafe $DbSize) MB)</span>" })</td>
                       </tr>"
                       })
                       $(if ($FbkSize) {
                       "<tr>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Backup Bruto (FBK):</td>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-size:14px; color:#cbd5e1;'>$FbkSize MB</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-size:14px; color:#cbd5e1;'>$(ConvertTo-HtmlSafe $FbkSize) MB</td>
                       </tr>"
                       })
                       $(if ($ZipSize) {
                       "<tr>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Arquivo Final (.GZ):</td>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-weight:800; color:#34d399; font-size:15px;'>$ZipSize MB $(if ($CompressionRatio) { "<span style='margin-left:6px; font-size:12.5px; color:#a7f3d0; font-weight:700; background-color:#064e3b; padding:3px 8px; border-radius:4px; border:1px solid #059669;'>$CompressionRatio</span>" })</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-weight:800; color:#34d399; font-size:15px;'>$(if ($ZipFileLeafHtml) { "<span style='font-family:Consolas,monospace; font-size:13.5px; color:#e2e8f0; margin-right:6px;'>$ZipFileLeafHtml</span>" })$(ConvertTo-HtmlSafe $ZipSize) MB $(if ($CompressionRatio) { "<span style='margin-left:6px; font-size:12.5px; color:#a7f3d0; font-weight:700; background-color:#064e3b; padding:3px 8px; border-radius:4px; border:1px solid #059669;'>$(ConvertTo-HtmlSafe $CompressionRatio)</span>" })</td>
                       </tr>"
                       })
-                      $(if ($FreeSpaceInfo) {
+                      $(if ($FreeSpaceInfoHtml) {
                       "<tr>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Espa&ccedil;o em Disco:</td>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-size:13.5px; color:#cbd5e1;'>$FreeSpaceInfo</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-size:13.5px; color:#cbd5e1;'>$FreeSpaceInfoHtml</td>
                       </tr>"
                       })
                       $(if ($SuccessDests -and $SuccessDests.Count -gt 0) {
@@ -2886,6 +2898,8 @@ function Send-BackupNotification {
                 Save-TaskNotificationState -TaskName $TaskName -State $state
                 $proximo = Get-FailureAlertIntervalHours -Sent ([int]$state.FailureAlertsSent) -CooldownHours $cooldownHours
                 Log-Message "Cooldown anti-flood armado (a partir da entrega confirmada): proximo lembrete desta falha so apos ${proximo}h."
+            } elseif ($Status -eq "RESOLVIDO") {
+                Save-TaskNotificationState -TaskName $TaskName -State $state
             } elseif ($Status -eq "AVISO") {
                 $state.LastConfigWarning = (Get-Date).ToString("o")
                 Save-TaskNotificationState -TaskName $TaskName -State $state
@@ -2922,22 +2936,31 @@ function Send-WelcomeEmail {
         $port = if ($pref.SmtpPort -gt 0) { [int]$pref.SmtpPort } else { 587 }
         $useSsl = if ($null -ne $pref.SmtpUseSsl) { [bool]$pref.SmtpUseSsl } else { $false }
         $clientName = if (-not [string]::IsNullOrWhiteSpace($pref.ClientName)) { $pref.ClientName } else { "CLIENTE SISMOTEL" }
+        $clientNameHtml = ConvertTo-HtmlSafe $clientName
         $anyDeskId = if (-not [string]::IsNullOrWhiteSpace($pref.AnyDeskId)) { $pref.AnyDeskId } else { "N&atilde;o configurado" }
         $teamViewerId = if (-not [string]::IsNullOrWhiteSpace($pref.TeamViewerId)) { $pref.TeamViewerId } else { "N&atilde;o configurado" }
         $remoteBadges = Get-RemoteBadgesHtml -anyDeskId $anyDeskId -teamViewerId $teamViewerId
         $timestampNow = Get-Date -Format 'dd/MM/yyyy HH:mm:ss'
 
         $tasksHtml = ""
-        if ($null -ne $global:configData.Tasks -and $global:configData.Tasks.Count -gt 0) {
-            foreach ($t in $global:configData.Tasks) {
-                $tName = $t.TaskName
-                $tTime = if ($t.BackupTime) { $t.BackupTime } else { "Hor&aacute;rio Livre / Cont&iacute;nuo" }
-                $tNetTerm = if (-not [string]::IsNullOrWhiteSpace($t.NetworkTerminalName)) { $t.NetworkTerminalName } else { "Local / N&atilde;o definido" }
+        $tasksArr = @()
+        if ($null -ne $global:configData.Tasks) { $tasksArr = @($global:configData.Tasks) }
+        if ($tasksArr.Count -gt 0) {
+            foreach ($t in $tasksArr) {
+                $tName = ConvertTo-HtmlSafe "$($t.TaskName)"
+                $tTime = if ($null -ne $t.SelectedHours -and @($t.SelectedHours).Count -gt 0) {
+                    ((@($t.SelectedHours) | ForEach-Object { "{0:D2}:00" -f [int]$_ }) -join ", ")
+                } elseif ($t.BackupTime) {
+                    ConvertTo-HtmlSafe "$($t.BackupTime)"
+                } else {
+                    "Hor&aacute;rio Livre / Cont&iacute;nuo"
+                }
+                $tNetTerm = if (-not [string]::IsNullOrWhiteSpace($t.NetworkTerminalName)) { ConvertTo-HtmlSafe "$($t.NetworkTerminalName)" } else { "Local / N&atilde;o definido" }
                 $tDestList = ""
                 if ($null -ne $t.Destinations) {
-                    foreach ($d in $t.Destinations) {
+                    foreach ($d in @($t.Destinations)) {
                         if (-not [string]::IsNullOrWhiteSpace($d)) {
-                            $tDestList += "<span style='color:#38bdf8; font-family:Consolas,monospace; font-size:11.5px;'>&bull; $d</span><br/>"
+                            $tDestList += "<span style='color:#38bdf8; font-family:Consolas,monospace; font-size:11.5px;'>&bull; $(ConvertTo-HtmlSafe $d)</span><br/>"
                         }
                     }
                 }
@@ -3015,7 +3038,7 @@ function Send-WelcomeEmail {
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#ffffff;">
                       <tr>
                         <td width="36%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Cliente / Empresa:</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:16px;">$clientName</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:16px;">$clientNameHtml</td>
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Servidor / Hostname:</td>
@@ -3256,12 +3279,36 @@ function Send-NetworkFailureAlert {
         $remoteBadges = Get-RemoteBadgesHtml -anyDeskId $anyDeskId -teamViewerId $teamViewerId
         $timestampNow = Get-Date -Format 'dd/MM/yyyy HH:mm:ss'
 
+        $rawDestination = "$Destination".Trim()
+        $isLocalServerDest = (-not $rawDestination.StartsWith("\\")) -and (-not (Test-IsGoogleDrivePath -Path $rawDestination))
+        $uncHost = if ($rawDestination -match '^\\\\([^\\\/]+)') { ConvertTo-HtmlSafe $matches[1] } else { "" }
+
         $clientNameHtml = ConvertTo-HtmlSafe $clientName
+        $TaskNameHtml = ConvertTo-HtmlSafe $TaskName
+        $TerminalNameHtml = if ([string]::IsNullOrWhiteSpace($TerminalName)) { "(n&atilde;o definido nas credenciais)" } else { ConvertTo-HtmlSafe $TerminalName }
         $Destination = ConvertTo-HtmlSafe $Destination
         $FailureReason = ConvertTo-HtmlSafe $FailureReason
+        $pingStepHtml = if (-not [string]::IsNullOrWhiteSpace($uncHost)) {
+            "Abrir o CMD no servidor e executar <code>ping $uncHost</code>."
+        } else {
+            "Confirmar no Explorer do servidor se a unidade e a pasta <code>$Destination</code> est&atilde;o conectadas e acess&iacute;veis."
+        }
         $daysStr = if ($DelayHours -ge 24) { "$([Math]::Floor($DelayHours / 24)) dia(s) e $($DelayHours % 24)h" } else { "${DelayHours}h" }
         $urgencyColor = if ($DelayHours -ge 48) { "#b91c1c" } elseif ($DelayHours -ge 24) { "#dc2626" } else { "#d97706" }
-        $urgencyLabel = if ($DelayHours -ge 48) { "URGENTE - MAIS DE 2 DIAS" } elseif ($DelayHours -ge 24) { "ATENCAO - 24H SEM COPIA EXTERNA" } else { "PREVENTIVO - MONITORANDO" }
+        $urgencyLabel = if ($DelayHours -ge 48) {
+            if ($isLocalServerDest) { "URGENTE - MAIS DE 2 DIAS SEM BACKUP LOCAL" } else { "URGENTE - MAIS DE 2 DIAS" }
+        } elseif ($DelayHours -ge 24) {
+            if ($isLocalServerDest) { "ATENCAO - 24H SEM BACKUP LOCAL" } else { "ATENCAO - 24H SEM COPIA EXTERNA" }
+        } else {
+            "PREVENTIVO - MONITORANDO"
+        }
+        $bannerSubtitle = if ($isLocalServerDest) { "BACKUP LOCAL PENDENTE" } else { "BACKUP EXTERNO PENDENTE" }
+        $introHeading = if ($isLocalServerDest) { "Destino Local Sem Backup h&aacute; $daysStr" } else { "Destino Externo Sem C&oacute;pia h&aacute; $daysStr" }
+        $introBodyHtml = if ($isLocalServerDest) {
+            "O FIBS detectou que a pasta local de backup no servidor est&aacute; <strong style='color:#ef4444;'>sem receber novos backups h&aacute; $daysStr</strong>. Verifique se o servi&ccedil;o e o agendador est&atilde;o ativos e se h&aacute; espa&ccedil;o livre no disco."
+        } else {
+            "O FIBS detectou que a c&oacute;pia de conting&ecirc;ncia para o destino listado abaixo est&aacute; <strong style='color:#ef4444;'>interrompida h&aacute; $daysStr</strong>. Esta ferramenta &eacute; respons&aacute;vel por salvar o motel caso ocorra sinistro ou parada no servidor. A c&oacute;pia de emerg&ecirc;ncia externa precisa de aten&ccedil;&atilde;o t&eacute;cnica imediata."
+        }
 
         $htmlBody = @"
 <!DOCTYPE html>
@@ -3269,7 +3316,7 @@ function Send-NetworkFailureAlert {
 <head>
   <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MEC Shield - Alerta de Backup Externo</title>
+  <title>MEC Shield - Alerta de Backup</title>
 </head>
 <body bgcolor="#090d16" style="margin:0; padding:0; background-color:#090d16; font-family:'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif; color:#f8fafc;">
   <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#090d16" style="background-color:#090d16; padding:25px 10px;">
@@ -3287,17 +3334,16 @@ function Send-NetworkFailureAlert {
           <!-- FAIXA DE STATUS PRINCIPAL -->
           <tr>
             <td bgcolor="$urgencyColor" style="background-color:$urgencyColor; color:#ffffff; padding:13px 28px; font-weight:800; font-size:14.5px; letter-spacing:0.5px; text-transform:uppercase;">
-              &#9679; $urgencyLabel &bull; BACKUP EXTERNO PENDENTE
+              &#9679; $urgencyLabel &bull; $bannerSubtitle
             </td>
           </tr>
 
           <!-- INTRODUCAO -->
           <tr>
             <td bgcolor="#111827" style="padding:22px 28px 10px 28px;">
-              <h2 style="margin:0 0 6px 0; color:#fef2f2; font-size:20px; font-weight:700;">Destino Externo Sem C&oacute;pia h&aacute; $daysStr</h2>
+              <h2 style="margin:0 0 6px 0; color:#fef2f2; font-size:20px; font-weight:700;">$introHeading</h2>
               <p style="margin:0; color:#cbd5e1; font-size:14px; line-height:1.65;">
-                O FIBS detectou que a c&oacute;pia de conting&ecirc;ncia para o destino listado abaixo est&aacute; <strong style="color:#ef4444;">interrompida h&aacute; $daysStr</strong>.
-                Esta ferramenta &eacute; respons&aacute;vel por salvar o motel caso ocorra sinistro ou parada no servidor. A c&oacute;pia de emerg&ecirc;ncia externa precisa de aten&ccedil;&atilde;o t&eacute;cnica imediata.
+                $introBodyHtml
               </p>
             </td>
           </tr>
@@ -3324,11 +3370,11 @@ function Send-NetworkFailureAlert {
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Tarefa Afetada:</td>
-                        <td bgcolor="#1e293b" style="padding:7px 0; font-weight:700; color:#f1f5f9; font-size:15px;">$TaskName</td>
+                        <td bgcolor="#1e293b" style="padding:7px 0; font-weight:700; color:#f1f5f9; font-size:15px;">$TaskNameHtml</td>
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Terminal Configurado:</td>
-                        <td bgcolor="#1e293b" style="padding:7px 0; font-weight:700; color:#fbbf24; font-size:14.5px;">$(if ([string]::IsNullOrWhiteSpace($TerminalName)) { "(nao definido nas credenciais)" } else { $TerminalName })</td>
+                        <td bgcolor="#1e293b" style="padding:7px 0; font-weight:700; color:#fbbf24; font-size:14.5px;">$TerminalNameHtml</td>
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Caminho do Destino:</td>
@@ -3362,7 +3408,18 @@ function Send-NetworkFailureAlert {
               <div style='background-color:#450a0a; border:1px solid #7f1d1d; border-left:4px solid #ef4444; border-radius:8px; padding:14px 18px; font-size:14px; color:#fca5a5; line-height:1.65;'>
                 <strong style='color:#f87171; font-size:15px;'>&#9888; ATEN&Ccedil;&Atilde;O: FALHA NA EXTRA&Ccedil;&Atilde;O DO BANCO DE DADOS</strong><br/>
                 <div style='margin-top:6px; color:#fee2e2;'>
-                  O backup externo n&atilde;o p&ocirc;de ser gerado porque a ferramenta gbak.exe encontrou erros no banco de dados Sismotel. O banco necessita de valida&ccedil;&atilde;o de integridade da equipe t&eacute;cnica MEC.
+                  O backup n&atilde;o p&ocirc;de ser gerado porque a ferramenta gbak.exe encontrou erros no banco de dados Sismotel. O banco necessita de valida&ccedil;&atilde;o de integridade da equipe t&eacute;cnica MEC.
+                </div>
+              </div>
+            </td>
+          </tr>"
+          } elseif ($isLocalServerDest) {
+          "<tr>
+            <td bgcolor='#111827' style='padding:8px 28px;'>
+              <div style='background-color:#450a0a; border:1px solid #7f1d1d; border-left:4px solid #ef4444; border-radius:8px; padding:14px 18px; font-size:14px; color:#fca5a5; line-height:1.65;'>
+                <strong style='color:#f87171; font-size:15px;'>&#9888; ATEN&Ccedil;&Atilde;O: PASTA LOCAL DO SERVIDOR SEM NOVOS BACKUPS</strong><br/>
+                <div style='margin-top:6px; color:#fee2e2;'>
+                  A pasta local <strong>$Destination</strong> no servidor <strong>$hostName</strong> n&atilde;o recebe um novo arquivo de backup h&aacute; <strong>$daysStr</strong>. Verifique se o servi&ccedil;o <code>MEC Shield Service</code> est&aacute; em execu&ccedil;&atilde;o, se h&aacute; espa&ccedil;o livre no disco e consulte o log da tarefa.
                 </div>
               </div>
             </td>
@@ -3433,7 +3490,7 @@ function Send-NetworkFailureAlert {
                       <strong>1. Acessar o Servidor:</strong> Conectar via AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).
                     </div>
                     <div style="margin-bottom:8px;">
-                      <strong>2. Testar Conex&atilde;o de Rede:</strong> Abrir o CMD no servidor e executar <code>ping $($Destination -replace '\\.*$', '')</code>.
+                      <strong>2. Testar Conex&atilde;o / Destino:</strong> $pingStepHtml
                     </div>
                     <div style="margin-bottom:8px;">
                       <strong>3. Validar Pasta de Destino:</strong> Pressionar <code>Win+R</code> e abrir o caminho do destino para confirmar exist&ecirc;ncia e permiss&atilde;o de grava&ccedil;&atilde;o.
@@ -3442,7 +3499,7 @@ function Send-NetworkFailureAlert {
                       <strong>4. Revalidar Credenciais:</strong> Abrir o <strong>MEC Shield</strong>, clicar em <em>Editar Tarefa</em> e usar o bot&atilde;o <em>Testar Conex&atilde;o</em>.
                     </div>
                     <div>
-                      <strong>5. Consultar Logs:</strong> Verificar <code>C:\Microtecs\FIBS\logs\backup_${TaskName}_log.txt</code>.
+                      <strong>5. Consultar Logs:</strong> Verificar <code>C:\Microtecs\FIBS\logs\backup_${TaskNameHtml}_log.txt</code>.
                     </div>
                   </td>
                 </tr>
@@ -3585,17 +3642,18 @@ function Test-ExternalDestinationsHealth {
         }
         if ($null -eq $global:configData -or $null -eq $global:configData.Tasks) { return }
 
-        $tConf = $global:configData.Tasks | Where-Object { $_.TaskName -eq $TaskName } | Select-Object -First 1
+        $tConf = @($global:configData.Tasks | Where-Object { $_.TaskName -eq $TaskName }) | Select-Object -First 1
         if ($null -eq $tConf) {
-            $tConf = $global:configData.Tasks | Where-Object { $_.TaskName -match "EXTERN" } | Select-Object -First 1
+            $tConf = @($global:configData.Tasks | Where-Object { $_.TaskName -match "EXTERN" }) | Select-Object -First 1
         }
         if ($null -eq $tConf) { return }
+        if ($null -ne $tConf.AlertOnMissingBackup -and [bool]$tConf.AlertOnMissingBackup -eq $false) { return }
 
         $destsToCheck = @()
-        if ($Destinations -and $Destinations.Count -gt 0) {
-            $destsToCheck = $Destinations
-        } elseif ($tConf.Destinations) {
-            $destsToCheck = $tConf.Destinations
+        if ($null -ne $Destinations -and @($Destinations).Count -gt 0) {
+            $destsToCheck = @($Destinations)
+        } elseif ($null -ne $tConf.Destinations) {
+            $destsToCheck = @($tConf.Destinations)
         }
 
         if ($destsToCheck.Count -eq 0) { return }
@@ -3908,13 +3966,15 @@ function Send-AuditAlertNotification {
         $remoteBadges = Get-RemoteBadgesHtml -anyDeskId $cleanAnyDesk -teamViewerId $cleanTv
         $timestampNow = Get-Date -Format 'dd/MM/yyyy HH:mm:ss'
 
-        # Valor negativo = gfix nao rodou (restauracao falhou antes): mostra "nao verificado", nunca um 0 verde
+        # Valor negativo = gfix/gstat nao rodou: mostra "nao verificado", nunca um 0 verde
         $recordColor = if ($RecordErrors -gt 0) { "#ef4444" } elseif ($RecordErrors -lt 0) { "#94a3b8" } else { "#10b981" }
         $pageColor = if ($PageErrors -gt 0) { "#ef4444" } elseif ($PageErrors -lt 0) { "#94a3b8" } else { "#10b981" }
         $recordText = if ($RecordErrors -lt 0) { "n&atilde;o verificado" } else { "$RecordErrors" }
         $pageText = if ($PageErrors -lt 0) { "n&atilde;o verificado" } else { "$PageErrors" }
-        $gapColor = if ($TransactionGap -ge 200000) { "#f59e0b" } else { "#10b981" }
-        $limitColor = if ($NextTransaction -ge 1500000000) { "#ef4444" } else { "#10b981" }
+        $gapColor = if ($TransactionGap -ge 200000) { "#f59e0b" } elseif ($TransactionGap -lt 0) { "#94a3b8" } else { "#10b981" }
+        $limitColor = if ($NextTransaction -ge 1500000000) { "#ef4444" } elseif ($NextTransaction -le 0) { "#94a3b8" } else { "#10b981" }
+        $gapText = if ($TransactionGap -lt 0) { "n&atilde;o verificado" } else { "$TransactionGap" }
+        $limitText = if ($NextTransaction -le 0) { "n&atilde;o verificado" } else { "$NextTransaction" }
 
         $htmlBody = @"
 <!DOCTYPE html>
@@ -4020,11 +4080,11 @@ function Send-AuditAlertNotification {
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Transaction Gap (Next - Oldest):</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:800; font-size:15px; color:$gapColor;">$TransactionGap</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:800; font-size:15px; color:$gapColor;">$gapText</td>
                       </tr>
                       <tr>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Contador de Transa&ccedil;&otilde;es (Pr&oacute;xima):</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:700; font-size:14.5px; color:$limitColor;">$NextTransaction</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:700; font-size:14.5px; color:$limitColor;">$limitText</td>
                       </tr>
                     </table>
                   </td>
@@ -4252,7 +4312,7 @@ function Invoke-GstatHeader {
     param([string]$GstatExe, [string]$DbPath, [hashtable]$Environment = @{})
     $saved = @{}
     foreach ($k in $Environment.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k, "Process"); [Environment]::SetEnvironmentVariable($k, [string]$Environment[$k], "Process") }
-    try { return (& "$GstatExe" -h "$DbPath" 2>&1 | Out-String) }
+    try { return ((& "$GstatExe" -h "$DbPath" 2>&1 | ForEach-Object { "$_" }) -join "`r`n") }
     catch { return "$_" }
     finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], "Process") } }
 }
@@ -4273,9 +4333,9 @@ function Invoke-DatabaseHealthAudit {
     }
 
     $pref = $global:configData.Preferences
-    $task = $global:configData.Tasks | Where-Object { $_.TaskName -eq $TaskName } | Select-Object -First 1
+    $task = @($global:configData.Tasks) | Where-Object { $_.TaskName -eq $TaskName } | Select-Object -First 1
     if ($null -eq $task) {
-        $task = $global:configData.Tasks | Select-Object -First 1
+        $task = @($global:configData.Tasks) | Select-Object -First 1
     }
     if ($null -eq $task) {
         Log-Message "[AUDITORIA ERRO] Nenhuma tarefa encontrada para auditoria."
@@ -4289,14 +4349,14 @@ function Invoke-DatabaseHealthAudit {
 
     $verdict = "OK"
     $motivos = @()
-    # -1 = gfix nao rodou (o e-mail mostra "nao verificado" em vez de um 0 enganoso)
+    # -1 = gfix/gstat nao rodou (o e-mail mostra "nao verificado" em vez de um 0 enganoso)
     $recordErrors = -1
     $pageErrors = -1
     $ressalvaIndice = $null
     $gfixLog = ""
-    $oldestTrans = 0
-    $nextTrans = 0
-    $transGap = 0
+    $oldestTrans = -1
+    $nextTrans = -1
+    $transGap = -1
 
     # 1. Ferramentas Firebird
     $gbakExe = "$($task.GbakPath)"
@@ -4354,21 +4414,31 @@ function Invoke-DatabaseHealthAudit {
             $verdict = "INCONCLUSIVO"
         }
 
-        # 3. ETAPA 2: ultimo backup local para restauracao de teste
+        # 3. ETAPA 2: ultimo backup local para restauracao de teste (priorizando discos locais antes de unidades do Google Drive)
         Log-Message "[AUDITORIA] 2/4 - Localizando ultimo arquivo de backup valido para teste fisico..."
-        $searchDirs = @()
-        if ($null -ne $task.Destinations) {
-            foreach ($d in $task.Destinations) {
-                if (-not [string]::IsNullOrWhiteSpace($d) -and -not $d.StartsWith("\\") -and (Test-Path $d)) { $searchDirs += $d }
-            }
+        $localNonCloudDirs = @()
+        $cloudDirs = @()
+        $allCandidateDests = @()
+        if ($null -ne $task.Destinations) { $allCandidateDests += @($task.Destinations) }
+        foreach ($otherT in @($global:configData.Tasks)) {
+            if ($null -ne $otherT -and $null -ne $otherT.Destinations) { $allCandidateDests += @($otherT.Destinations) }
         }
-        foreach ($d in @("D:\BKP_SISMOTEL", "C:\BKP_SISMOTEL")) { if (Test-Path $d) { $searchDirs += $d } }
-        $searchDirs = @($searchDirs | Select-Object -Unique)
+        $allCandidateDests += @("D:\BKP_SISMOTEL", "C:\BKP_SISMOTEL")
+        foreach ($d in @($allCandidateDests | Select-Object -Unique)) {
+            if ([string]::IsNullOrWhiteSpace($d) -or $d.StartsWith("\\") -or -not (Test-Path $d)) { continue }
+            if (Test-IsGoogleDrivePath -Path $d) { $cloudDirs += $d } else { $localNonCloudDirs += $d }
+        }
 
         $latestGz = $null
-        foreach ($sd in $searchDirs) {
+        foreach ($sd in $localNonCloudDirs) {
             $zips = @(Get-ChildItem -Path $sd -Filter "*.GZ" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Sort-Object LastWriteTime -Descending)
             if ($zips.Count -gt 0 -and ($null -eq $latestGz -or $zips[0].LastWriteTime -gt $latestGz.LastWriteTime)) { $latestGz = $zips[0] }
+        }
+        if ($null -eq $latestGz) {
+            foreach ($sd in $cloudDirs) {
+                $zips = @(Get-ChildItem -Path $sd -Filter "*.GZ" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Sort-Object LastWriteTime -Descending)
+                if ($zips.Count -gt 0 -and ($null -eq $latestGz -or $zips[0].LastWriteTime -gt $latestGz.LastWriteTime)) { $latestGz = $zips[0] }
+            }
         }
         if ($null -eq $latestGz) {
             throw (New-Object System.InvalidOperationException("Nenhum arquivo .GZ de backup local foi encontrado para o teste de restauracao."))
@@ -4765,7 +4835,7 @@ function Invoke-MecLiveUpdate {
 
         try {
             $fibsState.LastUpdateCheck = $now.ToString("yyyy-MM-dd HH:mm:ss")
-            Save-JsonState -Path $fibsStateFile -Data $fibsState -Depth 5
+            Invoke-WithMecLock -Name "State" -Script { Save-JsonState -Path $fibsStateFile -Data $fibsState -Depth 5 }
         } catch {
             Log-Message "[LIVEUPDATE AVISO] Nao foi possivel gravar a data da verificacao: $_. A atualizacao continua."
         }
@@ -4819,7 +4889,7 @@ function Invoke-MecLiveUpdate {
         }
         $fibsState.LastUpdateAttemptVersion = "$($manifest.version)"
         $fibsState.LastUpdateAttemptAt = (Get-Date).ToString("o")
-        try { Save-JsonState -Path $fibsStateFile -Data $fibsState -Depth 5 } catch {}
+        try { Invoke-WithMecLock -Name "State" -Script { Save-JsonState -Path $fibsStateFile -Data $fibsState -Depth 5 } } catch {}
 
         $statusDesc = if ($engineNeedsUpdate) { "Motor: v$engineVersion -> v$($manifest.version)" } else { "Interface defasada: v$exeVer -> v$($manifest.version)" }
         Log-Message "[LIVEUPDATE] Atualizacao assinada detectada: v$($manifest.version) ($statusDesc). Baixando..."
@@ -5276,10 +5346,15 @@ function Add-SuspectTempDir {
     param([string]$Path, [int]$Days = 7, [string]$Motivo = "")
     if ([string]::IsNullOrWhiteSpace($Path)) { return }
     $f = Join-Path $scriptDir "temp_suspeito.json"
-    $lista = @(Get-SuspectTempDirs | Where-Object { "$($_.Pasta)".TrimEnd('\') -ine $Path.TrimEnd('\') })
-    if ($Motivo.Length -gt 300) { $Motivo = $Motivo.Substring(0, 300) }
-    $lista += (New-Object PSObject -Property @{ Pasta = $Path; Ate = (Get-Date).AddDays($Days).ToString("o"); Motivo = $Motivo })
-    try { Save-JsonState -Path $f -Data @{ Pastas = $lista } -Depth 4 } catch {
+    try {
+        Invoke-WithMecLock -Name "State" -Script {
+            $lista = @(Get-SuspectTempDirs | Where-Object { "$($_.Pasta)".TrimEnd('\') -ine $Path.TrimEnd('\') })
+            $motivoClean = $Motivo
+            if ($motivoClean.Length -gt 300) { $motivoClean = $motivoClean.Substring(0, 300) }
+            $lista += (New-Object PSObject -Property @{ Pasta = $Path; Ate = (Get-Date).AddDays($Days).ToString("o"); Motivo = $motivoClean })
+            Save-JsonState -Path $f -Data @{ Pastas = $lista } -Depth 4
+        }
+    } catch {
         Log-Message "Aviso: nao foi possivel registrar a pasta suspeita '$Path': $_"
     }
 }
@@ -5533,8 +5608,8 @@ function Invoke-7zProcess {
             return @{ Started = $true; ExitCode = -1; StdErr = "Timeout de $([int]($TimeoutMs / 60000)) minutos excedido no 7-Zip."; TimedOut = $true }
         }
         $p.WaitForExit()
-        $err = "$(Complete-StreamReadToEnd -TaskInfo $errTask)".Trim()
-        $null = Complete-StreamReadToEnd -TaskInfo $outTask
+        $err = "$(Complete-StreamReadToEnd -TaskOrState $errTask)".Trim()
+        $null = Complete-StreamReadToEnd -TaskOrState $outTask
         return @{ Started = $true; ExitCode = $p.ExitCode; StdErr = $err; TimedOut = $false }
     } catch {
         # Win32Exception (193 = binario de outra arquitetura, 5 = acesso negado, antivirus...)
@@ -5601,11 +5676,11 @@ function Get-ZipEntrySha256Via7z {
         $metrics = Get-Sha256OfStreamWithMetrics -Stream $p.StandardOutput.BaseStream
         $p.WaitForExit()
         if ($p.ExitCode -ne 0) {
-            $err = "$(Complete-StreamReadToEnd -TaskInfo $errTask)".Trim()
+            $err = "$(Complete-StreamReadToEnd -TaskOrState $errTask)".Trim()
             Log-Message "Aviso: conferencia pelo 7-Zip retornou codigo $($p.ExitCode): $err"
             return $null
         }
-        $null = Complete-StreamReadToEnd -TaskInfo $errTask
+        $null = Complete-StreamReadToEnd -TaskOrState $errTask
         return $metrics
     } catch {
         Log-Message "Aviso: conferencia pelo 7-Zip nao executou ($($_.Exception.Message))."
@@ -5676,8 +5751,8 @@ function Invoke-ExternalTool {
     $result = (New-Object PSObject -Property @{
         ExitCode = $(if ($timedOut) { -1 } else { $p.ExitCode })
         TimedOut = $timedOut
-        StdOut   = (Complete-StreamReadToEnd -TaskInfo $outTask)
-        StdErr   = (Complete-StreamReadToEnd -TaskInfo $errTask)
+        StdOut   = (Complete-StreamReadToEnd -TaskOrState $outTask)
+        StdErr   = (Complete-StreamReadToEnd -TaskOrState $errTask)
     })
     $p.Dispose()
     return $result
@@ -5914,7 +5989,7 @@ if (-not $fibsState.WelcomeEmailSent -and $null -ne $global:configData.Preferenc
         Send-WelcomeEmail
         if ($global:mailSent) { $fibsState.WelcomeEmailSent = $true }
         $fibsState | Add-Member -MemberType NoteProperty -Name WelcomeEmailLastAttempt -Value (Get-Date).ToString("o") -Force
-        try { Save-JsonState -Path $fibsStateFile -Data $fibsState -Depth 5 } catch {}
+        try { Invoke-WithMecLock -Name "State" -Script { Save-JsonState -Path $fibsStateFile -Data $fibsState -Depth 5 } } catch {}
     }
 }
 # -----------------------------------------------------------
@@ -5922,7 +5997,7 @@ if (-not $fibsState.WelcomeEmailSent -and $null -ne $global:configData.Preferenc
 $networkTrackerFile = Join-Path $scriptDir "network_tracker.json"
 # Localiza a tarefa pelo nome
 $task = $null
-foreach ($t in $global:configData.Tasks) {
+foreach ($t in @($global:configData.Tasks)) {
     if ($t.TaskName -eq $TaskName) {
         $task = $t
         break
@@ -6972,7 +7047,7 @@ $($failedDestinations -join "`r`n")
 # Backup salvo so na 2a rodada: agora que ja esta gravado nos destinos, o aviso de
 # hardware segue a escada (1o agora, 2o +3 dias, 3o +7 dias, depois silencio).
 if (-not [string]::IsNullOrEmpty($avisoHwPendente)) {
-    Send-BackupNotification -Status "AVISO_HARDWARE" -SubjectInfo "Instabilidade de Disco ou Memoria ($TaskName)" -BodyDetails $avisoHwPendente -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -SuccessDests $allSuccessList -HardwareSmartFail $hwSmartFail
+    Send-BackupNotification -Status "AVISO_HARDWARE" -SubjectInfo "Instabilidade de Disco ou Memoria ($TaskName)" -BodyDetails $avisoHwPendente -ZipFile $fileName -ZipSize "$gzSizeMB" -FbkSize "$fbkSizeMB" -DbPath $dbPath -DbSize "$dbSizeMB" -DurationStr $durationStr -GbakDurationStr $gbakDurationStr -ZipDurationStr $zipDurationStr -CompressionRatio $compRatio -FreeSpaceInfo $diskInfo -SuccessDests $allSuccessList -HardwareSmartFail $hwSmartFail
 }
 
 # A auditoria diaria NAO roda mais dentro da rotina de backup: ela e disparada so

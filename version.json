@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.68",
+    "version":  "2.2.69",
     "releaseDate":  "2026-10-14",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Correcao de Write-TextFileAtomic no PowerShell 2.0 (Windows 7 / Server 2008 R2): substituicao de [NullString]::Value (introduzido no PS 3.0) por arquivo .bak temporario em File.Replace, eliminando todos os avisos ao gravar sequencia de backups e estados JSON.\\n2. Compatibilidade total e validada por AST com Windows 7 SP1, Windows 10/11 e Windows Server 2008 R2 a 2025.",
-    "setupSha256":  "CE32066AD341041C39B72AD95B78FDE557B15DA5E6DA61EF315C85D45C30F2FD",
-    "engineSha256":  "645CFA66CB3BB27186F2204000D02D340D3BC9DC7DCA7BA1497E0A8BCC52F5C9",
-    "signature":  "llV2FLy5HInTQuzS7RksSt9NA5k2YsUwxBP+M//BFYjhHrrVjioKg/G7vDXFOACPhL1sN7bzeLHZTh06pE7umkmyi2XiG7rIvOqDLejBVr7NRa5TVCT9GOytWA8ilLP2hglDySSoquDZ5eOQgHg8KVaqpSG0VRnwEFpQMhhtlYeK6XeMQGExM17yZiNHc7XAXxZAWOesIjjZA8reIU5LpLFi0Ed5v7fZg8157GitmTXozf8kPir/uGXQSHWlX4VH4dn4+o8jyJDpz1MfEWZEQedOCdyuNH4sVV05KKhuk+mRyCu/aSKF9cZuFmyM9SPdy9fkyLd6kGGh/uqnWGHIJpwvIdfVOkX949ldT6mPXzNpfOaLgxkt3XkXRpuHhaCo4Ny5jDzxxAk9Gyes7zxeR19tcfz0KLsM79MUJ8OiFWT4VlVjSBCLAjhw6bw9d6E7iOl/EJcRHAaAH1fiwd/v37L6ziRip/G61ONFwGBgsDIxO9Zl9yE1rZ+WgdH08SGD"
+    "changelog":  "1. Revisao profunda ponta a ponta (Motor PowerShell, E-mails HTML, Painel C#, Servico Windows e Instalador Inno Setup) para Windows 7 SP1, Windows 10/11 e Windows Server 2008 R2 a 2025.\\n2. Blindagem completa dos 4 templates de e-mail HTML + teste SMTP (escaping HTML contra caracteres especiais, card dedicado para atraso local vs falha de rede UNC, telemetria completa em avisos de hardware, omissao limpa de metricas gstat nao verificadas e suporte TLS 1.2/1.1 universal).\\n3. Correcoes criticas de captura de stdout/stderr do gbak/gfix/gstat/7z, preservacao de arrays unitarios no JSON polyfill (PS 2.0) e sincronismo de sequencia no painel C#.",
+    "setupSha256":  "126DA15A5B669A2497C7C59B933F9A38C03445B2208AC6C80F93AD09BB550CFB",
+    "engineSha256":  "A1CBBAB1629042800D541DD5DA1AFA4FB8587E982E2B8B53DD6169FFD4205806",
+    "signature":  "syb7Yy2xDRVlAZX0sSUmK1aMOexEth6LtftqvePpqDwD7JHH2VRYxtB0BQacqFsBPTp+kcqPJxqB6TMPXulxej7XjhNmrD7Kmx1VH2WMR0GSeo6x28Ar7fkbQWfiAWEub0+oM5e63AUyuK70b0jzkQhieOPCN2xNpxb4tuHJ3RC4LgcYxao+oVrmg2S99uAqAvLhvGPuCUB9OWx69O8SWniVATUixPfI4JZh2Kj1KB8ivpdf/hSC8vguXtd+IaLdqy4E7P0UoXiQ+/Om1c5+Vmi/wsO0gb8Vpxgy2y2y3T+CGP5uJBy/aN2VTOPWnte87eM7L1qrYER7aZGHCvJ5OYKBXHh1UNdp+h3bFh4Pby1+1rV06dn3g5HGk3BRqpbIPf4oak0WmklzChDb1ewzbbbOmkXeovD1CdMJZl0PVUznL3FbDqKOXd79/my5NHIggKSYx0wyRh/mHSa8ZDe3snXuLkS3ndEuyQJhdfXWgT4GH4nnZw7HDd9R26gc5QVN"
 }
