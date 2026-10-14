@@ -44,7 +44,7 @@ if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.67"
+$script:EngineVersion = "2.2.68"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -376,8 +376,10 @@ function Write-TextFileAtomic {
         try {
             if (Test-Path $Path) {
                 if ([string]::IsNullOrWhiteSpace($BackupPath)) {
-                    # [NullString]::Value: $null viraria "" ao chamar o .NET e o Replace falharia
-                    [System.IO.File]::Replace($tmp, $Path, [NullString]::Value)
+                    # Evita [NullString]::Value (inexistente no PowerShell 2.0 do Windows 7 / Server 2008 R2)
+                    $tmpBak = "$Path.$PID.bak"
+                    [System.IO.File]::Replace($tmp, $Path, $tmpBak)
+                    Remove-Item $tmpBak -Force -ErrorAction SilentlyContinue
                 } else {
                     [System.IO.File]::Replace($tmp, $Path, $BackupPath)
                 }

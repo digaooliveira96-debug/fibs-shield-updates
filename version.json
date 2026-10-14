@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.67",
+    "version":  "2.2.68",
     "releaseDate":  "2026-10-14",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Correcao definitiva do ParserError no PowerShell 2.0 (Windows 7 SP1) na linha 229 (substituicao de chamada dinamica $InputObject.$MethodName() por PSObject.Methods[MethodName].Invoke()).\\n2. Eliminacao de enumeracao de membros PS 3.0+ (.PSObject.Properties.Name) e acessos dinamicos a propriedades em backup_engine.ps1 e startup_guard.ps1, validados por AST no Pester.\\n3. Compatibilidade total Windows 7 a Windows 11 / Server 2012-2025 (Sismotel.chv ISO-8859-1, descoberta de rede, polyfills JSON/WMI e CLR 4.0).",
-    "setupSha256":  "C0907EE38FBC7AF9E5493302F8ADCDF08A41033FD6E30D7E2BAAEE6DC86011F9",
-    "engineSha256":  "169100DFA2634F9DD851986F432D3F22612FE8DD92C3F3257A911DCA8260B072",
-    "signature":  "nJNjFTIiVJaWTbtsTF1ACVWnQJB3spg5bbvpRHIVF52Gu9ZUec1RsUZ95XlgHYVnK4DfeRO0WC1ZYNoroaToHd61hy9CQ2hTepDbsYDa5nXDkTLhTOVTnOW/9Yq31r5Y22i+WuCn+bAp66DXVDMcUzapx3J5sWW9tXYeotZIrBAtYuUrxvwMYRua9vxyMCY8Gp0GOk2msiljx5W/vXdbhAup5xpKTcn2erVmkJl1eAs1oSRd/L8eNEfL8BxQ4Fs34X3aiP32vbRtMsIDS/zgGDKHou3U9z454/BdG/lxDK+jh0zZrtAoAQ0TlADcupN4deU6jkEFPVHkHzeJeo72FhOzLI/k/MuO25lLMbC6vYrkbS45qK7rVPHu1G2sueIYYZ+R/Oi1E+yoIJk8fjjohxBV2bHwUdcsktk1p++UTlj4mUeWfEQCUxQ7CdRkTnLOHrE6TRKFRXu33AGnr5dv4QZds+xZV4A7Y8SqM937nmKlFEhfFGyK/DWHGIsM2+2c"
+    "changelog":  "1. Correcao de Write-TextFileAtomic no PowerShell 2.0 (Windows 7 / Server 2008 R2): substituicao de [NullString]::Value (introduzido no PS 3.0) por arquivo .bak temporario em File.Replace, eliminando todos os avisos ao gravar sequencia de backups e estados JSON.\\n2. Compatibilidade total e validada por AST com Windows 7 SP1, Windows 10/11 e Windows Server 2008 R2 a 2025.",
+    "setupSha256":  "CE32066AD341041C39B72AD95B78FDE557B15DA5E6DA61EF315C85D45C30F2FD",
+    "engineSha256":  "645CFA66CB3BB27186F2204000D02D340D3BC9DC7DCA7BA1497E0A8BCC52F5C9",
+    "signature":  "llV2FLy5HInTQuzS7RksSt9NA5k2YsUwxBP+M//BFYjhHrrVjioKg/G7vDXFOACPhL1sN7bzeLHZTh06pE7umkmyi2XiG7rIvOqDLejBVr7NRa5TVCT9GOytWA8ilLP2hglDySSoquDZ5eOQgHg8KVaqpSG0VRnwEFpQMhhtlYeK6XeMQGExM17yZiNHc7XAXxZAWOesIjjZA8reIU5LpLFi0Ed5v7fZg8157GitmTXozf8kPir/uGXQSHWlX4VH4dn4+o8jyJDpz1MfEWZEQedOCdyuNH4sVV05KKhuk+mRyCu/aSKF9cZuFmyM9SPdy9fkyLd6kGGh/uqnWGHIJpwvIdfVOkX949ldT6mPXzNpfOaLgxkt3XkXRpuHhaCo4Ny5jDzxxAk9Gyes7zxeR19tcfz0KLsM79MUJ8OiFWT4VlVjSBCLAjhw6bw9d6E7iOl/EJcRHAaAH1fiwd/v37L6ziRip/G61ONFwGBgsDIxO9Zl9yE1rZ+WgdH08SGD"
 }
