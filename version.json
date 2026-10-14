@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.65",
-    "releaseDate":  "2026-10-13",
-    "minEngineVersion":  "2.1.0",
-    "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
-    "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Blindagem multi-cliente de particoes e Google Drive: protecao absoluta da reserva de 8 GB / 5 GB mesmo quando o Google Drive esta em modo Espelhar em C:\\Users, exclusao de unidades virtuais do Fail-Safe local e preservacao automatica de destinos de nuvem na reinstalacao.\\n2. Diagnostico preciso de falha por falta de espaco em discos locais no alerta por e-mail e guarda de fallback de sessao do usuario.\\n3. Correcoes em configurar_discos.ps1 (criptografia DPAPI fora do JSON e separacao de discos fisicos/nuvem), startup_guard.ps1 e deteccao automatica de 4 destinos no painel C#.",
-    "setupSha256":  "E0757DDC10A5C53C2D73100DDA7A28F48D39FC2634BF2B9C4F97B1AC63E15300",
-    "engineSha256":  "DE0781247B5C3667EEB7782094FB866530D8C1EBF5A819F8126F57D801A5ACAC",
-    "signature":  "eJABcm/U2WZTuNf7fRRa0wq+agdAcSJsVZM0byn+n6njGhL2K1Q23Wla+Un1OLNdsUFYHyQ+0Zbpr+chhRDquVWDehZRsXlWGTTXMLADv+XjH45hEgbjwRpYz/lwjKJy6Ve0RsWvUGjEnSuX8up5043rMwVABQSPxCqTQw9ZoEgzIQfZkrnSfmMmDmxSHAF32VrcGMlKJC1HxACGESPbIAPZ7VECUXJhT9Fjf/mgIMGEWjFEm2dQOCyZvjinRdtrpHAYYqJzZU7wB9tat4MEhPugrBHc6Jpbp1xyCSJNsApVrhjas5DzhL60GeKqzACgPvn5zWX/3GRVcQYI5z243Pqp2I0Iy7uac5X3UC2/KOL9tMmR6RpI/Jwgttp9VIhoe/sW7tCiE6PU5ri1bYbtvwCx5RVFyYExlbtXcO99jBdUhcHLz/GBjIx58VA93uyZ3nes0b8CfWqW39fu3i2fQO6Ti1f1YF3xIjSaV83O+jLdWrklvYdFeKXc8/i0rV3T"
+  "version": "2.2.66",
+  "releaseDate": "2026-10-14",
+  "minEngineVersion": "2.1.0",
+  "downloadUrl": "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
+  "setupUrl": "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
+  "changelog": "1. Compatibilidade total com Windows 7 SP1 (PowerShell 2.0 + .NET Framework 4.0) preservando 100% do funcionamento no Windows 10/11 e Windows Server 2012-2025.\\n2. Correcao da deteccao automatica do Nome do Motel (Sismotel.chv com leitura ISO-8859-1 byte a byte e multiplos discos) e da descoberta de compartilhamentos de rede no instalador e no painel.\\n3. Polyfills nativos para PowerShell 2.0 (ConvertFrom-Json, ConvertTo-Json, Get-CimInstance, 7-Zip fallback, COMPLUS_Version v4.0.30319) e validacao estrita de producao de log antes de reportar sucesso no painel.",
+  "setupSha256": "3AC957ADFF6048D53CD4EAC809460920F45653D288957B36690399A8F13F87E0",
+  "engineSha256": "163B6C44878CBA0CCF09C6DF00D0C4B325F915EBDF902634D3EFECE759E06941",
+  "signature": "oS6WGSX0XoI0iNxR9fjcw5liXaEpY9BmQP1veaoR61XWIXTMEAeUM9d36iX3sXcPmIvOPTSZVChV6kMexD4kG9/mbV74fJWQRi3wB9UXZfHJdiPbu4HAi7KQnWOcxFKwsT08N2BbRMPQ8YKG031cZhnJKwlscdY2SSX8Ek+5CM103hZLI+G3JCsdE8r5c7K4rYhHk1hudwuwNdUNxJ8nPPFDqHYuMEEuKsLoPnf0lr3AVjh3azdbzrIL5vs0xSHDWuXYwEgiDPTZ1VIeJIJFKtVCVgVkntJaE6fpc+xVtx8l0CFWqIIh9gDAVsQb2pB23NklEnnYwkEAWJxPfrDv3BKNwS1ubqGQKtxGs1lOxUM75HbpDf+yXEuWbwF+54gxQkxdkogr4YfPdzAoLI9dFERobCMt8w3SpcHF9WeU6+Nm/AuT+VOqUwqLO23+UQbENpHC8QFHq9pqCFa5dwSYlgMWRMGHpu9CrrmCVNydR5wpFNDQ7AxPEM66DfJDU/yd"
 }

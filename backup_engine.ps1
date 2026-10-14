@@ -17,13 +17,218 @@ param (
     [switch]$ReopenPanel
 )
 
+# Windows 7 / Server 2008 R2 com PowerShell 2.0 + .NET 4.0+:
+# Por padrao o PowerShell 2.0 abre no CLR 2.0, onde nao existem metodos do .NET 4.0
+# ([string]::IsNullOrWhiteSpace, System.Web.Extensions 4.0, ZipFile, etc.).
+# Relanca o proprio processo no CLR 4.0 antes de executar qualquer funcao.
+if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne "1" -and $env:MECSHIELD_LIBRARY_MODE -ne "1") {
+    $net4Dir = Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319"
+    if (Test-Path $net4Dir) {
+        $env:COMPLUS_Version = "v4.0.30319"
+        $env:MECSHIELD_CLR4_RELAUNCH = "1"
+        $relaunchArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $MyInvocation.MyCommand.Path)
+        foreach ($kv in $MyInvocation.BoundParameters.GetEnumerator()) {
+            if ($kv.Value -is [switch]) {
+                if ($kv.Value.IsPresent) { $relaunchArgs += "-$($kv.Key)" }
+            } else {
+                $relaunchArgs += "-$($kv.Key)"
+                $relaunchArgs += "$($kv.Value)"
+            }
+        }
+        $psExe = Join-Path $PSHome "powershell.exe"
+        & $psExe @relaunchArgs
+        exit $LASTEXITCODE
+    }
+}
+
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.65"
+$script:EngineVersion = "2.2.66"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
+
+# Leitura assincrona de stdout/stderr compativel com .NET 3.5/4.0/4.5/4.8 (Windows 7 a Windows 11).
+function Start-StreamReadToEnd {
+    param([System.IO.StreamReader]$Reader)
+    if ($null -eq $Reader) { return $null }
+    $del = [System.Delegate]::CreateDelegate([System.Func[string]], [System.IO.TextReader]$Reader, "ReadToEnd")
+    $ar = $del.BeginInvoke($null, $null)
+    return (New-Object PSObject -Property @{ Delegate = $del; AsyncResult = $ar })
+}
+
+function Complete-StreamReadToEnd {
+    param($TaskOrState)
+    if ($null -eq $TaskOrState) { return "" }
+    try {
+        return "$($TaskOrState.Delegate.EndInvoke($TaskOrState.AsyncResult))"
+    } catch {
+        return ""
+    }
+}
+
+# Polyfills JSON e CIM para Windows 7 (PowerShell 2.0 sobre CLR 4.0).
+# No PowerShell 3.0 / 4.0 / 5.1 (Windows 8, 10, 11, Server 2012+) os cmdlets nativos ja
+# existem e os polyfills nao sao registrados, preservando 100% do comportamento atual.
+function ConvertFrom-MecJsonDict {
+    param($Val)
+    if ($null -eq $Val) { return $null }
+    if ($Val -is [System.Collections.IDictionary]) {
+        $obj = New-Object PSObject
+        foreach ($k in $Val.Keys) {
+            $v = ConvertFrom-MecJsonDict -Val $Val[$k]
+            $obj | Add-Member -MemberType NoteProperty -Name "$k" -Value $v -Force
+        }
+        return $obj
+    }
+    if (($Val -is [System.Collections.IEnumerable]) -and -not ($Val -is [string])) {
+        $arr = @()
+        foreach ($item in $Val) {
+            $arr += ,(ConvertFrom-MecJsonDict -Val $item)
+        }
+        return ,$arr
+    }
+    return $Val
+}
+
+function Invoke-MecConvertFromJson {
+    param([Parameter(ValueFromPipeline = $true)]$InputObject)
+    process {
+        if ($null -eq $InputObject) { return $null }
+        $raw = "$InputObject".Trim()
+        if ($raw.Length -gt 0 -and [int][char]$raw[0] -eq 0xFEFF) { $raw = $raw.Substring(1).Trim() }
+        if ($raw.Length -eq 0) { return $null }
+        try { Add-Type -AssemblyName System.Web.Extensions -ErrorAction SilentlyContinue } catch {}
+        $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $ser.MaxJsonLength = 67108864
+        $parsed = $ser.DeserializeObject($raw)
+        return (ConvertFrom-MecJsonDict -Val $parsed)
+    }
+}
+
+function ConvertTo-MecJsonText {
+    param($Val, [int]$Depth = 10, [int]$Level = 0)
+    if ($Level -gt $Depth -or $null -eq $Val) { return "null" }
+    if ($Val -is [bool]) { if ($Val) { return "true" } else { return "false" } }
+    if ($Val -is [int] -or $Val -is [long] -or $Val -is [double] -or $Val -is [decimal] -or $Val -is [float]) {
+        return [System.Convert]::ToString($Val, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Val -is [datetime]) {
+        return '"' + $Val.ToString("o") + '"'
+    }
+    if ($Val -is [string] -or $Val -is [char] -or $Val -is [guid]) {
+        $s = "$Val"
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append('"')
+        for ($i = 0; $i -lt $s.Length; $i++) {
+            $ch = $s[$i]
+            $code = [int][char]$ch
+            if ($ch -eq '"') { [void]$sb.Append('\"') }
+            elseif ($ch -eq '\') { [void]$sb.Append('\\') }
+            elseif ($code -eq 8) { [void]$sb.Append('\b') }
+            elseif ($code -eq 12) { [void]$sb.Append('\f') }
+            elseif ($code -eq 10) { [void]$sb.Append('\n') }
+            elseif ($code -eq 13) { [void]$sb.Append('\r') }
+            elseif ($code -eq 9) { [void]$sb.Append('\t') }
+            elseif ($code -lt 32) { [void]$sb.AppendFormat('\u{0:x4}', $code) }
+            else { [void]$sb.Append($ch) }
+        }
+        [void]$sb.Append('"')
+        return $sb.ToString()
+    }
+    $indent = "    " * ($Level + 1)
+    $closeIndent = "    " * $Level
+    if ($Val -is [System.Collections.IDictionary]) {
+        $items = @()
+        foreach ($k in $Val.Keys) {
+            $kJson = ConvertTo-MecJsonText -Val "$k" -Depth $Depth -Level ($Level + 1)
+            $vJson = ConvertTo-MecJsonText -Val $Val[$k] -Depth $Depth -Level ($Level + 1)
+            $items += "${indent}${kJson}: ${vJson}"
+        }
+        if ($items.Count -eq 0) { return "{}" }
+        return "{`r`n" + ($items -join ",`r`n") + "`r`n${closeIndent}}"
+    }
+    if (($Val -is [System.Collections.IEnumerable]) -and -not ($Val -is [string])) {
+        $items = @()
+        foreach ($el in $Val) {
+            $items += "${indent}" + (ConvertTo-MecJsonText -Val $el -Depth $Depth -Level ($Level + 1))
+        }
+        if ($items.Count -eq 0) { return "[]" }
+        return "[`r`n" + ($items -join ",`r`n") + "`r`n${closeIndent}]"
+    }
+    $props = @($Val.PSObject.Properties | Where-Object { $_.MemberType -eq 'NoteProperty' -or $_.MemberType -eq 'Property' })
+    if ($props.Count -gt 0) {
+        $items = @()
+        foreach ($p in $props) {
+            $kJson = ConvertTo-MecJsonText -Val "$($p.Name)" -Depth $Depth -Level ($Level + 1)
+            $vJson = ConvertTo-MecJsonText -Val $p.Value -Depth $Depth -Level ($Level + 1)
+            $items += "${indent}${kJson}: ${vJson}"
+        }
+        return "{`r`n" + ($items -join ",`r`n") + "`r`n${closeIndent}}"
+    }
+    return (ConvertTo-MecJsonText -Val "$Val" -Depth $Depth -Level $Level)
+}
+
+function Invoke-MecConvertToJson {
+    param(
+        [Parameter(ValueFromPipeline = $true)]$InputObject,
+        [int]$Depth = 10,
+        [switch]$Compress
+    )
+    begin { $list = @() }
+    process { $list += ,$InputObject }
+    end {
+        $target = if ($list.Count -eq 1) { $list[0] } else { $list }
+        return (ConvertTo-MecJsonText -Val $target -Depth $Depth -Level 0)
+    }
+}
+
+if (-not (Get-Command ConvertFrom-Json -ErrorAction SilentlyContinue)) {
+    function ConvertFrom-Json {
+        param([Parameter(ValueFromPipeline = $true)]$InputObject)
+        process { return (Invoke-MecConvertFromJson -InputObject $InputObject) }
+    }
+}
+
+if (-not (Get-Command ConvertTo-Json -ErrorAction SilentlyContinue)) {
+    function ConvertTo-Json {
+        param([Parameter(ValueFromPipeline = $true)]$InputObject, [int]$Depth = 10, [switch]$Compress)
+        begin { $items = @() }
+        process { $items += ,$InputObject }
+        end {
+            $val = if ($items.Count -eq 1) { $items[0] } else { $items }
+            return (Invoke-MecConvertToJson -InputObject $val -Depth $Depth -Compress:$Compress)
+        }
+    }
+}
+
+if (-not (Get-Command Get-CimInstance -ErrorAction SilentlyContinue)) {
+    function Get-CimInstance {
+        param(
+            [Parameter(Position = 0)][string]$ClassName,
+            [string]$Filter,
+            [string]$Namespace = "root\cimv2",
+            $ErrorAction = "Continue"
+        )
+        if ($Filter) {
+            return Get-WmiObject -Class $ClassName -Namespace $Namespace -Filter $Filter -ErrorAction $ErrorAction
+        }
+        return Get-WmiObject -Class $ClassName -Namespace $Namespace -ErrorAction $ErrorAction
+    }
+}
+
+if (-not (Get-Command Invoke-CimMethod -ErrorAction SilentlyContinue)) {
+    function Invoke-CimMethod {
+        param(
+            $InputObject,
+            [string]$MethodName,
+            $ErrorAction = "Continue"
+        )
+        if ($null -eq $InputObject) { return $null }
+        return $InputObject.$MethodName()
+    }
+}
 
 function Test-IsDpapiBlob {
     param([string]$Value)
@@ -45,9 +250,9 @@ function Unprotect-String {
     } catch { return $null }
 }
 
-# Conversor JSON -> Hashtable compativel com Windows PowerShell 5.1.
+# Conversor JSON -> Hashtable compativel com Windows PowerShell 2.0 a 5.1.
 # ATENCAO: NAO usar o parametro -AsHashtable do ConvertFrom-Json aqui. Ele so existe
-# no PowerShell 6+; o servico roda sempre no powershell.exe 5.1 (System32), onde ele
+# no PowerShell 6+; o servico roda sempre no powershell.exe (System32), onde ele
 # lanca excecao, zera o rastreador de destinos e derruba o alerta de 24 horas.
 function ConvertTo-HashtableCompat {
     param($InputObject)
@@ -304,7 +509,7 @@ function Get-FailureDiagnosis {
     )
     foreach ($r in $regras) {
         if ($t -match $r.Padrao) {
-            return [PSCustomObject]@{ Codigo = $r.Codigo; Titulo = $r.Titulo; Causa = $r.Causa; Passos = $r.Passos }
+            return (New-Object PSObject -Property @{ Codigo = $r.Codigo; Titulo = $r.Titulo; Causa = $r.Causa; Passos = $r.Passos })
         }
     }
     return $null
@@ -482,7 +687,7 @@ function Resolve-MappedDrivePath {
                 Invoke-WithMecLock -Name "State" -Script {
                     $cache = @{}
                     if (Test-Path $cacheFile) {
-                        $cache = ConvertTo-HashtableCompat (Get-Content $cacheFile -Raw -Encoding UTF8 | ConvertFrom-Json)
+                        $cache = ConvertTo-HashtableCompat ([System.IO.File]::ReadAllText($cacheFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json)
                     }
                     if ($cache[$driveLetter] -ne $remotePath) {
                         $cache[$driveLetter] = $remotePath
@@ -493,7 +698,7 @@ function Resolve-MappedDrivePath {
         } else {
             try {
                 if (Test-Path $cacheFile) {
-                    $cache = ConvertTo-HashtableCompat (Get-Content $cacheFile -Raw -Encoding UTF8 | ConvertFrom-Json)
+                    $cache = ConvertTo-HashtableCompat ([System.IO.File]::ReadAllText($cacheFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json)
                     if (-not [string]::IsNullOrWhiteSpace($cache[$driveLetter])) {
                         $remotePath = $cache[$driveLetter]
                         Log-Message "Unidade ${driveLetter}: nao visivel para esta conta; usando a ultima traducao conhecida: $remotePath"
@@ -838,11 +1043,11 @@ function Get-UserSessionCopyScript {
     return @'
 param([string]$JobFile)
 $res = $null
-$quem = try { [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { "?" }
+$quem = $(try { [Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { "?" })
 $r = "FALHA`t$quem`tpedido ilegivel"
 try {
     $job = @{}
-    foreach ($l in (Get-Content -LiteralPath $JobFile -Encoding UTF8)) { $p = $l.Split("`t", 2); if ($p.Count -eq 2) { $job[$p[0]] = $p[1] } }
+    foreach ($l in (Get-Content -LiteralPath $JobFile -Encoding UTF8)) { $p = $l.Split("`t", 2); if ($p.Length -eq 2) { $job[$p[0]] = $p[1] } }
     $res = $job["RESULT"]
     $dest = $job["DESTDIR"]
     if ($dest -match '^([A-Za-z]:)(?:\\(.*))?$' -and -not (Test-Path -LiteralPath $dest)) {
@@ -851,7 +1056,7 @@ try {
         foreach ($gd in @("My Drive", "Meu Drive", "Mi unidad", "Mon Drive", "Meine Ablage", "Il mio Drive")) {
             $gdPath = Join-Path $drv $gd
             if (Test-Path -LiteralPath $gdPath -PathType Container) {
-                if ([string]::IsNullOrWhiteSpace($rel) -or ($rel -ieq $gd)) {
+                if ([string]::IsNullOrEmpty("$rel".Trim()) -or ($rel -ieq $gd)) {
                     $dest = Join-Path $gdPath "BKP_SISMOTEL"
                 } elseif ($rel -match '^(?i)(My Drive|Meu Drive|Mi unidad|Mon Drive|Meine Ablage|Il mio Drive)(?:\\(.*))?$') {
                     $sub = if ($matches[2]) { $matches[2] } else { "BKP_SISMOTEL" }
@@ -868,8 +1073,8 @@ try {
         # "The path is not of a legal form" e esconde a causa real.
         if ($dest.StartsWith("\\")) {
             $partes = $dest.TrimStart('\').Split('\')
-            $raiz = "\\" + $partes[0] + "\" + $(if ($partes.Count -gt 1) { $partes[1] } else { "" })
-            if ($partes.Count -le 2 -or -not (Test-Path -LiteralPath $raiz)) {
+            $raiz = "\\" + $partes[0] + "\" + $(if ($partes.Length -gt 1) { $partes[1] } else { "" })
+            if ($partes.Length -le 2 -or -not (Test-Path -LiteralPath $raiz)) {
                 throw "a pasta compartilhada '$raiz' nao abre nem para este usuario (terminal desligado, nome do computador mudou ou compartilhamento removido)"
             }
         }
@@ -891,8 +1096,8 @@ try {
                 if ($di.IsReady -and $di.AvailableFreeSpace -lt ($srcLen + 536870912)) {
                     $initFree = [long]$di.AvailableFreeSpace
                     $freedBytes = [long]0
-                    $antigosGuard = @(Get-ChildItem -LiteralPath $dest -File -ErrorAction SilentlyContinue | Where-Object {
-                        $_.Name -match "^${pfx}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${pfx}[-_]\d{8}_\d{6}\.(GZ|zip)$"
+                    $antigosGuard = @(Get-ChildItem -LiteralPath $dest -ErrorAction SilentlyContinue | Where-Object {
+                        -not $_.PSIsContainer -and ($_.Name -match "^${pfx}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${pfx}[-_]\d{8}_\d{6}\.(GZ|zip)$")
                     } | Sort-Object LastWriteTime -Descending | Select-Object -Skip 3)
                     [array]::Reverse($antigosGuard)
                     foreach ($fg in $antigosGuard) {
@@ -916,11 +1121,11 @@ try {
             throw "SHA-256 da copia nao confere com a origem (arquivo chegou alterado)"
         }
         $keep = 30; [void][int]::TryParse($job["KEEP"], [ref]$keep); if ($keep -lt 1) { $keep = 1 }
-        $velhos = @(Get-ChildItem -LiteralPath $dest -File -ErrorAction SilentlyContinue | Where-Object {
-            $_.Name -match "^${pfx}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${pfx}[-_]\d{8}_\d{6}\.(GZ|zip)$"
+        $velhos = @(Get-ChildItem -LiteralPath $dest -ErrorAction SilentlyContinue | Where-Object {
+            -not $_.PSIsContainer -and ($_.Name -match "^${pfx}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${pfx}[-_]\d{8}_\d{6}\.(GZ|zip)$")
         } | Sort-Object LastWriteTime -Descending | Select-Object -Skip $keep)
         foreach ($f in $velhos) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
-        $r = "OK`t$quem`t$final`t$($velhos.Count)"
+        $r = "OK`t$quem`t$final`t$($velhos.Length)"
     }
 } catch {
     $r = "FALHA`t$quem`t$(($_.Exception.Message -replace '[\r\n\t]+', ' '))"
@@ -937,25 +1142,79 @@ if ($res) {
 function Invoke-AsLoggedOnUser {
     param([string]$User, [string]$HelperFile, [string]$JobFile, [string]$ResultFile, [int]$TimeoutSec = 900, [switch]$Limited)
     $nome = "Copia_Rede_" + [Guid]::NewGuid().ToString("N").Substring(0, 12)
-    try {
-        $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ("-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"{0}`" -JobFile `"{1}`"" -f $HelperFile, $JobFile)
-        $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds ($TimeoutSec + 120))
+    if (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue) {
         try {
-            # Unidade do usuario (Google Drive, OneDrive): nivel normal, o mesmo token do
-            # Explorer. Um processo elevado pode nao enxergar a letra que o usuario ve.
-            if ($Limited) { throw "nivel normal pedido" }
-            $prn = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
-            Register-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Action $act -Principal $prn -Settings $set -Force -ErrorAction Stop | Out-Null
-        } catch {
-            # Privilegio maximo recusado para este usuario: roda no nivel normal dele
-            $prn = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
-            Register-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Action $act -Principal $prn -Settings $set -Force -ErrorAction Stop | Out-Null
+            $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ("-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"{0}`" -JobFile `"{1}`"" -f $HelperFile, $JobFile)
+            $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds ($TimeoutSec + 120))
+            try {
+                # Unidade do usuario (Google Drive, OneDrive): nivel normal, o mesmo token do
+                # Explorer. Um processo elevado pode nao enxergar a letra que o usuario ve.
+                if ($Limited) { throw "nivel normal pedido" }
+                $prn = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
+                Register-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Action $act -Principal $prn -Settings $set -Force -ErrorAction Stop | Out-Null
+            } catch {
+                # Privilegio maximo recusado para este usuario: roda no nivel normal dele
+                $prn = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
+                Register-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Action $act -Principal $prn -Settings $set -Force -ErrorAction Stop | Out-Null
+            }
+            Start-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -ErrorAction Stop
+            $limite = (Get-Date).AddSeconds($TimeoutSec)
+            while ((Get-Date) -lt $limite -and -not (Test-Path $ResultFile)) { Start-Sleep -Seconds 2 }
+        } finally {
+            try { Unregister-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Confirm:$false -ErrorAction SilentlyContinue } catch {}
         }
-        Start-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -ErrorAction Stop
-        $limite = (Get-Date).AddSeconds($TimeoutSec)
-        while ((Get-Date) -lt $limite -and -not (Test-Path $ResultFile)) { Start-Sleep -Seconds 2 }
-    } finally {
-        try { Unregister-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+    } else {
+        # Fallback Windows 7 / Server 2008 R2 (onde o modulo ScheduledTasks nao existe):
+        # usa schtasks.exe com XML de LogonType InteractiveToken.
+        $tn = "MEC_Shield\$nome"
+        $xmlFile = Join-Path ([System.IO.Path]::GetTempPath()) ("mec_task_" + $nome + ".xml")
+        try {
+            $escUser = [System.Security.SecurityElement]::Escape($User)
+            $escArgs = [System.Security.SecurityElement]::Escape(("-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"{0}`" -JobFile `"{1}`"" -f $HelperFile, $JobFile))
+            $levels = if ($Limited) { @("LeastPrivilege") } else { @("HighestAvailable", "LeastPrivilege") }
+            $created = $false
+            foreach ($rl in $levels) {
+                $xml = @"
+<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals>
+    <Principal id="Author">
+      <UserId>$escUser</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>$rl</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <ExecutionTimeLimit>PT$($TimeoutSec + 120)S</ExecutionTimeLimit>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>$escArgs</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"@
+                [System.IO.File]::WriteAllText($xmlFile, $xml, [System.Text.Encoding]::Unicode)
+                & schtasks.exe /Create /TN $tn /XML $xmlFile /F 2>&1 | Out-Null
+                if ($LASTEXITCODE -eq 0) { $created = $true; break }
+            }
+            if (-not $created) { throw "schtasks nao conseguiu registrar a tarefa temporaria para '$User'" }
+            & schtasks.exe /Run /TN $tn 2>&1 | Out-Null
+            $limite = (Get-Date).AddSeconds($TimeoutSec)
+            while ((Get-Date) -lt $limite -and -not (Test-Path $ResultFile)) { Start-Sleep -Seconds 2 }
+        } finally {
+            try { & schtasks.exe /Delete /TN $tn /F 2>&1 | Out-Null } catch {}
+            try { if (Test-Path $xmlFile) { Remove-Item $xmlFile -Force -ErrorAction SilentlyContinue } } catch {}
+        }
     }
 }
 
@@ -975,7 +1234,7 @@ function Copy-ViaLoggedOnUser {
     )
     $users = @(Get-LoggedOnUsers)
     if ($users.Count -eq 0) {
-        return [PSCustomObject]@{ Ok = $false; User = ""; FinalPath = ""; Removed = 0; Message = "nenhum usuario logado no servidor para fazer a copia pela sessao dele" }
+        return (New-Object PSObject -Property @{ Ok = $false; User = ""; FinalPath = ""; Removed = 0; Message = "nenhum usuario logado no servidor para fazer a copia pela sessao dele" })
     }
     $base = if ([string]::IsNullOrWhiteSpace($WorkRoot)) { Join-Path $env:ProgramData "MEC_Shield\rede" } else { $WorkRoot }
     $falhas = @()
@@ -998,7 +1257,7 @@ function Copy-ViaLoggedOnUser {
             if ($p[0] -eq "OK") {
                 $removidos = 0; if ($p.Count -ge 4) { [void][int]::TryParse($p[3], [ref]$removidos) }
                 $final = if ($p.Count -ge 3) { $p[2] } else { "" }
-                return [PSCustomObject]@{ Ok = $true; User = $p[1]; FinalPath = $final; Removed = $removidos; Message = "OK" }
+                return (New-Object PSObject -Property @{ Ok = $true; User = $p[1]; FinalPath = $final; Removed = $removidos; Message = "OK" })
             }
             $falhas += "$($p[1]): $(if ($p.Count -ge 3) { $p[2] } else { 'falha sem detalhe' })"
         } catch {
@@ -1007,7 +1266,7 @@ function Copy-ViaLoggedOnUser {
             try { Remove-Item $jobDir -Recurse -Force -ErrorAction SilentlyContinue } catch {}
         }
     }
-    return [PSCustomObject]@{ Ok = $false; User = ""; FinalPath = ""; Removed = 0; Message = ($falhas -join " | ") }
+    return (New-Object PSObject -Property @{ Ok = $false; User = ""; FinalPath = ""; Removed = 0; Message = ($falhas -join " | ") })
 }
 
 # Grava, le e apaga um arquivo de prova. Devolve "" se deu certo ou a mensagem de erro.
@@ -1043,11 +1302,11 @@ function Invoke-NetworkAccessTest {
         $dest = (Resolve-GoogleDriveDestinationPath -Path $dest).TrimEnd('\', '/')
         $direto = Test-WriteProbe -Dir $dest
         if ([string]::IsNullOrWhiteSpace($direto)) {
-            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Gravacao direta pelo servico, sem senha: OK (funciona 24h, mesmo sem ninguem logado)." }
+            $results += (New-Object PSObject -Property @{ Destination = $dest; Ok = $true; Message = "Gravacao direta pelo servico, sem senha: OK (funciona 24h, mesmo sem ninguem logado)." })
             continue
         }
         if (-not (Test-IsSystemAccount)) {
-            $results += [PSCustomObject]@{ Destination = $dest; Ok = $false; Message = "Falha: $direto" }
+            $results += (New-Object PSObject -Property @{ Destination = $dest; Ok = $false; Message = "Falha: $direto" })
             continue
         }
         $comSenha = ""
@@ -1058,7 +1317,7 @@ function Invoke-NetworkAccessTest {
                 if ($s.Ok) {
                     try { $comSenha = Test-WriteProbe -Dir $dest } finally { Exit-NetworkCredential $s }
                     if ([string]::IsNullOrWhiteSpace($comSenha)) {
-                        $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Gravacao pelo servico com o usuario de rede '$($s.Account)': OK (funciona 24h, mesmo sem ninguem logado)." }
+                        $results += (New-Object PSObject -Property @{ Destination = $dest; Ok = $true; Message = "Gravacao pelo servico com o usuario de rede '$($s.Account)': OK (funciona 24h, mesmo sem ninguem logado)." })
                         continue
                     }
                     if ($comSenha -match '(?i)user name or password|nome de usu.rio ou (a )?senha|logon failure|falha de logon') {
@@ -1075,9 +1334,9 @@ function Invoke-NetworkAccessTest {
         }
         $v = Copy-ViaLoggedOnUser -DestDir $dest -Probe -TimeoutSec 120 -NivelNormal:(-not $dest.StartsWith("\\"))
         if ($v.Ok) {
-            $results += [PSCustomObject]@{ Destination = $dest; Ok = $true; Message = "Grava pelo usuario logado ($($v.User)). Precisa de alguem logado no servidor para a copia de rede (o backup local continua 24h). Servico: $direto" }
+            $results += (New-Object PSObject -Property @{ Destination = $dest; Ok = $true; Message = "Grava pelo usuario logado ($($v.User)). Precisa de alguem logado no servidor para a copia de rede (o backup local continua 24h). Servico: $direto" })
         } else {
-            $results += [PSCustomObject]@{ Destination = $dest; Ok = $false; Message = "Servico: $direto | Usuario logado: $($v.Message)" }
+            $results += (New-Object PSObject -Property @{ Destination = $dest; Ok = $false; Message = "Servico: $direto | Usuario logado: $($v.Message)" })
         }
     }
     return $results
@@ -1095,13 +1354,13 @@ function Invoke-NetworkAccessTestFromRequest {
         }
         Remove-Item $RequestFile -Force -ErrorAction SilentlyContinue
     }
-    $ident = try { [System.Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { "desconhecida" }
+    $ident = $(try { [System.Security.Principal.WindowsIdentity]::GetCurrent().Name } catch { "desconhecida" })
     $out = @("IDENT`t$ident")
     if ($dests.Count -eq 0) {
         $out += "FALHA`t-`tPedido de teste vazio ou ilegivel."
     } else {
         # Mesma credencial de rede que o backup automatico usa (config.json da instalacao)
-        $cfg = try { Read-ConfigData } catch { $null }
+        $cfg = $(try { Read-ConfigData } catch { $null })
         $tasks = if ($null -ne $cfg) { @($cfg.Tasks) } else { @() }
         foreach ($r in (Invoke-NetworkAccessTest -Destinations $dests -Tasks $tasks)) {
             $status = if ($r.Ok) { "OK" } else { "FALHA" }
@@ -1238,8 +1497,8 @@ function Expand-RarArchive {
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow  = $true
     $p = [System.Diagnostics.Process]::Start($psi)
-    $outTask = $p.StandardOutput.ReadToEndAsync()
-    $errTask = $p.StandardError.ReadToEndAsync()
+    $outTask = Start-StreamReadToEnd -Reader $p.StandardOutput
+    $errTask = Start-StreamReadToEnd -Reader $p.StandardError
     $finished = $p.WaitForExit(120000) # 2 minutos max para extrair
     if (-not $finished) { try { $p.Kill() } catch {}; $p.WaitForExit() }
     $exitCode = $p.ExitCode
@@ -1248,10 +1507,10 @@ function Expand-RarArchive {
         throw "WinRAR excedeu 2 minutos ao extrair '$RarPath'. Operacao cancelada."
     }
     if ($exitCode -ne 0) {
-        $errOut = try { $errTask.Result } catch { "" }
+        $errOut = $(try { Complete-StreamReadToEnd -TaskOrState $errTask } catch { "" })
         throw "WinRAR retornou codigo $exitCode ao extrair '$RarPath'. $errOut".Trim()
     }
-    $extracted = Get-ChildItem -Path $DestDir -Filter "*.fbk" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    $extracted = Get-ChildItem -Path $DestDir -Filter "*.fbk" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Select-Object -First 1
     if ($null -eq $extracted) {
         throw "Nenhum arquivo .fbk encontrado dentro de '$RarPath' apos extracao pelo WinRAR."
     }
@@ -1274,6 +1533,19 @@ function Test-BackupGzIntegrity {
         $fmt = Get-GzFileFormat -Path $GzPath
 
         if ($fmt -eq "ZIP") {
+            if ($null -eq ([System.IO.Compression.ZipFile] -as [type]) -and $null -ne (Find-7zExe)) {
+                $m7 = Get-ZipEntrySha256Via7z -ArchivePath $GzPath -EntryName $ExpectedEntryName
+                if ($null -eq $m7) {
+                    return @{ Ok = $false; Reason = "Falha ao ler o GZ (ZIP) pelo 7-Zip." }
+                }
+                if ($m7.BytesRead -ne $ExpectedSize) {
+                    return @{ Ok = $false; Reason = "Tamanho descompactado divergente: GZ diz $($m7.BytesRead) bytes, o .fbk tinha $ExpectedSize bytes." }
+                }
+                if ($m7.Hash -ne $ExpectedSha256) {
+                    return @{ Ok = $false; Reason = "SHA-256 do conteudo descompactado nao confere com o .fbk original (corrupcao silenciosa)." }
+                }
+                return @{ Ok = $true; Reason = "Conteudo conferido por SHA-256 (formato ZIP via 7-Zip)." }
+            }
             # Formato padrao do FIBS: ZIP com extensao .GZ
             $zip = [System.IO.Compression.ZipFile]::OpenRead($GzPath)
             $entry = $zip.Entries | Where-Object { $_.Name -eq $ExpectedEntryName } | Select-Object -First 1
@@ -1357,7 +1629,7 @@ function Get-NextBackupSequenceNumber {
     $seqData = @{}
     if (Test-Path $SequenceFilePath) {
         try {
-            $raw = Get-Content $SequenceFilePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $raw = [System.IO.File]::ReadAllText($SequenceFilePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
             if ($null -ne $raw) {
                 foreach ($prop in $raw.psobject.Properties) {
                     $seqData[$prop.Name] = [int]$prop.Value
@@ -1374,7 +1646,7 @@ function Get-NextBackupSequenceNumber {
             $resolved = Resolve-MappedDrivePath $dest
             if (Test-Path $resolved) {
                 try {
-                    $files = Get-ChildItem -Path $resolved -Filter "$Prefix-*.*" -File -ErrorAction SilentlyContinue
+                    $files = Get-ChildItem -Path $resolved -Filter "$Prefix-*.*" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer }
                     foreach ($f in $files) {
                         if ($f.Name -match "^$([regex]::Escape($Prefix))-(\d+)\.(zip|gz|rar|fbk)$") {
                             $num = [int]$matches[1]
@@ -1413,7 +1685,7 @@ function Save-BackupSequenceNumber {
         Invoke-WithMecLock -Name "State" -Script {
             $seqData = @{}
             if (Test-Path $SequenceFilePath) {
-                $raw = Get-Content $SequenceFilePath -Raw -Encoding UTF8 | ConvertFrom-Json
+                $raw = [System.IO.File]::ReadAllText($SequenceFilePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
                 if ($null -ne $raw) {
                     foreach ($prop in $raw.psobject.Properties) { $seqData[$prop.Name] = [int]$prop.Value }
                 }
@@ -1437,8 +1709,8 @@ function Save-BackupSequenceNumber {
 function Get-PrefixBackupFiles {
     param([string]$Directory, [string]$Prefix)
     $escapedPrefix = [regex]::Escape($Prefix)
-    return @(Get-ChildItem -Path $Directory -File -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -match "^${escapedPrefix}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.(GZ|zip)$"
+    return @(Get-ChildItem -Path $Directory -ErrorAction SilentlyContinue | Where-Object {
+        -not $_.PSIsContainer -and ($_.Name -match "^${escapedPrefix}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${escapedPrefix}[-_]\d{8}_\d{6}\.(GZ|zip)$")
     } | Sort-Object LastWriteTime -Descending)
 }
 
@@ -1524,7 +1796,7 @@ function Get-RemoteBadgesHtml([string]$anyDeskId, [string]$teamViewerId) {
         "<span style='color:#94a3b8; font-style:italic; font-size:13.5px;'>N&atilde;o informado</span>"
     }
     
-    return [PSCustomObject]@{ AnyDesk = $adBadge; TeamViewer = $tvBadge }
+    return (New-Object PSObject -Property @{ AnyDesk = $adBadge; TeamViewer = $tvBadge })
 }
 
 # Credenciais do Firebird por variavel de ambiente (suportado pelo cliente Firebird
@@ -1606,11 +1878,11 @@ function Get-MailDailyLimit {
 }
 
 function Get-MailBudgetState {
-    $st = [PSCustomObject]@{ Envios = @(); Suprimidos = 0 }
+    $st = (New-Object PSObject -Property @{ Envios = @(); Suprimidos = 0 })
     $f = Get-MailBudgetFile
     try {
         if (Test-Path $f) {
-            $raw = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
+            $raw = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
             $agora = Get-Date
             $validos = @()
             foreach ($e in @($raw.Envios)) {
@@ -1844,7 +2116,7 @@ function Test-WithinCooldown {
 }
 
 function New-TaskNotificationState {
-    return [PSCustomObject]@{
+    return (New-Object PSObject -Property @{
         InFailureState      = $false
         LastFailureAlert    = $null
         InWarningState      = $false
@@ -1860,7 +2132,7 @@ function New-TaskNotificationState {
         HwLastWarning       = $null
         HwLastEvent         = $null
         HwSmartFail         = $false
-    }
+    })
 }
 
 # backup_state.json = { "Tasks": { "<tarefa>": { ...estado... } } }
@@ -1871,7 +2143,7 @@ function Get-TaskNotificationState {
     $state = New-TaskNotificationState
     try {
         if (Test-Path $stateFile) {
-            $raw = Get-Content $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $raw = [System.IO.File]::ReadAllText($stateFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
             $src = $null
             if ($null -ne $raw.Tasks -and $null -ne $raw.Tasks.$TaskName) {
                 $src = $raw.Tasks.$TaskName
@@ -1899,7 +2171,7 @@ function Save-TaskNotificationState {
             $all = @{}
             if (Test-Path $stateFile) {
                 try {
-                    $raw = Get-Content $stateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                    $raw = [System.IO.File]::ReadAllText($stateFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
                     if ($null -ne $raw.Tasks) {
                         foreach ($p in $raw.Tasks.PSObject.Properties) { $all[$p.Name] = $p.Value }
                     }
@@ -1936,7 +2208,7 @@ function Send-BackupNotification {
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
             if (Test-Path $configFile) {
-                try { $global:configData = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+                try { $global:configData = [System.IO.File]::ReadAllText($configFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
             }
         }
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) { return }
@@ -2948,7 +3220,7 @@ function Send-NetworkFailureAlert {
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
             if (Test-Path $configFile) {
-                try { $global:configData = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+                try { $global:configData = [System.IO.File]::ReadAllText($configFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
             }
         }
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) { return }
@@ -3270,7 +3542,7 @@ function Save-NetworkTrackerEntries {
         Invoke-WithMecLock -Name "State" -Script {
             $current = @{}
             if (Test-Path $trackerFile) {
-                try { $current = ConvertTo-HashtableCompat (Get-Content $trackerFile -Raw -Encoding UTF8 | ConvertFrom-Json) } catch {}
+                try { $current = ConvertTo-HashtableCompat ([System.IO.File]::ReadAllText($trackerFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json) } catch {}
             }
             foreach ($k in ($Keys | Select-Object -Unique)) {
                 if ($Entries.ContainsKey($k)) { $current[$k] = $Entries[$k] }
@@ -3295,7 +3567,7 @@ function Test-ExternalDestinationsHealth {
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Tasks) {
             if (Test-Path $configFile) {
-                try { $global:configData = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+                try { $global:configData = [System.IO.File]::ReadAllText($configFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
             }
         }
         if ($null -eq $global:configData -or $null -eq $global:configData.Tasks) { return }
@@ -3327,7 +3599,7 @@ function Test-ExternalDestinationsHealth {
         $networkTrackerFile = Join-Path $scriptDir "network_tracker.json"
         $netTracker = @{}
         if (Test-Path $networkTrackerFile) {
-            try { $netTracker = ConvertTo-HashtableCompat (Get-Content $networkTrackerFile -Raw -Encoding UTF8 | ConvertFrom-Json) }
+            try { $netTracker = ConvertTo-HashtableCompat ([System.IO.File]::ReadAllText($networkTrackerFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json) }
     catch { Log-Message "Aviso: falha ao ler o rastreador de destinos: $_" }
         }
 
@@ -3375,7 +3647,7 @@ function Test-ExternalDestinationsHealth {
                     }
                     if (Test-Path $destTrim) {
                         $destAccessible = $true
-                        $existingGzs = @(Get-ChildItem -Path "$destTrim\*" -Include "*.GZ", "*.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+                        $existingGzs = @(Get-ChildItem -Path "$destTrim\*" -Include "*.GZ", "*.zip" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Sort-Object LastWriteTime -Descending)
                         if ($existingGzs.Count -gt 0) {
                             $realLastBackupTime = $existingGzs[0].LastWriteTime
                         }
@@ -3497,13 +3769,13 @@ function Get-OptimalSandboxDir {
                 if ([System.IO.Path]::GetPathRoot($c) -eq $d.Name) {
                     $sandboxPath = Join-Path $c "_temp_audit"
                     if (Test-WritableDirectory -Path $sandboxPath) {
-                        return [PSCustomObject]@{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" }
+                        return (New-Object PSObject -Property @{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" })
                     }
                 }
             }
             $sandboxPath = Join-Path $d.Name "BKP_SISMOTEL\_temp_audit"
             if (Test-WritableDirectory -Path $sandboxPath) {
-                return [PSCustomObject]@{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" }
+                return (New-Object PSObject -Property @{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" })
             }
         }
     }
@@ -3516,7 +3788,7 @@ function Get-OptimalSandboxDir {
         if ($freeMB -ge $reqDbDrive) {
             $sandboxPath = Join-Path $scriptDir "_temp_audit"
             if (Test-WritableDirectory -Path $sandboxPath) {
-                return [PSCustomObject]@{ Path = $sandboxPath; Drive = $sameDrive.Name; FreeMB = $freeMB; RequiredMB = $reqDbDrive; Status = "OK" }
+                return (New-Object PSObject -Property @{ Path = $sandboxPath; Drive = $sameDrive.Name; FreeMB = $freeMB; RequiredMB = $reqDbDrive; Status = "OK" })
             }
         }
     }
@@ -3527,23 +3799,23 @@ function Get-OptimalSandboxDir {
         if ($freeMB -ge $minRequiredMB) {
             $sandboxPath = Join-Path $d.Name "BKP_SISMOTEL\_temp_audit"
             if (Test-WritableDirectory -Path $sandboxPath) {
-                return [PSCustomObject]@{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" }
+                return (New-Object PSObject -Property @{ Path = $sandboxPath; Drive = $d.Name; FreeMB = $freeMB; RequiredMB = $minRequiredMB; Status = "OK" })
             }
         }
     }
     
     # Nenhum disco possui espaco suficiente
-    return [PSCustomObject]@{ Path = $null; Drive = $null; FreeMB = 0; RequiredMB = $minRequiredMB; Status = "INSUFFICIENT_SPACE" }
+    return (New-Object PSObject -Property @{ Path = $null; Drive = $null; FreeMB = 0; RequiredMB = $minRequiredMB; Status = "INSUFFICIENT_SPACE" })
 }
 
 # Estado da auditoria diaria em arquivo proprio (audit_state.json). Antes a data
 # era gravada reescrevendo o config.json inteiro, concorrendo com a interface.
 function Get-AuditState {
     $f = Join-Path $scriptDir "audit_state.json"
-    $st = [PSCustomObject]@{ LastAuditDate = ""; LastResult = ""; ConsecutiveInconclusive = 0; LastInconclusiveAlert = $null; ConsecutiveNotRestorable = 0; LastNotRestorableAlert = $null; LastIndexWarning = ""; LastIndexWarningDate = "" }
+    $st = (New-Object PSObject -Property @{ LastAuditDate = ""; LastResult = ""; ConsecutiveInconclusive = 0; LastInconclusiveAlert = $null; ConsecutiveNotRestorable = 0; LastNotRestorableAlert = $null; LastIndexWarning = ""; LastIndexWarningDate = "" })
     try {
         if (Test-Path $f) {
-            $raw = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
+            $raw = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
             foreach ($prop in $st.PSObject.Properties.Name) {
                 if ($null -ne $raw.PSObject.Properties[$prop]) { $st.$prop = $raw.$prop }
             }
@@ -3599,7 +3871,7 @@ function Send-AuditAlertNotification {
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
             if (Test-Path $configFile) {
-                try { $global:configData = Get-Content $configFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+                try { $global:configData = [System.IO.File]::ReadAllText($configFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
             }
         }
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) { return }
@@ -3856,7 +4128,7 @@ function Test-FirebirdAccessProblem {
 
 function Get-GstatHeaderInfo {
     param([string]$Output)
-    $info = [PSCustomObject]@{ Ok = $false; Oldest = [long]0; Next = [long]0; Gap = [long]0; Reason = "" }
+    $info = (New-Object PSObject -Property @{ Ok = $false; Oldest = [long]0; Next = [long]0; Gap = [long]0; Reason = "" })
     $mOld = [regex]::Match("$Output", 'Oldest transaction\s+(\d+)')
     $mNext = [regex]::Match("$Output", 'Next transaction\s+(\d+)')
     if ($mOld.Success -and $mNext.Success) {
@@ -3909,7 +4181,7 @@ function Get-InactiveIndexDetails {
         $cmp = if ($valor -match '^-?\d+$') { "$($mKey.Groups[1].Value) + 0 = $valor" } else { "$($mKey.Groups[1].Value) = $valor" }
         $sql = "SELECT COUNT(*) FROM $($tabelas[0]) WHERE $cmp"
     }
-    return [PSCustomObject]@{ Indexes = $indices; Tables = $tabelas; Keys = $chaves; Kind = $tipo; Sql = $sql; Summary = ($partes -join " | ") }
+    return (New-Object PSObject -Property @{ Indexes = $indices; Tables = $tabelas; Keys = $chaves; Kind = $tipo; Sql = $sql; Summary = ($partes -join " | ") })
 }
 
 # Resultado da restauracao de teste (gbak -rep) na sandbox.
@@ -3921,16 +4193,16 @@ function Get-RestoreVerdict {
     param($ExitCode, [bool]$FdbExists, [long]$FdbSize, [string]$Output)
     $temErro = ("$Output" -match '(?im)^\s*gbak:\s*ERROR|ERROR:')
     if ($ExitCode -eq 0 -and $FdbExists -and $FdbSize -gt 0 -and -not $temErro) {
-        return [PSCustomObject]@{ Verdict = "OK"; Reason = "Restauracao de teste concluida." }
+        return (New-Object PSObject -Property @{ Verdict = "OK"; Reason = "Restauracao de teste concluida." })
     }
     if (Test-FirebirdAccessProblem $Output) {
-        return [PSCustomObject]@{ Verdict = "INCONCLUSIVO"; Reason = "O Firebird recusou a restauracao de teste por acesso/credencial (codigo $ExitCode)." }
+        return (New-Object PSObject -Property @{ Verdict = "INCONCLUSIVO"; Reason = "O Firebird recusou a restauracao de teste por acesso/credencial (codigo $ExitCode)." })
     }
     if ($FdbExists -and $FdbSize -gt 0 -and (Test-IndexOnlyRestoreFailure $Output)) {
         $det = Get-InactiveIndexDetails $Output
-        return [PSCustomObject]@{ Verdict = "INDICE_INATIVO"; Details = $det; Reason = "Backup restaurou com todos os dados, mas indice/chave nao reativou por dado inconsistente no banco de producao ($($det.Summary)). Nao e corrupcao fisica." }
+        return (New-Object PSObject -Property @{ Verdict = "INDICE_INATIVO"; Details = $det; Reason = "Backup restaurou com todos os dados, mas indice/chave nao reativou por dado inconsistente no banco de producao ($($det.Summary)). Nao e corrupcao fisica." })
     }
-    return [PSCustomObject]@{ Verdict = "NAO_RESTAURAVEL"; Reason = "O backup mais recente NAO restaurou (gbak codigo $ExitCode, FDB criado: $FdbExists)." }
+    return (New-Object PSObject -Property @{ Verdict = "NAO_RESTAURAVEL"; Reason = "O backup mais recente NAO restaurou (gbak codigo $ExitCode, FDB criado: $FdbExists)." })
 }
 
 # Resultado da validacao gfix -v -full no banco restaurado.
@@ -3945,20 +4217,20 @@ function Get-GfixVerdict {
     if ($corrupcao -and $pag -eq 0) { $pag = 1 }
 
     if ($rec -gt 0 -or $pag -gt 0) {
-        return [PSCustomObject]@{ Verdict = "CORROMPIDO"; RecordErrors = $rec; PageErrors = $pag; Reason = "gfix encontrou $rec erro(s) de registro e $pag erro(s) de pagina." }
+        return (New-Object PSObject -Property @{ Verdict = "CORROMPIDO"; RecordErrors = $rec; PageErrors = $pag; Reason = "gfix encontrou $rec erro(s) de registro e $pag erro(s) de pagina." })
     }
     if (($mRec.Success -or $mPag.Success) -and $ExitCode -eq 0) {
-        return [PSCustomObject]@{ Verdict = "OK"; RecordErrors = 0; PageErrors = 0; Reason = "gfix sem erros." }
+        return (New-Object PSObject -Property @{ Verdict = "OK"; RecordErrors = 0; PageErrors = 0; Reason = "gfix sem erros." })
     }
     # Firebird 2.5 nao imprime nada quando a validacao passa limpa.
     $semTextoDeErro = -not ("$Output" -match '(?i)error|failed|unable|denied|negado|falha|not found|nao encontrado')
     if ($ExitCode -eq 0 -and $semTextoDeErro) {
-        return [PSCustomObject]@{ Verdict = "OK"; RecordErrors = 0; PageErrors = 0; Reason = "gfix sem erros." }
+        return (New-Object PSObject -Property @{ Verdict = "OK"; RecordErrors = 0; PageErrors = 0; Reason = "gfix sem erros." })
     }
     if (Test-FirebirdAccessProblem $Output) {
-        return [PSCustomObject]@{ Verdict = "INCONCLUSIVO"; RecordErrors = 0; PageErrors = 0; Reason = "gfix nao conseguiu acessar o banco restaurado (codigo $ExitCode)." }
+        return (New-Object PSObject -Property @{ Verdict = "INCONCLUSIVO"; RecordErrors = 0; PageErrors = 0; Reason = "gfix nao conseguiu acessar o banco restaurado (codigo $ExitCode)." })
     }
-    return [PSCustomObject]@{ Verdict = "INCONCLUSIVO"; RecordErrors = 0; PageErrors = 0; Reason = "gfix terminou com codigo $ExitCode sem relatorio de validacao." }
+    return (New-Object PSObject -Property @{ Verdict = "INCONCLUSIVO"; RecordErrors = 0; PageErrors = 0; Reason = "gfix terminou com codigo $ExitCode sem relatorio de validacao." })
 }
 
 # Le o cabecalho do banco ativo (gstat -h). Isolado em funcao para os testes.
@@ -4081,7 +4353,7 @@ function Invoke-DatabaseHealthAudit {
 
         $latestGz = $null
         foreach ($sd in $searchDirs) {
-            $zips = @(Get-ChildItem -Path $sd -Filter "*.GZ" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+            $zips = @(Get-ChildItem -Path $sd -Filter "*.GZ" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Sort-Object LastWriteTime -Descending)
             if ($zips.Count -gt 0 -and ($null -eq $latestGz -or $zips[0].LastWriteTime -gt $latestGz.LastWriteTime)) { $latestGz = $zips[0] }
         }
         if ($null -eq $latestGz) {
@@ -4100,7 +4372,7 @@ function Invoke-DatabaseHealthAudit {
         $sandboxDir = $sandboxInfo.Path
         Log-Message "[AUDITORIA] 3/4 - Ambiente Sandbox Isolado: $($sandboxInfo.Drive) | Caminho: $sandboxDir | Espaco Livre: $($sandboxInfo.FreeMB) MB"
         if (Test-Path $sandboxDir) {
-            Get-ChildItem -Path $sandboxDir -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $sandboxDir -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Remove-Item -Force -ErrorAction SilentlyContinue
         } else {
             New-Item -ItemType Directory -Path $sandboxDir -Force -ErrorAction Stop | Out-Null
         }
@@ -4192,9 +4464,9 @@ function Invoke-DatabaseHealthAudit {
             $rOnline = Invoke-ExternalTool -FilePath $gfixExe -Arguments "-online `"$sandboxDbPath`"" -Environment $fbEnv -TimeoutMs 600000
             if ($rOnline.ExitCode -eq 0 -and -not $rOnline.TimedOut) {
                 Log-Message "[AUDITORIA] Banco de sandbox colocado online (gfix -online) sem o(s) indice(s) inconsistente(s)."
-                $rv = [PSCustomObject]@{ Verdict = "OK"; Reason = "Restauracao de teste concluida com ressalva de indice." }
+                $rv = (New-Object PSObject -Property @{ Verdict = "OK"; Reason = "Restauracao de teste concluida com ressalva de indice." })
             } else {
-                $rv = [PSCustomObject]@{ Verdict = "INCONCLUSIVO"; Reason = "Restauracao com indice inativo e gfix -online falhou na sandbox (codigo $($rOnline.ExitCode)): $("$($rOnline.StdErr)$($rOnline.StdOut)".Trim())" }
+                $rv = (New-Object PSObject -Property @{ Verdict = "INCONCLUSIVO"; Reason = "Restauracao com indice inativo e gfix -online falhou na sandbox (codigo $($rOnline.ExitCode)): $("$($rOnline.StdErr)$($rOnline.StdOut)".Trim())" })
             }
         }
         if ($rv.Verdict -ne "OK") {
@@ -4407,16 +4679,16 @@ function Invoke-MecLiveUpdate {
         $fibsStateFile = Join-Path $scriptDir "fibs_state.json"
         $fibsState = $null
         if (Test-Path $fibsStateFile) {
-            try { $fibsState = Get-Content $fibsStateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+            try { $fibsState = [System.IO.File]::ReadAllText($fibsStateFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
         }
         if ($null -eq $fibsState) {
-            $fibsState = [PSCustomObject]@{ WelcomeEmailSent = $false; LastUpdateCheck = "" }
+            $fibsState = (New-Object PSObject -Property @{ WelcomeEmailSent = $false; LastUpdateCheck = "" })
         }
         # Garante as propriedades esperadas mesmo em arquivos gravados por versoes antigas
         foreach ($prop in @("WelcomeEmailSent", "LastUpdateCheck", "LastUpdateAttemptVersion", "LastUpdateAttemptAt")) {
             if ($null -eq $fibsState.PSObject.Properties[$prop]) {
                 $valor = if ($prop -eq "WelcomeEmailSent") { $false } else { "" }
-                $fibsState | Add-Member -NotePropertyName $prop -NotePropertyValue $valor -Force
+                $fibsState | Add-Member -MemberType NoteProperty -Name $prop -Value $valor -Force
             }
         }
 
@@ -4443,7 +4715,7 @@ function Invoke-MecLiveUpdate {
         $pubKeyFile = Join-Path $scriptDir "liveupdate_pubkey.xml"
         $pubKeyXml = $null
         if (Test-Path $pubKeyFile) {
-            try { $pubKeyXml = Get-Content $pubKeyFile -Raw -Encoding UTF8 } catch {}
+            try { $pubKeyXml = [System.IO.File]::ReadAllText($pubKeyFile, [System.Text.Encoding]::UTF8) } catch {}
         }
         if ([string]::IsNullOrWhiteSpace($pubKeyXml)) {
             $pubKeyXml = $defaultPubKeyXml
@@ -4591,7 +4863,7 @@ function Invoke-MecLiveUpdate {
             throw "SHA-256 do motor baixado nao confere com o manifesto assinado."
         }
 
-        $stageContent = Get-Content $stageFile -Raw -Encoding UTF8
+        $stageContent = [System.IO.File]::ReadAllText($stageFile, [System.Text.Encoding]::UTF8)
         $parseErrors = $null
         $null = [System.Management.Automation.PSParser]::Tokenize($stageContent, [ref]$parseErrors)
         if ($null -ne $parseErrors -and $parseErrors.Count -gt 0) {
@@ -4634,7 +4906,7 @@ function Enter-BackupLock {
             return "Acquired"
         }
         $owner = ""
-        try { $owner = "$(Get-Content $lockFile -Raw -ErrorAction SilentlyContinue)".Trim() } catch {}
+        try { if (Test-Path $lockFile) { $owner = "$([System.IO.File]::ReadAllText($lockFile, [System.Text.Encoding]::UTF8))".Trim() } } catch {}
         $ownerTask = ""
         if ($owner -match '^(.*?)\s*\|\s*PID:(\d+)') { $ownerTask = $matches[1].Trim() }
         if (-not $Manual -and $ownerTask -eq $TaskName) { return "Duplicate" }
@@ -4697,7 +4969,7 @@ function Get-DriveSpaceInfo {
     try {
         $d = New-Object System.IO.DriveInfo([System.IO.Path]::GetPathRoot($Path))
         if (-not $d.IsReady) { return $null }
-        return [PSCustomObject]@{ FreeMB = $d.AvailableFreeSpace / 1MB; TotalMB = $d.TotalSize / 1MB }
+        return (New-Object PSObject -Property @{ FreeMB = $d.AvailableFreeSpace / 1MB; TotalMB = $d.TotalSize / 1MB })
     } catch { return $null }
 }
 
@@ -4726,7 +4998,7 @@ function Invoke-DestinationSpaceGuard {
     )
     $info = & $SpaceProvider $Directory
     if ($null -eq $info) {
-        return [PSCustomObject]@{ Ok = $true; Removed = 0; FreeMB = -1; RequiredMB = 0; Message = "Espaco livre nao informado pelo Windows; copia segue." }
+        return (New-Object PSObject -Property @{ Ok = $true; Removed = 0; FreeMB = -1; RequiredMB = 0; Message = "Espaco livre nao informado pelo Windows; copia segue." })
     }
     $isGDrive = (-not $IsDbDrive) -and ($Directory -notmatch '^(?i)C:\\Users\\[^\\]+\\(My Drive|Meu Drive|Mi unidad|Mon Drive|Meine Ablage|Il mio Drive)(\\|$)') -and (Test-IsGoogleDrivePath -Path $Directory)
     $reserveMB = if ($isGDrive) { 512 } else { Get-DiskReserveMB -TotalMB $info.TotalMB -IsDbDrive $IsDbDrive }
@@ -4755,15 +5027,15 @@ function Invoke-DestinationSpaceGuard {
         }
     }
     if ($null -eq $info) {
-        return [PSCustomObject]@{ Ok = $true; Removed = $removed; FreeMB = -1; RequiredMB = $required; Message = "Espaco livre nao informado pelo Windows; copia segue." }
+        return (New-Object PSObject -Property @{ Ok = $true; Removed = $removed; FreeMB = -1; RequiredMB = $required; Message = "Espaco livre nao informado pelo Windows; copia segue." })
     }
     $finalFree = if ($isGDrive) { [Math]::Max([double]$info.FreeMB, ($initialFreeMB + $freedMB)) } else { [double]$info.FreeMB }
     $free = [math]::Round($finalFree, 0)
     if ($finalFree -ge $minStopMB) {
-        return [PSCustomObject]@{ Ok = $true; Removed = $removed; FreeMB = $free; RequiredMB = $minStopMB; Message = "Espaco OK ($free MB livres, exigido $minStopMB MB)." }
+        return (New-Object PSObject -Property @{ Ok = $true; Removed = $removed; FreeMB = $free; RequiredMB = $minStopMB; Message = "Espaco OK ($free MB livres, exigido $minStopMB MB)." })
     }
     $folga = if ($IsDbDrive) { "folga do disco do banco" } else { "folga minima" }
-    return [PSCustomObject]@{ Ok = $false; Removed = $removed; FreeMB = $free; RequiredMB = $minStopMB; Message = "Espaco insuficiente em '$Directory': $free MB livres, exigido $minStopMB MB (copia de $([math]::Round($IncomingMB, 0)) MB + $folga). Copia nao gravada para proteger o disco." }
+    return (New-Object PSObject -Property @{ Ok = $false; Removed = $removed; FreeMB = $free; RequiredMB = $minStopMB; Message = "Espaco insuficiente em '$Directory': $free MB livres, exigido $minStopMB MB (copia de $([math]::Round($IncomingMB, 0)) MB + $folga). Copia nao gravada para proteger o disco." })
 }
 
 # Remove sobras de rotinas interrompidas (FBK/GZ parciais) das pastas temporarias
@@ -4802,7 +5074,7 @@ function Clear-StaleBackupTemp {
         if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path $dir)) { continue }
         $leaf = Split-Path $dir -Leaf
         if ($leaf -ne "FIBS_TEMP" -and $leaf -ne "temp_backup") { continue }
-        Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\.(fbk|GZ)$' -or $_.Name -match '^gbak_.*_log\.txt$' } | ForEach-Object {
+        Get-ChildItem -Path $dir -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer -and ($_.Name -match '\.(fbk|GZ)$' -or $_.Name -match '^gbak_.*_log\.txt$') } | ForEach-Object {
             Log-Message "Limpeza: removendo sobra de rotina interrompida: $($_.FullName) ($([math]::Round($_.Length / 1MB, 2)) MB)"
             Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
         }
@@ -4830,14 +5102,14 @@ function Get-PhysicalDiskOfPath {
         foreach ($p in $parts) {
             $drives = @(Get-WmiObject -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($p.DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition" -ErrorAction Stop)
             foreach ($d in $drives) {
-                return [PSCustomObject]@{
+                return (New-Object PSObject -Property @{
                     Index     = [int]$d.Index
                     Model     = "$($d.Model)".Trim()
                     Interface = "$($d.InterfaceType)"
                     Status    = "$($d.Status)"
                     PnpId     = "$($d.PNPDeviceID)"
                     Letter    = $letter
-                }
+                })
             }
         }
     } catch {}
@@ -4905,7 +5177,7 @@ function Get-DiskErrorEventSummary {
                     }
                 }
                 $ultimo = ($g.Group | Sort-Object TimeCreated -Descending | Select-Object -First 1).TimeCreated
-                $res += [PSCustomObject]@{ Provider = $f.P; Id = [int]$g.Name; Count = $g.Count; Disks = $discos; Last = $ultimo }
+                $res += (New-Object PSObject -Property @{ Provider = $f.P; Id = [int]$g.Name; Count = $g.Count; Disks = $discos; Last = $ultimo })
             }
         } catch {}
     }
@@ -4936,7 +5208,7 @@ function Get-StorageHealthReport {
             if ($todos.Count -gt 0) {
                 $lista = @()
                 foreach ($t in $todos) {
-                    $sm = Test-SmartPredictFailure -Disk ([PSCustomObject]@{ PnpId = "$($t.PNPDeviceID)" }) -Map $smart
+                    $sm = Test-SmartPredictFailure -Disk (New-Object PSObject -Property @{ PnpId = "$($t.PNPDeviceID)" }) -Map $smart
                     $smTxt = if ($sm -eq $true) { ", SMART FALHA PREVISTA" } else { "" }
                     $lista += "Disco $($t.Index) $("$($t.Model)".Trim()) [$($t.InterfaceType), $([math]::Round($t.Size / 1GB)) GB, $($t.Status)$smTxt]"
                 }
@@ -4949,7 +5221,7 @@ function Get-StorageHealthReport {
         } else {
             foreach ($e in $ev) {
                 $dTxt = if ($e.Disks.Count -gt 0) { " no Disco $($e.Disks -join ',')" } else { "" }
-                $quando = try { $e.Last.ToString("dd/MM HH:mm") } catch { "?" }
+                $quando = $(try { $e.Last.ToString("dd/MM HH:mm") } catch { "?" })
                 $linhas += "Evento $($e.Provider) $($e.Id) x$($e.Count)$dTxt (ultimo $quando): $(Get-DiskEventMeaning -Provider $e.Provider -Id $e.Id)"
             }
         }
@@ -4967,7 +5239,7 @@ function Get-SuspectTempDirs {
     $out = @()
     try {
         if (Test-Path $f) {
-            $raw = Get-Content $f -Raw -Encoding UTF8 | ConvertFrom-Json
+            $raw = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
             foreach ($e in @($raw.Pastas)) {
                 if ($null -eq $e -or [string]::IsNullOrWhiteSpace("$($e.Pasta)") -or [string]::IsNullOrWhiteSpace("$($e.Ate)")) { continue }
                 try { if ([DateTime]::Parse("$($e.Ate)") -gt (Get-Date)) { $out += $e } } catch {}
@@ -4992,7 +5264,7 @@ function Add-SuspectTempDir {
     $f = Join-Path $scriptDir "temp_suspeito.json"
     $lista = @(Get-SuspectTempDirs | Where-Object { "$($_.Pasta)".TrimEnd('\') -ine $Path.TrimEnd('\') })
     if ($Motivo.Length -gt 300) { $Motivo = $Motivo.Substring(0, 300) }
-    $lista += [PSCustomObject]@{ Pasta = $Path; Ate = (Get-Date).AddDays($Days).ToString("o"); Motivo = $Motivo }
+    $lista += (New-Object PSObject -Property @{ Pasta = $Path; Ate = (Get-Date).AddDays($Days).ToString("o"); Motivo = $Motivo })
     try { Save-JsonState -Path $f -Data @{ Pastas = $lista } -Depth 4 } catch {
         Log-Message "Aviso: nao foi possivel registrar a pasta suspeita '$Path': $_"
     }
@@ -5090,8 +5362,8 @@ function Save-UnverifiedBackupCopy {
                 Remove-Item $alvo -Force -ErrorAction SilentlyContinue
                 continue
             }
-            Get-ChildItem -Path $d -Filter "$Prefix-*.NAO_CONFERIDO" -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -ne $nome } |
+            Get-ChildItem -Path $d -Filter "$Prefix-*.NAO_CONFERIDO" -ErrorAction SilentlyContinue |
+                Where-Object { -not $_.PSIsContainer -and $_.Name -ne $nome } |
                 ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
             return $alvo
         }
@@ -5238,8 +5510,8 @@ function Invoke-7zProcess {
         $p = [System.Diagnostics.Process]::Start($psi)
         if ($null -eq $p) { return @{ Started = $false; ExitCode = -1; StdErr = "Process.Start nao devolveu o processo do 7-Zip."; TimedOut = $false } }
         try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
-        $outTask = $p.StandardOutput.ReadToEndAsync()
-        $errTask = $p.StandardError.ReadToEndAsync()
+        $outTask = Start-StreamReadToEnd -Reader $p.StandardOutput
+        $errTask = Start-StreamReadToEnd -Reader $p.StandardError
         if (-not $p.WaitForExit($TimeoutMs)) {
             try { $p.Kill() } catch {}
             # Espera o processo morrer de fato: senao o arquivo parcial continua travado
@@ -5247,9 +5519,8 @@ function Invoke-7zProcess {
             return @{ Started = $true; ExitCode = -1; StdErr = "Timeout de $([int]($TimeoutMs / 60000)) minutos excedido no 7-Zip."; TimedOut = $true }
         }
         $p.WaitForExit()
-        $err = ""
-        try { $err = "$($errTask.Result)".Trim() } catch {}
-        try { $null = $outTask.Result } catch {}
+        $err = "$(Complete-StreamReadToEnd -TaskInfo $errTask)".Trim()
+        $null = Complete-StreamReadToEnd -TaskInfo $outTask
         return @{ Started = $true; ExitCode = $p.ExitCode; StdErr = $err; TimedOut = $false }
     } catch {
         # Win32Exception (193 = binario de outra arquitetura, 5 = acesso negado, antivirus...)
@@ -5279,14 +5550,14 @@ function Expand-7zArchive {
     if (-not (Find-7zExe)) { throw "7-Zip nao encontrado na pasta do sistema ou nao executavel neste Windows." }
     $DestDir = $DestDir.TrimEnd('\')
     # Sobra de extracao anterior faria a auditoria restaurar o backup errado
-    foreach ($s in @(Get-ChildItem -Path $DestDir -Filter $Filter -File -ErrorAction SilentlyContinue)) {
+    foreach ($s in @(Get-ChildItem -Path $DestDir -Filter $Filter -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer })) {
         Remove-Item $s.FullName -Force -ErrorAction Stop
     }
     $r = Invoke-7zProcess -Arguments "e -y -bso0 -bsp0 `"$ArchivePath`" `"$Filter`" -o`"$DestDir`""
     if (-not $r.Started) { throw "7-Zip nao pode ser executado: $($r.StdErr)" }
     if ($r.TimedOut) { throw "$($r.StdErr)" }
     if ($r.ExitCode -ne 0) { throw "Erro no 7-Zip ao extrair (Codigo $($r.ExitCode)): $($r.StdErr)" }
-    $extracted = @(Get-ChildItem -Path $DestDir -Filter $Filter -File -ErrorAction SilentlyContinue)
+    $extracted = @(Get-ChildItem -Path $DestDir -Filter $Filter -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer })
     if ($extracted.Count -ne 1) { throw "Esperado 1 arquivo $Filter apos extracao via 7-Zip; encontrados $($extracted.Count)." }
     return $extracted[0].FullName
 }
@@ -5312,15 +5583,15 @@ function Get-ZipEntrySha256Via7z {
         $p = [System.Diagnostics.Process]::Start($psi)
         if ($null -eq $p) { return $null }
         try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
-        $errTask = $p.StandardError.ReadToEndAsync()
+        $errTask = Start-StreamReadToEnd -Reader $p.StandardError
         $metrics = Get-Sha256OfStreamWithMetrics -Stream $p.StandardOutput.BaseStream
         $p.WaitForExit()
         if ($p.ExitCode -ne 0) {
-            $err = ""
-            try { $err = "$($errTask.Result)".Trim() } catch {}
+            $err = "$(Complete-StreamReadToEnd -TaskInfo $errTask)".Trim()
             Log-Message "Aviso: conferencia pelo 7-Zip retornou codigo $($p.ExitCode): $err"
             return $null
         }
+        $null = Complete-StreamReadToEnd -TaskInfo $errTask
         return $metrics
     } catch {
         Log-Message "Aviso: conferencia pelo 7-Zip nao executou ($($_.Exception.Message))."
@@ -5352,6 +5623,9 @@ function New-BackupGzArchive {
         [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression") | Out-Null
         [System.Reflection.Assembly]::LoadWithPartialName("System.IO.Compression.FileSystem") | Out-Null
     }
+    if ($null -eq ("System.IO.Compression.ZipFile" -as [type]) -and $null -ne (Find-7zExe)) {
+        if (Compress-BackupWith7z -FbkPath $FbkPath -GzPath $GzPath) { return "7ZIP" }
+    }
     $zip = $null
     try {
         $zip = [System.IO.Compression.ZipFile]::Open($GzPath, [System.IO.Compression.ZipArchiveMode]::Create)
@@ -5377,20 +5651,20 @@ function Invoke-ExternalTool {
     foreach ($k in $Environment.Keys) { $psi.EnvironmentVariables[$k] = [string]$Environment[$k] }
     $p = [System.Diagnostics.Process]::Start($psi)
     try { $p.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
-    $outTask = $p.StandardOutput.ReadToEndAsync()
-    $errTask = $p.StandardError.ReadToEndAsync()
+    $outTask = Start-StreamReadToEnd -Reader $p.StandardOutput
+    $errTask = Start-StreamReadToEnd -Reader $p.StandardError
     $timedOut = $false
     if (-not $p.WaitForExit($TimeoutMs)) {
         $timedOut = $true
         try { $p.Kill() } catch {}
         $p.WaitForExit()
     }
-    $result = [PSCustomObject]@{
+    $result = (New-Object PSObject -Property @{
         ExitCode = $(if ($timedOut) { -1 } else { $p.ExitCode })
         TimedOut = $timedOut
-        StdOut   = $outTask.Result
-        StdErr   = $errTask.Result
-    }
+        StdOut   = (Complete-StreamReadToEnd -TaskInfo $outTask)
+        StdErr   = (Complete-StreamReadToEnd -TaskInfo $errTask)
+    })
     $p.Dispose()
     return $result
 }
@@ -5611,10 +5885,10 @@ if ($null -ne $cfgRecarregado) { $global:configData = $cfgRecarregado }
 $fibsStateFile = Join-Path $scriptDir "fibs_state.json"
 $fibsState = $null
 if (Test-Path $fibsStateFile) {
-    try { $fibsState = Get-Content $fibsStateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+    try { $fibsState = [System.IO.File]::ReadAllText($fibsStateFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
 }
 if ($null -eq $fibsState) {
-    $fibsState = [PSCustomObject]@{ WelcomeEmailSent = $false; LastUpdateCheck = "" }
+    $fibsState = (New-Object PSObject -Property @{ WelcomeEmailSent = $false; LastUpdateCheck = "" })
 }
 if (-not $fibsState.WelcomeEmailSent -and $null -ne $global:configData.Preferences) {
     $p = $global:configData.Preferences
@@ -5625,7 +5899,7 @@ if (-not $fibsState.WelcomeEmailSent -and $null -ne $global:configData.Preferenc
         $global:mailSent = $false
         Send-WelcomeEmail
         if ($global:mailSent) { $fibsState.WelcomeEmailSent = $true }
-        $fibsState | Add-Member -NotePropertyName WelcomeEmailLastAttempt -NotePropertyValue (Get-Date).ToString("o") -Force
+        $fibsState | Add-Member -MemberType NoteProperty -Name WelcomeEmailLastAttempt -Value (Get-Date).ToString("o") -Force
         try { Save-JsonState -Path $fibsStateFile -Data $fibsState -Depth 5 } catch {}
     }
 }
@@ -5668,7 +5942,7 @@ $dedupeMinutes = 10
 if (-not $Manual) {
     try {
         if (Test-Path $lastRunFile) {
-            $lastRuns = Get-Content $lastRunFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $lastRuns = [System.IO.File]::ReadAllText($lastRunFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
             $prev = $lastRuns.$TaskName
             if (-not [string]::IsNullOrWhiteSpace($prev)) {
                 $minutosDesde = ((Get-Date) - [DateTime]::Parse("$prev")).TotalMinutes
@@ -6048,7 +6322,7 @@ for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
             break
         } else {
             $gbakError = "$($r.StdErr)".Trim()
-            if (Test-Path $gbakLog) { $gbakError = ((Get-Content $gbakLog -Tail 5) -join "`n") + "`n" + $gbakError }
+            if (Test-Path $gbakLog) { $gbakError = ((Get-Content $gbakLog | Select-Object -Last 5) -join "`n") + "`n" + $gbakError }
             if ([string]::IsNullOrWhiteSpace($gbakError)) { $gbakError = "Sem detalhes no log." }
             Log-Message "Tentativa $attempt falhou. Codigo: $($r.ExitCode). Erro: $gbakError"
         }
@@ -6431,7 +6705,7 @@ foreach ($destTrimmed in $resolvedDestList) {
             # usuario logado: antes o segundo apagava o primeiro e o e-mail dizia "sem permissao"
             # mesmo com o terminal desligado.
             $motivoServico = if ([string]::IsNullOrWhiteSpace($destinationFailureReason)) { "sem detalhe" } else { $destinationFailureReason }
-            $ehDominio = try { (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).PartOfDomain } catch { $false }
+            $ehDominio = $(try { (Get-WmiObject Win32_ComputerSystem -ErrorAction Stop).PartOfDomain } catch { $false })
             $orientacao = if (-not $acessoNegado) {
                 "Confira se o terminal esta ligado e se a pasta '$destTrimmed' abre no Explorer deste servidor."
             } elseif ($ehDominio) {
@@ -6617,7 +6891,7 @@ try {
     Invoke-WithMecLock -Name "State" -Script {
         $runs = @{}
         if (Test-Path $lastRunFile) {
-            $prevRuns = Get-Content $lastRunFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $prevRuns = [System.IO.File]::ReadAllText($lastRunFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
             if ($null -ne $prevRuns) {
                 foreach ($prop in $prevRuns.psobject.Properties) { $runs[$prop.Name] = "$($prop.Value)" }
             }
