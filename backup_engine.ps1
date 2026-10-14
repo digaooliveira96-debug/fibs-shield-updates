@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.63"
+$script:EngineVersion = "2.2.64"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -885,16 +885,23 @@ try {
     } else {
         $pfx = [regex]::Escape($job["PREFIX"])
         try {
-            $srcLen = (Get-Item -LiteralPath $job["SRC"]).Length
-            $di = New-Object System.IO.DriveInfo([System.IO.Path]::GetPathRoot($dest))
-            if ($di.IsReady -and $di.AvailableFreeSpace -lt ($srcLen + 536870912)) {
-                $antigosGuard = @(Get-ChildItem -LiteralPath $dest -File -ErrorAction SilentlyContinue | Where-Object {
-                    $_.Name -match "^${pfx}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${pfx}[-_]\d{8}_\d{6}\.(GZ|zip)$"
-                } | Sort-Object LastWriteTime -Descending | Select-Object -Skip 3)
-                [array]::Reverse($antigosGuard)
-                foreach ($fg in $antigosGuard) {
-                    if ($di.AvailableFreeSpace -ge ($srcLen + 536870912)) { break }
-                    Remove-Item -LiteralPath $fg.FullName -Force -ErrorAction SilentlyContinue
+            if (-not $dest.StartsWith("\\")) {
+                $srcLen = (Get-Item -LiteralPath $job["SRC"]).Length
+                $di = New-Object System.IO.DriveInfo([System.IO.Path]::GetPathRoot($dest))
+                if ($di.IsReady -and $di.AvailableFreeSpace -lt ($srcLen + 536870912)) {
+                    $initFree = [long]$di.AvailableFreeSpace
+                    $freedBytes = [long]0
+                    $antigosGuard = @(Get-ChildItem -LiteralPath $dest -File -ErrorAction SilentlyContinue | Where-Object {
+                        $_.Name -match "^${pfx}[-_]\d{4,}\.(GZ|zip)$" -or $_.Name -match "^${pfx}[-_]\d{8}_\d{6}\.(GZ|zip)$"
+                    } | Sort-Object LastWriteTime -Descending | Select-Object -Skip 3)
+                    [array]::Reverse($antigosGuard)
+                    foreach ($fg in $antigosGuard) {
+                        $effFree = [Math]::Max([long]$di.AvailableFreeSpace, ($initFree + $freedBytes))
+                        if ($effFree -ge ($srcLen + 536870912)) { break }
+                        $fgLen = [long]$fg.Length
+                        Remove-Item -LiteralPath $fg.FullName -Force -ErrorAction SilentlyContinue
+                        if (-not (Test-Path -LiteralPath $fg.FullName)) { $freedBytes += $fgLen }
+                    }
                 }
             }
         } catch {}
@@ -4721,18 +4728,25 @@ function Invoke-DestinationSpaceGuard {
     if ($null -eq $info) {
         return [PSCustomObject]@{ Ok = $true; Removed = 0; FreeMB = -1; RequiredMB = 0; Message = "Espaco livre nao informado pelo Windows; copia segue." }
     }
-    $reserveMB = if (Test-IsGoogleDrivePath -Path $Directory) { 512 } else { Get-DiskReserveMB -TotalMB $info.TotalMB -IsDbDrive $IsDbDrive }
+    $isGDrive = Test-IsGoogleDrivePath -Path $Directory
+    $reserveMB = if ($isGDrive) { 512 } else { Get-DiskReserveMB -TotalMB $info.TotalMB -IsDbDrive $IsDbDrive }
+    $minStopMB = if ($isGDrive) { [math]::Round($IncomingMB + 100, 0) } else { [math]::Round($IncomingMB + $reserveMB, 0) }
     $required = [math]::Round($IncomingMB + $reserveMB, 0)
+    $initialFreeMB = [double]$info.FreeMB
+    $freedMB = [double]0
     $removed = 0
     if ($info.FreeMB -lt $required) {
         $antigos = @(Get-PrefixBackupFiles -Directory $Directory -Prefix $Prefix | Select-Object -Skip ([Math]::Max(0, $MinKeep)))
         [array]::Reverse($antigos)   # do mais antigo para o mais recente
         foreach ($f in $antigos) {
-            if ($info.FreeMB -ge $required) { break }
+            $effectiveFree = if ($isGDrive) { [Math]::Max([double]$info.FreeMB, ($initialFreeMB + $freedMB)) } else { [double]$info.FreeMB }
+            if ($effectiveFree -ge $required) { break }
             try {
+                $fMB = [double]($f.Length / 1MB)
                 Remove-Item $f.FullName -Force -ErrorAction Stop
                 $removed++
-                Log-Message "PROTECAO DE DISCO: backup antigo removido para liberar espaco: $($f.Name) ($([math]::Round($f.Length / 1MB, 2)) MB)"
+                $freedMB += $fMB
+                Log-Message "PROTECAO DE DISCO: backup antigo removido para liberar espaco: $($f.Name) ($([math]::Round($fMB, 2)) MB)"
             } catch {
                 Log-Message "PROTECAO DE DISCO: nao foi possivel remover $($f.Name): $_"
             }
@@ -4743,12 +4757,13 @@ function Invoke-DestinationSpaceGuard {
     if ($null -eq $info) {
         return [PSCustomObject]@{ Ok = $true; Removed = $removed; FreeMB = -1; RequiredMB = $required; Message = "Espaco livre nao informado pelo Windows; copia segue." }
     }
-    $free = [math]::Round($info.FreeMB, 0)
-    if ($info.FreeMB -ge $required) {
-        return [PSCustomObject]@{ Ok = $true; Removed = $removed; FreeMB = $free; RequiredMB = $required; Message = "Espaco OK ($free MB livres, exigido $required MB)." }
+    $finalFree = if ($isGDrive) { [Math]::Max([double]$info.FreeMB, ($initialFreeMB + $freedMB)) } else { [double]$info.FreeMB }
+    $free = [math]::Round($finalFree, 0)
+    if ($finalFree -ge $minStopMB) {
+        return [PSCustomObject]@{ Ok = $true; Removed = $removed; FreeMB = $free; RequiredMB = $minStopMB; Message = "Espaco OK ($free MB livres, exigido $minStopMB MB)." }
     }
     $folga = if ($IsDbDrive) { "folga do disco do banco" } else { "folga minima" }
-    return [PSCustomObject]@{ Ok = $false; Removed = $removed; FreeMB = $free; RequiredMB = $required; Message = "Espaco insuficiente em '$Directory': $free MB livres, exigido $required MB (copia de $([math]::Round($IncomingMB, 0)) MB + $folga). Copia nao gravada para proteger o disco." }
+    return [PSCustomObject]@{ Ok = $false; Removed = $removed; FreeMB = $free; RequiredMB = $minStopMB; Message = "Espaco insuficiente em '$Directory': $free MB livres, exigido $minStopMB MB (copia de $([math]::Round($IncomingMB, 0)) MB + $folga). Copia nao gravada para proteger o disco." }
 }
 
 # Remove sobras de rotinas interrompidas (FBK/GZ parciais) das pastas temporarias

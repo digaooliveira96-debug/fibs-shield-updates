@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.63",
+    "version":  "2.2.64",
     "releaseDate":  "2026-10-13",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Suporte inteligente ao Google Drive Desktop (15 GB): deteccao automatica da subpasta real (My Drive em Windows em ingles / Meu Drive em portugues), auto-cura do config.json e reserva de seguranca dedicada de 512 MB.\\n2. Blindagem das particoes locais fisicas (C:, D:, E:, System Reserved) 100% preservada com reservas de 8 GB (disco do banco) e 5 GB (demais discos).\\n3. Fallback automatico para sessao do usuario logado com conferencia SHA-256 em unidades virtuais.",
-    "setupSha256":  "7685B0D881DE9A9D0CE0F36ECE5C21106075D36C846C7810FC5E26667E053EB7",
-    "engineSha256":  "83D50C0682DA4FED17D69994592139F5E1ECB51BD1F91E6CF7C7CCD290D4A349",
-    "signature":  "U4ZIeI4oom8PEFjckR9emRyl/1uvNfWGNKIPGrwnuFzmCdezRlkam8DZ+9yLsHvpQMRuP8beuuV/b+8uVv2xuotdp+5rnx7AWpw3XSdmb+VoKU1LGThpmzxatb8081AZivFFRGH4AYLODRNwIZiFlejk00AijzZOtErz5Ilnfle69OIzbhYoROpwsw/00Nwu0pJgP0u2IYTNiKA5fnOMBEYfN4a+fnmJh0feAz2PdJzOwKUpye7WHZYnspny5qjUy29YkhusPvRnO1F5rU6s/fwi+1R3UBU3bkrOb3hLyrpp/qF6/zQZ7b2JU+UfYbYe1sOONV2rzoyCVs3UuZbXvqDd9xbsqy2EU8OvwRFFC2B6jNybB8gJbU0sjabgJ9tSA6d63A1hUuyjDSrDFKEMi8yCLb+jssuO3okGHTgMrMuo+Svd0OoXpfBQW6nvsCqGAiqXE+riFUzwkOSEk3nx6wDvTyJaDIm7W91b0ol+7YngFJon60TFXBsolGtDCwuH"
+    "changelog":  "1. Suporte inteligente ao Google Drive Desktop (15 GB): deteccao automatica da subpasta real (My Drive / Meu Drive), auto-cura do config.json, limpeza automatica aos 512 MB com compensacao de cota assincrona e parada segura somente abaixo de 100 MB livres.\\n2. Blindagem das particoes locais fisicas (C:, D:, E:, System Reserved) 100% preservada com reservas de 8 GB (disco do banco) e 5 GB (demais discos).\\n3. Correcoes defensivas da auditoria Ultrareview (100/100): guarda UNC em DriveInfo e fallback de leitura escalar em ConfigTypes.cs.",
+    "setupSha256":  "0844D238854182BAE65E09EDFC1AC13ED0DC884D43B39E0C81591064E04957AC",
+    "engineSha256":  "8332B570C395831748335EAEB0B2716D19B538BC63E06BC53B67DB38D42F97E1",
+    "signature":  "jVnQY0zgEZeXmELgKhWN1wY8L99CV00hWMFw7p7UICOGVIdtu6G6Y/X0C/1ufk0tv5efC/dIZL0a6c4fNRCYl0J70CE7+3ErlXIVYQmyGUWurRmB5KLR9mzKpTz0fBFXWQ7W64ruCW5O3u5qm+WhaFMtrsSvhxayhhcAXfzzHZJAy/v3WNfunq1IE9MIfLPC5eKhIiejvmtqDBk/AhxbjZ+HCkXYLw2Iu7Q4C8eOh8ZCgMqtqJCHVwPhEBUW9pODzIsAmEnNjmesvLU37eF2Xz1ea+7YjA9tvFvu7Fat2FQakkFRtdOFg0U+MedTVAraUEbbIeo6r3UQ27jB3QTyUuycHlkNnXur+UR445ZNP67DErYaTtbzAaOq5a6pEXnlZkwPaSowBRszIujKpHkfIjhDvwh+f7rjeQrM4wfB9d8SDL7RRFCqk5nYcSQs9ORenIr+hChU8vUP++J4YgTknkDwScLiazJ3gHHCra4nJERzGiAPGsRUfrv8xfsC3J7k"
 }
