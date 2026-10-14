@@ -20,7 +20,7 @@ param (
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.64"
+$script:EngineVersion = "2.2.65"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -4728,7 +4728,7 @@ function Invoke-DestinationSpaceGuard {
     if ($null -eq $info) {
         return [PSCustomObject]@{ Ok = $true; Removed = 0; FreeMB = -1; RequiredMB = 0; Message = "Espaco livre nao informado pelo Windows; copia segue." }
     }
-    $isGDrive = Test-IsGoogleDrivePath -Path $Directory
+    $isGDrive = (-not $IsDbDrive) -and ($Directory -notmatch '^(?i)C:\\Users\\[^\\]+\\(My Drive|Meu Drive|Mi unidad|Mon Drive|Meine Ablage|Il mio Drive)(\\|$)') -and (Test-IsGoogleDrivePath -Path $Directory)
     $reserveMB = if ($isGDrive) { 512 } else { Get-DiskReserveMB -TotalMB $info.TotalMB -IsDbDrive $IsDbDrive }
     $minStopMB = if ($isGDrive) { [math]::Round($IncomingMB + 100, 0) } else { [math]::Round($IncomingMB + $reserveMB, 0) }
     $required = [math]::Round($IncomingMB + $reserveMB, 0)
@@ -5160,7 +5160,7 @@ function Select-FailSafeDirectory {
     param([string]$DbPath, [double]$GzSizeMB)
     $dbRoot = [System.IO.Path]::GetPathRoot($DbPath)
     $candidatos = @()
-    if ((Test-Path "D:\") -and -not (Test-IsSystemReservedDrive -Path "D:\")) { $candidatos += "D:\BKP_SISMOTEL" }
+    if ((Test-Path "D:\") -and -not (Test-IsSystemReservedDrive -Path "D:\") -and -not (Test-IsGoogleDrivePath -Path "D:\")) { $candidatos += "D:\BKP_SISMOTEL" }
     if (-not (Test-IsSystemReservedDrive -Path "C:\")) { $candidatos += "C:\BKP_SISMOTEL" }
     foreach ($c in $candidatos) {
         if (Test-IsSystemReservedDrive -Path $c) { continue }
@@ -5817,6 +5817,7 @@ if ($null -ne $destinations) {
 
 $resolvedDestList = @()
 $missingLocalDests = @()
+$missingLocalReasons = @{}
 # Unidade com letra que so existe na sessao do usuario logado (Google Drive, OneDrive,
 # unidade do usuario): o servico nao a enxerga; a copia e feita pela sessao dele.
 $userDriveDests = @()
@@ -5846,7 +5847,9 @@ foreach ($dest in $destList) {
         # Destino local
         if (Test-IsSystemReservedDrive -Path $destTrimmed) {
             # Nunca some em silencio: vira FALHA do destino e entra no alerta
-            Log-Message "FALHA DE DESTINO: '$destTrimmed' esta numa particao reservada do sistema (rotulo de sistema ou menor que 1 GB). Nada foi gravado nela; corrija o destino na tarefa '$TaskName'."
+            $motivoRes = "particao reservada do sistema (rotulo de sistema ou menor que 1 GB)"
+            Log-Message "FALHA DE DESTINO: '$destTrimmed' esta numa $motivoRes. Nada foi gravado nela; corrija o destino na tarefa '$TaskName'."
+            $missingLocalReasons[$destTrimmed] = $motivoRes
             if (-not ($missingLocalDests -contains $destTrimmed)) { $missingLocalDests += $destTrimmed }
             continue
         }
@@ -5855,7 +5858,9 @@ foreach ($dest in $destList) {
             Log-Message "Unidade '$destRoot' nao aparece para o servico (Google Drive, OneDrive ou unidade do usuario). '$destTrimmed' sera copiado pelo usuario logado."
             if (-not ($userDriveDests -contains $destTrimmed)) { $userDriveDests += $destTrimmed }
         } elseif (-not (Test-Path $destRoot)) {
-            Log-Message "FALHA DE DESTINO: A particao/unidade '$destRoot' nao existe neste computador (drive ausente ou inacessivel para a conta SYSTEM). Destino '$destTrimmed' registrado como FALHA."
+            $motivoAusente = "a particao/unidade '$destRoot' nao existe neste computador (drive ausente ou inacessivel para a conta SYSTEM)"
+            Log-Message "FALHA DE DESTINO: $motivoAusente. Destino '$destTrimmed' registrado como FALHA."
+            $missingLocalReasons[$destTrimmed] = $motivoAusente
             if (-not ($missingLocalDests -contains $destTrimmed)) {
                 $missingLocalDests += $destTrimmed
             }
@@ -6243,7 +6248,7 @@ $fileName = Split-Path $tempGz -Leaf
 $localSuccessList = @()
 $networkSuccessList = @()
 $failedDestinations = @($missingLocalDests)
-$destinationFailureReasons = @{}
+$destinationFailureReasons = $missingLocalReasons
 # Todos os destinos configurados da tarefa (ja traduzidos para UNC quando mapeados)
 $allDestinations = @($resolvedDestList) + @($userDriveDests) + @($missingLocalDests)
 
@@ -6275,6 +6280,7 @@ foreach ($destTrimmed in $resolvedDestList) {
     }
 
     $destSuccess = $false
+    $semPermissaoLocal = $false
     foreach ($modoAcesso in $modosAcesso) {
     if ($destSuccess) { break }
     $netSession = $null
@@ -6440,7 +6446,7 @@ foreach ($destTrimmed in $resolvedDestList) {
 
     # Unidade virtual (Google Drive G:) que apareceu como existente para o servico (Test-Path G:\ = True),
     # mas cuja subpasta (My Drive / Meu Drive) so aceita gravacao na sessao do usuario logado.
-    if (-not $destSuccess -and -not $isNetwork -and (Test-IsSystemAccount) -and ([System.IO.Path]::GetPathRoot($destTrimmed) -ne $dbDrive)) {
+    if (-not $destSuccess -and -not $isNetwork -and (Test-IsSystemAccount) -and ([System.IO.Path]::GetPathRoot($destTrimmed) -ne $dbDrive) -and ($semPermissaoLocal -or (Test-IsGoogleDrivePath -Path $destTrimmed)) -and ($destinationFailureReason -notmatch "Espaco insuficiente")) {
         Log-Message "Unidade '$destTrimmed': o servico nao gravou diretamente. Tentando copiar pela sessao do usuario logado (Google Drive / unidade do usuario)..."
         $viaUserLocal = Copy-ViaLoggedOnUser -DestDir ($destTrimmed.Trim().TrimEnd('\', '/')) -SourceFile $tempGz -Prefix $basePrefix -Keep $keepBackupsCount -ExpectedSha $zipSha -NivelNormal
         if ($viaUserLocal.Ok) {
@@ -6475,7 +6481,7 @@ foreach ($destTrimmed in $userDriveDests) {
     Log-Message "Gravando backup GZ no destino [UNIDADE DO USUARIO] - $destTrimmed"
     $viaUser = Copy-ViaLoggedOnUser -DestDir ($destTrimmed.TrimEnd('\', '/')) -SourceFile $tempGz -Prefix $basePrefix -Keep $keepBackupsCount -ExpectedSha $zipSha -NivelNormal
     if ($viaUser.Ok) {
-        $networkSuccessList += $viaUser.FinalPath
+        if ($destTrimmed.StartsWith("\\")) { $networkSuccessList += $viaUser.FinalPath } else { $localSuccessList += $viaUser.FinalPath }
         $viaUserDir = Split-Path $viaUser.FinalPath -Parent
         if (-not [string]::IsNullOrWhiteSpace($viaUserDir) -and $viaUserDir -ne $destTrimmed) {
             Update-GoogleDriveDestinationInConfig -OldPath $destTrimmed -NewPath $viaUserDir
@@ -6571,7 +6577,8 @@ Causas mais frequentes para verificar:
 "@
     } else {
         $subjectInfo = "Falha ao Gravar nos Discos Locais ($TaskName)"
-        $errMsg = "ERRO CRITICO: Nao foi possivel gravar nos discos locais do servidor ($($failedDestinations -join ', ')). Verifique se as unidades locais estao cheias ou sem permissao de gravacao."
+        $detalhesLocais = @($failedDestinations | ForEach-Object { if ($destinationFailureReasons.ContainsKey($_)) { "${_}: $($destinationFailureReasons[$_])" } else { "$_" } }) -join "; "
+        $errMsg = "ERRO CRITICO: Nao foi possivel gravar nos discos locais do servidor ($($failedDestinations -join ', ')). Motivo(s): $detalhesLocais. Verifique se as unidades locais estao cheias ou sem permissao de gravacao."
     }
     if (-not [string]::IsNullOrEmpty($avisoHwPendente)) { $errMsg += "`n`nATENCAO - NESTA ROTINA TAMBEM HOUVE: $avisoHwPendente" }
     Log-Message $errMsg

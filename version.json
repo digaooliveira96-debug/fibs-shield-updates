@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.64",
+    "version":  "2.2.65",
     "releaseDate":  "2026-10-13",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Suporte inteligente ao Google Drive Desktop (15 GB): deteccao automatica da subpasta real (My Drive / Meu Drive), auto-cura do config.json, limpeza automatica aos 512 MB com compensacao de cota assincrona e parada segura somente abaixo de 100 MB livres.\\n2. Blindagem das particoes locais fisicas (C:, D:, E:, System Reserved) 100% preservada com reservas de 8 GB (disco do banco) e 5 GB (demais discos).\\n3. Correcoes defensivas da auditoria Ultrareview (100/100): guarda UNC em DriveInfo e fallback de leitura escalar em ConfigTypes.cs.",
-    "setupSha256":  "0844D238854182BAE65E09EDFC1AC13ED0DC884D43B39E0C81591064E04957AC",
-    "engineSha256":  "8332B570C395831748335EAEB0B2716D19B538BC63E06BC53B67DB38D42F97E1",
-    "signature":  "jVnQY0zgEZeXmELgKhWN1wY8L99CV00hWMFw7p7UICOGVIdtu6G6Y/X0C/1ufk0tv5efC/dIZL0a6c4fNRCYl0J70CE7+3ErlXIVYQmyGUWurRmB5KLR9mzKpTz0fBFXWQ7W64ruCW5O3u5qm+WhaFMtrsSvhxayhhcAXfzzHZJAy/v3WNfunq1IE9MIfLPC5eKhIiejvmtqDBk/AhxbjZ+HCkXYLw2Iu7Q4C8eOh8ZCgMqtqJCHVwPhEBUW9pODzIsAmEnNjmesvLU37eF2Xz1ea+7YjA9tvFvu7Fat2FQakkFRtdOFg0U+MedTVAraUEbbIeo6r3UQ27jB3QTyUuycHlkNnXur+UR445ZNP67DErYaTtbzAaOq5a6pEXnlZkwPaSowBRszIujKpHkfIjhDvwh+f7rjeQrM4wfB9d8SDL7RRFCqk5nYcSQs9ORenIr+hChU8vUP++J4YgTknkDwScLiazJ3gHHCra4nJERzGiAPGsRUfrv8xfsC3J7k"
+    "changelog":  "1. Blindagem multi-cliente de particoes e Google Drive: protecao absoluta da reserva de 8 GB / 5 GB mesmo quando o Google Drive esta em modo Espelhar em C:\\Users, exclusao de unidades virtuais do Fail-Safe local e preservacao automatica de destinos de nuvem na reinstalacao.\\n2. Diagnostico preciso de falha por falta de espaco em discos locais no alerta por e-mail e guarda de fallback de sessao do usuario.\\n3. Correcoes em configurar_discos.ps1 (criptografia DPAPI fora do JSON e separacao de discos fisicos/nuvem), startup_guard.ps1 e deteccao automatica de 4 destinos no painel C#.",
+    "setupSha256":  "E0757DDC10A5C53C2D73100DDA7A28F48D39FC2634BF2B9C4F97B1AC63E15300",
+    "engineSha256":  "DE0781247B5C3667EEB7782094FB866530D8C1EBF5A819F8126F57D801A5ACAC",
+    "signature":  "eJABcm/U2WZTuNf7fRRa0wq+agdAcSJsVZM0byn+n6njGhL2K1Q23Wla+Un1OLNdsUFYHyQ+0Zbpr+chhRDquVWDehZRsXlWGTTXMLADv+XjH45hEgbjwRpYz/lwjKJy6Ve0RsWvUGjEnSuX8up5043rMwVABQSPxCqTQw9ZoEgzIQfZkrnSfmMmDmxSHAF32VrcGMlKJC1HxACGESPbIAPZ7VECUXJhT9Fjf/mgIMGEWjFEm2dQOCyZvjinRdtrpHAYYqJzZU7wB9tat4MEhPugrBHc6Jpbp1xyCSJNsApVrhjas5DzhL60GeKqzACgPvn5zWX/3GRVcQYI5z243Pqp2I0Iy7uac5X3UC2/KOL9tMmR6RpI/Jwgttp9VIhoe/sW7tCiE6PU5ri1bYbtvwCx5RVFyYExlbtXcO99jBdUhcHLz/GBjIx58VA93uyZ3nes0b8CfWqW39fu3i2fQO6Ti1f1YF3xIjSaV83O+jLdWrklvYdFeKXc8/i0rV3T"
 }
