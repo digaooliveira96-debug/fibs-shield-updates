@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.69",
-    "releaseDate":  "2026-10-14",
+    "version":  "2.2.72",
+    "releaseDate":  "2026-10-15",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Revisao profunda ponta a ponta (Motor PowerShell, E-mails HTML, Painel C#, Servico Windows e Instalador Inno Setup) para Windows 7 SP1, Windows 10/11 e Windows Server 2008 R2 a 2025.\\n2. Blindagem completa dos 4 templates de e-mail HTML + teste SMTP (escaping HTML contra caracteres especiais, card dedicado para atraso local vs falha de rede UNC, telemetria completa em avisos de hardware, omissao limpa de metricas gstat nao verificadas e suporte TLS 1.2/1.1 universal).\\n3. Correcoes criticas de captura de stdout/stderr do gbak/gfix/gstat/7z, preservacao de arrays unitarios no JSON polyfill (PS 2.0) e sincronismo de sequencia no painel C#.",
-    "setupSha256":  "126DA15A5B669A2497C7C59B933F9A38C03445B2208AC6C80F93AD09BB550CFB",
-    "engineSha256":  "A1CBBAB1629042800D541DD5DA1AFA4FB8587E982E2B8B53DD6169FFD4205806",
-    "signature":  "syb7Yy2xDRVlAZX0sSUmK1aMOexEth6LtftqvePpqDwD7JHH2VRYxtB0BQacqFsBPTp+kcqPJxqB6TMPXulxej7XjhNmrD7Kmx1VH2WMR0GSeo6x28Ar7fkbQWfiAWEub0+oM5e63AUyuK70b0jzkQhieOPCN2xNpxb4tuHJ3RC4LgcYxao+oVrmg2S99uAqAvLhvGPuCUB9OWx69O8SWniVATUixPfI4JZh2Kj1KB8ivpdf/hSC8vguXtd+IaLdqy4E7P0UoXiQ+/Om1c5+Vmi/wsO0gb8Vpxgy2y2y3T+CGP5uJBy/aN2VTOPWnte87eM7L1qrYER7aZGHCvJ5OYKBXHh1UNdp+h3bFh4Pby1+1rV06dn3g5HGk3BRqpbIPf4oak0WmklzChDb1ewzbbbOmkXeovD1CdMJZl0PVUznL3FbDqKOXd79/my5NHIggKSYx0wyRh/mHSa8ZDe3snXuLkS3ndEuyQJhdfXWgT4GH4nnZw7HDd9R26gc5QVN"
+    "changelog":  "1. Correcao definitiva da copia externa em rede pela sessao do usuario logado (SRV-DESERTIN): suporte automatico aos dois tokens UAC (Highest e Limited do Explorer), liberacao de leitura (RX) na pasta pai do temporario e preservacao do diagnostico completo no monitor de 24h.\\n2. Novos e-mails de Boas-Vindas, Alerta de Rede Externa, Rotina/Falha e Auditoria Diaria com linguagem simples e direta, quadro resumo de 3 respostas no topo e diagnostico real dos HDs, espaco livre e banco de dados.\\n3. Compatibilidade total com Windows 7 SP1, Windows 10/11 e Windows Server 2008 R2 a 2025.",
+    "setupSha256":  "3E80FB41548B2EB50B5C144A1363DB68F0CBED34E20A76121D2738EFB3FDC561",
+    "engineSha256":  "8377CC9512E5FD7F4DCC0A556F0F01903EA3A3290E773B1D222974C7961F0020",
+    "signature":  "M5JtSUcu4YvP6AvKYxI6BRuVw2qiZ/WfKOYji7IC+D8FZgCUl7fSlztnbnaZ4xxvcgHNCM7aUrBFfr6NvvQ2tRi0RPfyxBou1SUUlrr1L4Hg6GH72O559fROts9YJtOVoKGfUf6ccOFHVsC1nCbJ95hfsGYyQQ2WyMTFF48R9lUspKBoQn/LOlHvPs/mnTitp+zxTRMpJYMb3H4KvoShpuZV/OMvZ5K0n7QXFVJI31lxN+RRTFUlXthPjdfMPuFas+EdEQFiHi/041QcP6c/BlX2UFCHp2WlTGTAcsMRQ85U1GTLrCMfnVEhf0DRWjJLQJMnjFDDiDNP8C1V9Uj3XDQI9fp/mZoTUK/FJxSvRN6wjM/22nB0PthG66Tj0srw3IFQqgcPprrdc/3JluNQO1ow5ddyKsMWAMB4GtOhHdcEi9WaZOps00I2J9+feJ/YTEAv2R+ZVF32rmsY4us6xzIbNzUIyx2fU7wyaoSMkwgDvKEiLs7RyISZjsUh5cuq"
 }

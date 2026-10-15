@@ -44,7 +44,7 @@ if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.69"
+$script:EngineVersion = "2.2.72"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -1034,16 +1034,31 @@ function Test-IsAccessDeniedError {
 function Get-LoggedOnUsers {
     $users = @()
     try {
-        foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
-            try {
-                $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
-                if ($o.ReturnValue -eq 0 -and -not [string]::IsNullOrWhiteSpace($o.User)) {
-                    $u = if ([string]::IsNullOrWhiteSpace($o.Domain)) { "$($o.User)" } else { "$($o.Domain)\$($o.User)" }
-                    if ($users -notcontains $u) { $users += $u }
-                }
-            } catch {}
+        if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+            foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
+                try {
+                    $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
+                    if ($o.ReturnValue -eq 0 -and -not [string]::IsNullOrWhiteSpace($o.User)) {
+                        $u = if ([string]::IsNullOrWhiteSpace($o.Domain)) { "$($o.User)" } else { "$($o.Domain)\$($o.User)" }
+                        if ($users -notcontains $u) { $users += $u }
+                    }
+                } catch {}
+            }
         }
     } catch {}
+    if ($users.Count -eq 0) {
+        try {
+            foreach ($p in @(Get-WmiObject Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
+                try {
+                    $o = $p.GetOwner()
+                    if ($null -ne $o -and $o.ReturnValue -eq 0 -and -not [string]::IsNullOrWhiteSpace($o.User)) {
+                        $u = if ([string]::IsNullOrWhiteSpace($o.Domain)) { "$($o.User)" } else { "$($o.Domain)\$($o.User)" }
+                        if ($users -notcontains $u) { $users += $u }
+                    }
+                } catch {}
+            }
+        } catch {}
+    }
     # Sem virgula: ",@()" viraria "1 usuario vazio" em @(Get-LoggedOnUsers)
     return $users
 }
@@ -1123,7 +1138,11 @@ try {
             }
         } catch {}
         $final = Join-Path $dest (Split-Path $job["SRC"] -Leaf)
-        Copy-Item -LiteralPath $job["SRC"] -Destination $final -Force -ErrorAction Stop
+        try {
+            [IO.File]::Copy($job["SRC"], $final, $true)
+        } catch {
+            Copy-Item -LiteralPath $job["SRC"] -Destination $final -Force -ErrorAction Stop
+        }
         # SHA-256 pelo .NET: Get-FileHash nao existe no PowerShell 2/3
         $fs = [IO.File]::Open($final, 'Open', 'Read', 'Read')
         $alg = [Security.Cryptography.SHA256]::Create()
@@ -1159,19 +1178,33 @@ function Invoke-AsLoggedOnUser {
             $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ("-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"{0}`" -JobFile `"{1}`"" -f $HelperFile, $JobFile)
             $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds ($TimeoutSec + 120))
             try {
-                # Unidade do usuario (Google Drive, OneDrive): nivel normal, o mesmo token do
-                # Explorer. Um processo elevado pode nao enxergar a letra que o usuario ve.
+                # Unidade do usuario (Google Drive, OneDrive) ou token normal do Explorer:
+                # um processo elevado pode nao enxergar a sessao SMB/letra aberta no Explorer.
                 if ($Limited) { throw "nivel normal pedido" }
                 $prn = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Highest
                 Register-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Action $act -Principal $prn -Settings $set -Force -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -ErrorAction Stop
             } catch {
-                # Privilegio maximo recusado para este usuario: roda no nivel normal dele
+                # Privilegio maximo recusado para este usuario ou nivel normal solicitado: roda no nivel normal dele
                 $prn = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
                 Register-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Action $act -Principal $prn -Settings $set -Force -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -ErrorAction Stop
             }
-            Start-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -ErrorAction Stop
             $limite = (Get-Date).AddSeconds($TimeoutSec)
-            while ((Get-Date) -lt $limite -and -not (Test-Path $ResultFile)) { Start-Sleep -Seconds 2 }
+            $ciclos = 0
+            while ((Get-Date) -lt $limite -and -not (Test-Path $ResultFile)) {
+                Start-Sleep -Seconds 2
+                $ciclos++
+                if ($ciclos -ge 2 -and -not (Test-Path $ResultFile) -and (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue)) {
+                    try {
+                        $stTask = Get-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -ErrorAction Stop
+                        if ($null -ne $stTask -and $null -ne $stTask.State -and "$($stTask.State)" -ne "Running" -and "$($stTask.State)" -ne "Queued") {
+                            Start-Sleep -Seconds 1
+                            break
+                        }
+                    } catch {}
+                }
+            }
         } finally {
             try { Unregister-ScheduledTask -TaskPath "\MEC_Shield\" -TaskName $nome -Confirm:$false -ErrorAction SilentlyContinue } catch {}
         }
@@ -1231,7 +1264,10 @@ function Invoke-AsLoggedOnUser {
 }
 
 # Copia (ou testa, com -Probe) um destino de rede pela sessao de cada usuario logado,
-# ate um conseguir. Devolve Ok, User, FinalPath, Removed e Message.
+# ate um conseguir. Tenta os dois tokens UAC do usuario (o nivel pedido e, se falhar, o
+# outro nivel: Limited = mesmo token do explorer.exe; Highest = token elevado do painel),
+# pois no Windows com UAC ativo a sessao SMB aberta no Explorer nao existe no token elevado.
+# Devolve Ok, User, FinalPath, Removed e Message.
 function Copy-ViaLoggedOnUser {
     param(
         [string]$DestDir,
@@ -1250,12 +1286,20 @@ function Copy-ViaLoggedOnUser {
     }
     $base = if ([string]::IsNullOrWhiteSpace($WorkRoot)) { Join-Path $env:ProgramData "MEC_Shield\rede" } else { $WorkRoot }
     $falhas = @()
+    $niveisTentativa = @([bool]$NivelNormal, (-not [bool]$NivelNormal))
     foreach ($u in $users) {
         $jobDir = Join-Path $base ([Guid]::NewGuid().ToString("N"))
         try {
             New-Item -ItemType Directory -Path $jobDir -Force -ErrorAction Stop | Out-Null
+            & icacls.exe $base /grant "${u}:(RX)" /Q 2>&1 | Out-Null
             & icacls.exe $jobDir /grant "${u}:(OI)(CI)M" /Q 2>&1 | Out-Null
-            if (-not $Probe) { & icacls.exe $SourceFile /grant "${u}:(R)" /Q 2>&1 | Out-Null }
+            if (-not $Probe -and -not [string]::IsNullOrWhiteSpace($SourceFile)) {
+                $srcParent = Split-Path $SourceFile -Parent
+                if (-not [string]::IsNullOrWhiteSpace($srcParent)) {
+                    & icacls.exe $srcParent /grant "${u}:(RX)" /Q 2>&1 | Out-Null
+                }
+                & icacls.exe $SourceFile /grant "${u}:(R)" /Q 2>&1 | Out-Null
+            }
             $helper = Join-Path $jobDir "copia_rede.ps1"
             [System.IO.File]::WriteAllText($helper, (Get-UserSessionCopyScript), [System.Text.Encoding]::ASCII)
             $jobFile = Join-Path $jobDir "pedido.txt"
@@ -1263,15 +1307,23 @@ function Copy-ViaLoggedOnUser {
             $modo = if ($Probe) { "PROBE" } else { "COPY" }
             $linhas = @("MODE`t$modo", "DESTDIR`t$DestDir", "SRC`t$SourceFile", "PREFIX`t$Prefix", "KEEP`t$Keep", "SHA`t$ExpectedSha", "RESULT`t$resFile")
             [System.IO.File]::WriteAllText($jobFile, ($linhas -join "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
-            Invoke-AsLoggedOnUser -User $u -HelperFile $helper -JobFile $jobFile -ResultFile $resFile -TimeoutSec $TimeoutSec -Limited:$NivelNormal
-            if (-not (Test-Path $resFile)) { $falhas += "${u}: sem resposta em $TimeoutSec s"; continue }
-            $p = ([System.IO.File]::ReadAllText($resFile)).Split("`t")
-            if ($p[0] -eq "OK") {
-                $removidos = 0; if ($p.Count -ge 4) { [void][int]::TryParse($p[3], [ref]$removidos) }
-                $final = if ($p.Count -ge 3) { $p[2] } else { "" }
-                return (New-Object PSObject -Property @{ Ok = $true; User = $p[1]; FinalPath = $final; Removed = $removidos; Message = "OK" })
+            $ultimoErroUsuario = ""
+            foreach ($usarLimited in $niveisTentativa) {
+                if (Test-Path $resFile) { Remove-Item $resFile -Force -ErrorAction SilentlyContinue }
+                Invoke-AsLoggedOnUser -User $u -HelperFile $helper -JobFile $jobFile -ResultFile $resFile -TimeoutSec $TimeoutSec -Limited:$usarLimited
+                if (-not (Test-Path $resFile)) {
+                    $ultimoErroUsuario = "${u}: sem resposta em $TimeoutSec s"
+                    continue
+                }
+                $p = ([System.IO.File]::ReadAllText($resFile)).Split("`t")
+                if ($p[0] -eq "OK") {
+                    $removidos = 0; if ($p.Count -ge 4) { [void][int]::TryParse($p[3], [ref]$removidos) }
+                    $final = if ($p.Count -ge 3) { $p[2] } else { "" }
+                    return (New-Object PSObject -Property @{ Ok = $true; User = $p[1]; FinalPath = $final; Removed = $removidos; Message = "OK" })
+                }
+                $ultimoErroUsuario = "$($p[1]): $(if ($p.Count -ge 3) { $p[2] } else { 'falha sem detalhe' })"
             }
-            $falhas += "$($p[1]): $(if ($p.Count -ge 3) { $p[2] } else { 'falha sem detalhe' })"
+            if (-not [string]::IsNullOrWhiteSpace($ultimoErroUsuario)) { $falhas += $ultimoErroUsuario }
         } catch {
             $falhas += "${u}: $($_.Exception.Message)"
         } finally {
@@ -2637,18 +2689,18 @@ function Send-BackupNotification {
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#38bdf8; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ DADOS DO CLIENTE &bull; ACESSO REMOTO ]</span>
+                    <span style="color:#38bdf8; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 1. DADOS DO CLIENTE E ACESSO REMOTO ]</span>
                   </td>
                 </tr>
                 <tr>
                   <td bgcolor="#1e293b" style="background-color:#1e293b; padding:16px 18px;">
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#ffffff;">
                       <tr>
-                        <td width="36%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Cliente / Empresa:</td>
+                        <td width="36%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Cliente / Motel:</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:16px;">$clientNameHtml</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Servidor / Hostname:</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Nome do Servidor:</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-weight:700; color:#38bdf8; font-size:14.5px;">$hostName</td>
                       </tr>
                       <tr>
@@ -2670,50 +2722,50 @@ function Send-BackupNotification {
             </td>
           </tr>
 
-          <!-- CARD 2: TELEMETRIA DA ROTINA & ARMAZENAMENTO -->
+          <!-- CARD 2: RESUMO DO BACKUP E ARMAZENAMENTO -->
           <tr>
             <td bgcolor="#111827" style="background-color:#111827; padding:8px 28px;">
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#34d399; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ M&Eacute;TRICAS &bull; TELEMETRIA DA EXECU&Ccedil;&Atilde;O ]</span>
+                    <span style="color:#34d399; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 2. RESUMO DO BACKUP E ESPA&Ccedil;O EM DISCO ]</span>
                   </td>
                 </tr>
                 <tr>
                   <td bgcolor="#1e293b" style="background-color:#1e293b; padding:16px 18px;">
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#e2e8f0;">
                       <tr>
-                        <td width="38%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Tarefa Executada:</td>
+                        <td width="38%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Rotina / Tarefa:</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:15px;">$TaskNameHtml $taskBadgeHtml</td>
                       </tr>
                       $(if ($DurationStr) {
                       "<tr>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Dura&ccedil;&atilde;o da Rotina:</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Tempo Total:</td>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-weight:800; color:#38bdf8; font-size:15.5px;'>$(ConvertTo-HtmlSafe $DurationStr)</td>
                       </tr>"
                       })
                       $gbakZipRowHtml
                       $(if ($DbPath) {
                       "<tr>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Banco Firebird:</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Banco do Sismotel:</td>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-size:13.5px; color:#cbd5e1;'>$DbPath $(if ($DbSize) { "<span style='color:#94a3b8; font-size:12.5px;'>($(ConvertTo-HtmlSafe $DbSize) MB)</span>" })</td>
                       </tr>"
                       })
                       $(if ($FbkSize) {
                       "<tr>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Backup Bruto (FBK):</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Tamanho antes de compactar:</td>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-size:14px; color:#cbd5e1;'>$(ConvertTo-HtmlSafe $FbkSize) MB</td>
                       </tr>"
                       })
                       $(if ($ZipSize) {
                       "<tr>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Arquivo Final (.GZ):</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Arquivo de Backup (.GZ):</td>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-weight:800; color:#34d399; font-size:15px;'>$(if ($ZipFileLeafHtml) { "<span style='font-family:Consolas,monospace; font-size:13.5px; color:#e2e8f0; margin-right:6px;'>$ZipFileLeafHtml</span>" })$(ConvertTo-HtmlSafe $ZipSize) MB $(if ($CompressionRatio) { "<span style='margin-left:6px; font-size:12.5px; color:#a7f3d0; font-weight:700; background-color:#064e3b; padding:3px 8px; border-radius:4px; border:1px solid #059669;'>$(ConvertTo-HtmlSafe $CompressionRatio)</span>" })</td>
                       </tr>"
                       })
                       $(if ($FreeSpaceInfoHtml) {
                       "<tr>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Espa&ccedil;o em Disco:</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;'>Espa&ccedil;o Livre no Disco:</td>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-size:13.5px; color:#cbd5e1;'>$FreeSpaceInfoHtml</td>
                       </tr>"
                       })
@@ -2723,7 +2775,7 @@ function Send-BackupNotification {
                           $dListHtml += "<div style='margin-bottom:4px;'>&#10004; $sd</div>"
                       }
                       "<tr>
-                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;' valign='top'>Destinos Salvos:</td>
+                        <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;' valign='top'>Salvo com Sucesso em:</td>
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-size:13px; color:#34d399;'>$dListHtml</td>
                       </tr>"
                       })
@@ -2739,14 +2791,15 @@ function Send-BackupNotification {
           "<tr>
             <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
               <div style='background-color:#450a0a; border:1px solid #7f1d1d; border-left:4px solid #ef4444; border-radius:8px; padding:16px; font-size:13.5px; color:#fca5a5; line-height:1.6;'>
-                <strong style='color:#f87171; font-size:14.5px;'>DIAGN&Oacute;STICO DA FALHA:</strong><br/>
+                <strong style='color:#f87171; font-size:14.5px;'>MOTIVO IDENTIFICADO:</strong><br/>
                 $(if ($null -ne $diag) {
                 "<div style='margin-top:8px; font-size:16px; font-weight:800; color:#fecaca;'>$($diag.Titulo)</div>
-                <div style='margin-top:6px; font-size:14px; color:#fde2e2;'><strong>Causa prov&aacute;vel:</strong> $($diag.Causa)</div>
+                <div style='margin-top:6px; font-size:14px; color:#fde2e2;'><strong>Explica&ccedil;&atilde;o simples:</strong> $($diag.Causa)</div>
                 <div style='margin-top:12px; font-size:11.5px; color:#fca5a5; text-transform:uppercase; letter-spacing:0.5px;'>Detalhe t&eacute;cnico (para o suporte):</div>
                 <div style='margin-top:4px; font-family:Consolas,monospace; white-space:pre-wrap; word-break:break-all; font-size:12px; opacity:0.85;'>$BodyDetails</div>"
                 } else {
-                "<div style='margin-top:8px; font-family:Consolas,monospace; white-space:pre-wrap; word-break:break-all; font-size:13px;'>$BodyDetails</div>"
+                "<div style='margin-top:8px; font-size:11.5px; color:#fca5a5; text-transform:uppercase; letter-spacing:0.5px;'>Detalhe t&eacute;cnico (para o suporte):</div>
+                <div style='margin-top:4px; font-family:Consolas,monospace; white-space:pre-wrap; word-break:break-all; font-size:13px;'>$BodyDetails</div>"
                 })
               </div>
             </td>
@@ -2756,7 +2809,7 @@ function Send-BackupNotification {
               <table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' bgcolor='#1e293b' style='background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;'>
                 <tr>
                   <td bgcolor='#0f172a' style='background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;'>
-                    <span style='color:#f87171; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;'>[ A&Ccedil;&Atilde;O RECOMENDADA &bull; SUPORTE MEC ]</span>
+                    <span style='color:#fbbf24; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;'>[ 3. COMO RESOLVER PASSO A PASSO ]</span>
                   </td>
                 </tr>
                 <tr>
@@ -2778,20 +2831,16 @@ function Send-BackupNotification {
           "<tr>
             <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
               <div style='background-color:#451a03; border:1px solid #78350f; border-left:4px solid #f59e0b; border-radius:8px; padding:16px; font-size:14px; color:#fde68a; line-height:1.65;'>
-                <strong style='color:#fbbf24; font-size:15px;'>&#9888; DESTINO EXTERNO / TERMINAL RECEP&Ccedil;&Atilde;O N&Atilde;O LOCALIZADO:</strong><br/>
-                <div style='margin-top:8px; color:#fef3c7;'>O backup local no servidor foi gravado com <strong>100% de sucesso e integridade</strong>. No entanto, a c&oacute;pia de conting&ecirc;ncia externa para a recep&ccedil;&atilde;o n&atilde;o respondeu no(s) seguinte(s) caminho(s):</div>
+                <strong style='color:#fbbf24; font-size:15px;'>&#9888; COMPUTADOR EXTERNO N&Atilde;O RESPONDEU NA REDE:</strong><br/>
+                <div style='margin-top:8px; color:#fef3c7;'>O backup principal no servidor foi salvo com <strong>100% de sucesso</strong>, mas n&atilde;o foi poss&iacute;vel enviar a c&oacute;pia extra para:</div>
                 <div style='margin:10px 0; padding:10px 14px; background-color:#1e140a; border:1px solid #b45309; border-radius:6px; font-family:Consolas,monospace; font-size:13.5px; color:#fef08a;'>$wListHtml</div>
                 <div style='margin-top:8px; font-size:13.5px; color:#cbd5e1;'>
-                  <strong style='color:#fbbf24;'>Causas mais frequentes identificadas no cliente:</strong>
+                  <strong style='color:#fbbf24;'>O que costuma causar isso:</strong>
                   <ul style='margin:6px 0 0 18px; padding:0; color:#fde68a;'>
-                    <li style='margin-bottom:4px;'><strong>Terminal da Recep&ccedil;&atilde;o Desligado:</strong> O computador ou switch de rede pode estar sem energia ou em suspens&atilde;o/hiberna&ccedil;&atilde;o.</li>
-                    <li style='margin-bottom:4px;'><strong>Formata&ccedil;&atilde;o ou Troca de Terminal:</strong> O computador pode ter sido formatado recentemente ou substitu&iacute;do na recep&ccedil;&atilde;o.</li>
-                    <li style='margin-bottom:4px;'><strong>Permiss&atilde;o:</strong> A pasta n&atilde;o aceita grava&ccedil;&atilde;o do servidor. Libere nas abas Compartilhamento e Seguran&ccedil;a da pasta (ex.: Todos com Modificar).</li>
-                    <li><strong>Mudan&ccedil;a de IP ou Cabo Solto:</strong> O endere&ccedil;o IP do terminal variou pelo roteador ou o cabo de rede foi desconectado.</li>
+                    <li style='margin-bottom:4px;'><strong>Computador Desligado:</strong> O computador de destino est&aacute; desligado, em modo de espera ou com cabo de rede solto.</li>
+                    <li style='margin-bottom:4px;'><strong>Pasta N&atilde;o Compartilhada:</strong> O computador foi formatado/trocado e a pasta de backup precisa ser compartilhada novamente.</li>
+                    <li><strong>Falta de Permiss&atilde;o:</strong> Libere permiss&atilde;o de grava&ccedil;&atilde;o (Modificar) nas abas Compartilhamento e Seguran&ccedil;a da pasta.</li>
                   </ul>
-                </div>
-                <div style='margin-top:10px; font-size:12.5px; color:#94a3b8; font-style:italic;'>
-                  O FIBS continuar&aacute; gerando os backups locais normalmente no servidor e tentar&aacute; sincronizar a recep&ccedil;&atilde;o na pr&oacute;xima rotina.
                 </div>
               </div>
             </td>
@@ -2803,8 +2852,8 @@ function Send-BackupNotification {
           "<tr>
             <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
               <div style='background-color:#064e3b; border:1px solid #065f46; border-left:4px solid #10b981; border-radius:8px; padding:16px; font-size:14px; color:#a7f3d0; line-height:1.65;'>
-                <strong style='color:#34d399; font-size:15px;'>&#10004; RESTABELECIMENTO OPERACIONAL:</strong><br/>
-                <div style='margin-top:6px;'>O backup deste cliente e a conex&atilde;o com os destinos de rede voltaram a operar com 100% de estabilidade e integridade. Os alertas anteriores foram encerrados e a prote&ccedil;&atilde;o 24/7 est&aacute; plenamente ativa.</div>
+                <strong style='color:#34d399; font-size:15px;'>&#10004; TUDO VOLTOU AO NORMAL:</strong><br/>
+                <div style='margin-top:6px;'>O backup deste servidor voltou a funcionar normalmente. Os avisos anteriores foram encerrados e a prote&ccedil;&atilde;o autom&aacute;tica segue ativa.</div>
               </div>
             </td>
           </tr>"
@@ -2920,6 +2969,119 @@ function Send-BackupNotification {
     }
 }
 
+function Get-ServerStorageSummaryForEmail {
+    $dbInfoHtml = ""
+    $disksHtml = ""
+    try {
+        # 1. Identifica os bancos de dados configurados nas tarefas e seus tamanhos reais
+        $seenDbs = @()
+        $dbLines = @()
+        if ($null -ne $global:configData -and $null -ne $global:configData.Tasks) {
+            foreach ($tk in @($global:configData.Tasks)) {
+                $pDb = if (-not [string]::IsNullOrWhiteSpace($tk.DbPath)) { "$($tk.DbPath)".Trim() } elseif ($null -ne $global:configData.Preferences -and -not [string]::IsNullOrWhiteSpace($global:configData.Preferences.DbPath)) { "$($global:configData.Preferences.DbPath)".Trim() } else { "" }
+                if ([string]::IsNullOrWhiteSpace($pDb) -or ($seenDbs -contains $pDb.ToUpperInvariant())) { continue }
+                $seenDbs += $pDb.ToUpperInvariant()
+                $pDbSafe = ConvertTo-HtmlSafe $pDb
+                if (Test-Path $pDb) {
+                    try {
+                        $fItem = Get-Item $pDb -ErrorAction Stop
+                        $szMB = [Math]::Round($fItem.Length / 1MB, 1)
+                        $szTxt = if ($szMB -ge 1024) { "$([Math]::Round($fItem.Length / 1GB, 2)) GB ($szMB MB)" } else { "$szMB MB" }
+                        $dbLines += "<div style='margin-bottom:4px;'><span style='color:#34d399; font-weight:700;'>&#10004; Localizado:</span> <code style='color:#f8fafc; font-family:Consolas,monospace; font-size:12.5px;'>$pDbSafe</code> <span style='display:inline-block; margin-left:6px; padding:2px 7px; border-radius:4px; background-color:#064e3b; color:#a7f3d0; font-size:11.5px; font-weight:700;'>Tamanho atual: $szTxt</span></div>"
+                    } catch {
+                        $dbLines += "<div style='margin-bottom:4px;'><code style='color:#f8fafc; font-family:Consolas,monospace; font-size:12.5px;'>$pDbSafe</code></div>"
+                    }
+                } else {
+                    $dbLines += "<div style='margin-bottom:4px;'><code style='color:#cbd5e1; font-family:Consolas,monospace; font-size:12.5px;'>$pDbSafe</code></div>"
+                }
+            }
+        }
+        if ($dbLines.Count -eq 0 -and $null -ne $global:configData -and $null -ne $global:configData.Preferences -and -not [string]::IsNullOrWhiteSpace($global:configData.Preferences.DbPath)) {
+            $pDb = "$($global:configData.Preferences.DbPath)".Trim()
+            $pDbSafe = ConvertTo-HtmlSafe $pDb
+            if (Test-Path $pDb) {
+                try {
+                    $fItem = Get-Item $pDb -ErrorAction Stop
+                    $szMB = [Math]::Round($fItem.Length / 1MB, 1)
+                    $dbLines += "<div><span style='color:#34d399; font-weight:700;'>&#10004; Localizado:</span> <code style='color:#f8fafc; font-family:Consolas,monospace; font-size:12.5px;'>$pDbSafe</code> <span style='color:#a7f3d0; font-weight:700;'>($szMB MB)</span></div>"
+                } catch {
+                    $dbLines += "<div><code style='color:#f8fafc; font-family:Consolas,monospace; font-size:12.5px;'>$pDbSafe</code></div>"
+                }
+            } else {
+                $dbLines += "<div><code style='color:#cbd5e1; font-family:Consolas,monospace; font-size:12.5px;'>$pDbSafe</code></div>"
+            }
+        }
+        if ($dbLines.Count -gt 0) {
+            $dbInfoHtml = ($dbLines -join "")
+        } else {
+            $dbInfoHtml = "<span style='color:#94a3b8;'>Caminho padrao do Sismotel</span>"
+        }
+
+        # 2. Lista os discos (HDs / SSDs / Unidades) detectados no servidor com espaco livre e saude SMART
+        $smartMap = @{}
+        try { $smartMap = Get-SmartPredictFailureMap } catch {}
+        $driveRows = @()
+        $allDrives = @([System.IO.DriveInfo]::GetDrives() | Where-Object { $_.IsReady -and ($_.DriveType -eq [System.IO.DriveType]::Fixed -or $_.DriveType -eq [System.IO.DriveType]::Removable) })
+        foreach ($drv in $allDrives) {
+            try {
+                $root = "$($drv.Name)"
+                $freeGB = [Math]::Round($drv.AvailableFreeSpace / 1GB, 1)
+                $totalGB = [Math]::Round($drv.TotalSize / 1GB, 1)
+                if ($totalGB -le 0) { continue }
+                $pctFree = [Math]::Round(($drv.AvailableFreeSpace / [double]$drv.TotalSize) * 100, 0)
+                $volLabel = if (-not [string]::IsNullOrWhiteSpace($drv.VolumeLabel)) { ConvertTo-HtmlSafe "$($drv.VolumeLabel)" } else { "Disco Local" }
+                $isGDrive = $false
+                try { $isGDrive = (Test-IsGoogleDrivePath -Path $root) } catch {}
+                if ($isGDrive) { $volLabel = "Google Drive" }
+
+                $physModel = ""
+                $smartBadge = "<span style='display:inline-block; padding:2px 7px; border-radius:4px; background-color:#064e3b; color:#6ee7b7; font-size:11px; font-weight:700;'>Disco Saud&aacute;vel</span>"
+                try {
+                    $phys = Get-PhysicalDiskOfPath -Path $root
+                    if ($null -ne $phys -and -not [string]::IsNullOrWhiteSpace($phys.Model)) {
+                        $physModel = ConvertTo-HtmlSafe "$($phys.Model)".Trim()
+                        $smFail = Test-SmartPredictFailure -Disk $phys -Map $smartMap
+                        if ($smFail -eq $true) {
+                            $smartBadge = "<span style='display:inline-block; padding:2px 7px; border-radius:4px; background-color:#7f1d1d; color:#fecaca; font-size:11px; font-weight:700;'>&#9888; Alerta SMART no HD</span>"
+                        }
+                    }
+                } catch {}
+
+                $spaceColor = if ($freeGB -lt 8) { "#f87171" } elseif ($freeGB -lt 20) { "#fbbf24" } else { "#34d399" }
+                $modelTxt = if ($physModel) { " &bull; <span style='color:#94a3b8; font-size:12px;'>$physModel</span>" } else { "" }
+
+                $driveRows += @"
+                <tr>
+                  <td bgcolor="#1e293b" style="padding:10px 12px; border-bottom:1px solid #334155; background-color:#1e293b;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                      <div>
+                        <strong style="color:#38bdf8; font-family:Consolas,monospace; font-size:14px;">$(ConvertTo-HtmlSafe $root)</strong>
+                        <span style="color:#e2e8f0; font-weight:600; font-size:13px; margin-left:4px;">($volLabel)</span>$modelTxt
+                      </div>
+                    </div>
+                    <div style="margin-top:4px; font-size:12.5px; color:#cbd5e1;">
+                      Espa&ccedil;o Livre: <strong style="color:$spaceColor; font-size:13.5px;">$freeGB GB livres</strong> de $totalGB GB ($pctFree% livre) &nbsp;$smartBadge
+                    </div>
+                  </td>
+                </tr>
+"@
+            } catch {}
+        }
+        if ($driveRows.Count -gt 0) {
+            $disksHtml = ($driveRows -join "")
+        } else {
+            $disksHtml = "<tr><td bgcolor='#1e293b' style='padding:12px; color:#94a3b8; font-size:13px;'>Informacoes de disco indisponiveis no momento.</td></tr>"
+        }
+    } catch {
+        if ([string]::IsNullOrWhiteSpace($dbInfoHtml)) { $dbInfoHtml = "<span style='color:#94a3b8;'>Padrao Sismotel</span>" }
+        if ([string]::IsNullOrWhiteSpace($disksHtml)) { $disksHtml = "<tr><td bgcolor='#1e293b' style='padding:12px; color:#94a3b8; font-size:13px;'>Leitura de disco concluida.</td></tr>" }
+    }
+    return (New-Object PSObject -Property @{
+        DbInfoHtml = $dbInfoHtml
+        DisksHtml  = $disksHtml
+    })
+}
+
 function Send-WelcomeEmail {
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) { return }
@@ -2942,6 +3104,9 @@ function Send-WelcomeEmail {
         $remoteBadges = Get-RemoteBadgesHtml -anyDeskId $anyDeskId -teamViewerId $teamViewerId
         $timestampNow = Get-Date -Format 'dd/MM/yyyy HH:mm:ss'
 
+        $srvInventory = Get-ServerStorageSummaryForEmail
+        $retentionCount = if ($pref.MaxBackupsToKeep -gt 0) { [int]$pref.MaxBackupsToKeep } else { 30 }
+
         $tasksHtml = ""
         $tasksArr = @()
         if ($null -ne $global:configData.Tasks) { $tasksArr = @($global:configData.Tasks) }
@@ -2953,27 +3118,31 @@ function Send-WelcomeEmail {
                 } elseif ($t.BackupTime) {
                     ConvertTo-HtmlSafe "$($t.BackupTime)"
                 } else {
-                    "Hor&aacute;rio Livre / Cont&iacute;nuo"
+                    "Autom&aacute;tico ao longo do dia"
                 }
-                $tNetTerm = if (-not [string]::IsNullOrWhiteSpace($t.NetworkTerminalName)) { ConvertTo-HtmlSafe "$($t.NetworkTerminalName)" } else { "Local / N&atilde;o definido" }
+                $tNetTerm = if (-not [string]::IsNullOrWhiteSpace($t.NetworkTerminalName)) { ConvertTo-HtmlSafe "$($t.NetworkTerminalName)" } else { "No pr&oacute;prio servidor" }
+                $tRet = if ($t.RetentionCount -gt 0) { [int]$t.RetentionCount } else { $retentionCount }
                 $tDestList = ""
                 if ($null -ne $t.Destinations) {
                     foreach ($d in @($t.Destinations)) {
                         if (-not [string]::IsNullOrWhiteSpace($d)) {
-                            $tDestList += "<span style='color:#38bdf8; font-family:Consolas,monospace; font-size:11.5px;'>&bull; $(ConvertTo-HtmlSafe $d)</span><br/>"
+                            $dTrim = "$d".Trim()
+                            $tipoDest = if ($dTrim.StartsWith("\\")) { "<span style='color:#fbbf24; font-size:11px; font-weight:700;'>[Computador na Rede]</span>" } elseif (Test-IsGoogleDrivePath -Path $dTrim) { "<span style='color:#60a5fa; font-size:11px; font-weight:700;'>[Google Drive]</span>" } else { "<span style='color:#34d399; font-size:11px; font-weight:700;'>[Pasta Local no Servidor]</span>" }
+                            $tDestList += "<div style='margin-top:3px;'><span style='color:#38bdf8; font-family:Consolas,monospace; font-size:12px;'>&bull; $(ConvertTo-HtmlSafe $dTrim)</span> $tipoDest</div>"
                         }
                     }
                 }
-                if ([string]::IsNullOrWhiteSpace($tDestList)) { $tDestList = "<span style='color:#94a3b8; font-style:italic;'>Padr&atilde;o local</span>" }
+                if ([string]::IsNullOrWhiteSpace($tDestList)) { $tDestList = "<span style='color:#94a3b8; font-style:italic;'>Pasta padr&atilde;o no servidor</span>" }
                 
                 $tasksHtml += @"
                 <tr>
                   <td bgcolor="#1e293b" style="padding:14px 16px; border-bottom:1px solid #334155; background-color:#1e293b;">
-                    <div style="color:#10b981; font-weight:800; font-size:15px; margin-bottom:4px;">&#128194; $tName</div>
-                    <div style="color:#cbd5e1; font-size:12.5px; line-height:1.6;">
-                      <span style="color:#94a3b8; font-weight:600;">Hor&aacute;rio Agendado:</span> <strong style="color:#ffffff;">$tTime</strong> &bull; 
-                      <span style="color:#94a3b8; font-weight:600;">Terminal Alerta:</span> <span style="color:#f1f5f9;">$tNetTerm</span><br/>
-                      <span style="color:#94a3b8; font-weight:600;">Destinos de Armazenamento:</span><br/>
+                    <div style="color:#10b981; font-weight:800; font-size:15px; margin-bottom:6px;">&#128194; $tName</div>
+                    <div style="color:#cbd5e1; font-size:13px; line-height:1.65;">
+                      <span style="color:#94a3b8; font-weight:600;">Hor&aacute;rios do Backup:</span> <strong style="color:#ffffff;">$tTime</strong><br/>
+                      <span style="color:#94a3b8; font-weight:600;">Computador Externo / Identifica&ccedil;&atilde;o:</span> <span style="color:#f1f5f9;">$tNetTerm</span> &bull;
+                      <span style="color:#94a3b8; font-weight:600;">Limpeza Autom&aacute;tica:</span> <span style="color:#a7f3d0;">mant&eacute;m as &uacute;ltimas $tRet c&oacute;pias</span><br/>
+                      <span style="color:#94a3b8; font-weight:600;">Onde os arquivos s&atilde;o salvos:</span>
                       $tDestList
                     </div>
                   </td>
@@ -2992,7 +3161,7 @@ function Send-WelcomeEmail {
 <head>
   <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MEC Shield Enterprise</title>
+  <title>MEC Shield Enterprise - Instala&ccedil;&atilde;o Conclu&iacute;da</title>
 </head>
 <body bgcolor="#090d16" style="margin:0; padding:0; background-color:#090d16; font-family:'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif; color:#f8fafc;">
   <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#090d16" style="background-color:#090d16; padding:25px 10px;">
@@ -3000,7 +3169,7 @@ function Send-WelcomeEmail {
       <td align="center">
         <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#111827" style="background-color:#111827; max-width:660px; border-radius:12px; overflow:hidden; border:1px solid #1e293b; box-shadow:0 20px 25px -5px rgba(0, 0, 0, 0.7);">
           
-          <!-- BANNER OFICIAL MEC (INLINE CID - 100% LIMPO E NITIDO) -->
+          <!-- BANNER OFICIAL MEC -->
           <tr>
             <td align="center" bgcolor="#0f172a" style="background-color:#0f172a; padding:0; margin:0; line-height:0;">
               <img src="cid:mec_header" alt="MEC Shield Enterprise" width="660" style="display:block; width:100%; max-width:660px; height:auto; border:0;" />
@@ -3010,17 +3179,21 @@ function Send-WelcomeEmail {
           <!-- FAIXA DE STATUS PRINCIPAL -->
           <tr>
             <td bgcolor="#10b981" style="background-color:#10b981; padding:13px 28px; color:#ffffff; font-size:14.5px; font-weight:800; letter-spacing:0.5px; text-transform:uppercase;">
-              &#9679; NOVA INSTALA&Ccedil;&Atilde;O FIBS &bull; MEC SHIELD ENTERPRISE ATIVADO COM SUCESSO
+              &#9679; INSTALA&Ccedil;&Atilde;O CONCLU&Iacute;DA &bull; BACKUP AUTOM&Aacute;TICO ATIVADO NO SERVIDOR
             </td>
           </tr>
 
-          <!-- INTRODUCAO EXECUTIVA DE BOAS-VINDAS -->
+          <!-- RESUMO SIMPLES E DIRETO NO TOPO -->
           <tr>
-            <td bgcolor="#111827" style="padding:24px 28px 12px 28px;">
-              <h2 style="margin:0 0 8px 0; color:#ffffff; font-size:21px; font-weight:700;">Seja bem-vindo ao novo padr&atilde;o corporativo de seguran&ccedil;a cont&iacute;nua</h2>
-              <p style="margin:0 0 14px 0; color:#cbd5e1; font-size:14px; line-height:1.65;">
-                A instala&ccedil;&atilde;o do sistema corporativo <strong style="color:#10b981;">FIBS MEC Shield Enterprise (v$($script:EngineVersion))</strong> foi conclu&iacute;da com &ecirc;xito neste servidor. Esta nova gera&ccedil;&atilde;o substitui integralmente as rotinas legadas e traz uma arquitetura avan&ccedil;ada de conting&ecirc;ncia concebida sob medida para o regime ininterrupto (24/7) de mot&eacute;is, blindando o banco de dados do <strong>Sismotel</strong> com prote&ccedil;&atilde;o em m&uacute;ltiplas camadas e sem nenhum impacto na agilidade da recep&ccedil;&atilde;o.
-              </p>
+            <td bgcolor="#111827" style="background-color:#111827; padding:18px 28px 8px 28px;">
+              <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#0f172a" style="background-color:#0f172a; border:1px solid #334155; border-left:6px solid #10b981; border-radius:8px;">
+                <tr><td style="padding:14px 18px 2px 18px; color:#34d399; font-size:12px; font-weight:800; letter-spacing:0.6px;">O QUE FOI FEITO AGORA</td></tr>
+                <tr><td style="padding:0 18px 12px 18px; color:#ffffff; font-size:15.5px; line-height:1.5;">O novo <strong>MEC Shield Enterprise (v$($script:EngineVersion))</strong> foi instalado no servidor <strong>$hostName</strong> e j&aacute; est&aacute; protegendo o banco de dados do <strong>Sismotel</strong> automaticamente.</td></tr>
+                <tr><td style="padding:2px 18px 2px 18px; color:#38bdf8; font-size:12px; font-weight:800; letter-spacing:0.6px;">COMO FUNCIONA NO DIA A DIA</td></tr>
+                <tr><td style="padding:0 18px 12px 18px; color:#e2e8f0; font-size:14.5px; line-height:1.5;">O backup roda sozinho em segundo plano (mesmo sem ningu&eacute;m logado no Windows) e <strong>n&atilde;o trava o Sismotel na recep&ccedil;&atilde;o</strong>. Tamb&eacute;m controla o espa&ccedil;o livre do HD apagando os arquivos mais antigos automaticamente.</td></tr>
+                <tr><td style="padding:2px 18px 2px 18px; color:#fbbf24; font-size:12px; font-weight:800; letter-spacing:0.6px;">QUANDO VOC&Ecirc; RECEBER&Aacute; NOVOS E-MAILS?</td></tr>
+                <tr><td style="padding:0 18px 14px 18px; color:#e2e8f0; font-size:14.5px; line-height:1.5;"><strong>Somente se acontecer algum problema</strong> (ex.: falha ao salvar o backup, HD ficando cheio ou computador externo desligado h&aacute; mais de 24 horas). Quando tudo est&aacute; funcionando bem, o sistema trabalha em sil&ecirc;ncio para n&atilde;o lotar sua caixa de entrada.</td></tr>
+              </table>
             </td>
           </tr>
 
@@ -3030,18 +3203,18 @@ function Send-WelcomeEmail {
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#38bdf8; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ IDENTIFICA&Ccedil;&Atilde;O &bull; ACESSO REMOTO ]</span>
+                    <span style="color:#38bdf8; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 1. DADOS DO CLIENTE E ACESSO REMOTO ]</span>
                   </td>
                 </tr>
                 <tr>
                   <td bgcolor="#1e293b" style="background-color:#1e293b; padding:16px 18px;">
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#ffffff;">
                       <tr>
-                        <td width="36%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Cliente / Empresa:</td>
+                        <td width="36%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Cliente / Motel:</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:16px;">$clientNameHtml</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Servidor / Hostname:</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Nome do Servidor:</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-weight:700; color:#38bdf8; font-size:14.5px;">$hostName</td>
                       </tr>
                       <tr>
@@ -3053,12 +3226,12 @@ function Send-WelcomeEmail {
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0;">$($remoteBadges.TeamViewer)</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Data de Ativa&ccedil;&atilde;o:</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Data da Instala&ccedil;&atilde;o:</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#cbd5e1; font-size:13.5px;">$timestampNow</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Edi&ccedil;&atilde;o / Vers&atilde;o:</td>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#34d399; font-weight:700; font-size:13.5px;">v$($script:EngineVersion) &bull; Enterprise Shield</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Vers&atilde;o Instalada:</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#34d399; font-weight:700; font-size:13.5px;">v$($script:EngineVersion) &bull; MEC Shield Enterprise</td>
                       </tr>
                     </table>
                   </td>
@@ -3067,96 +3240,38 @@ function Send-WelcomeEmail {
             </td>
           </tr>
 
-          <!-- CARD 2: COMPARATIVO DE EVOLUCAO (O QUE MUDA DO FIBS LEGADO) -->
-          <tr>
-            <td bgcolor="#111827" style="background-color:#111827; padding:8px 28px;">
-              <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
-                <tr>
-                  <td bgcolor="#0f172a" style="background-color:#0f172a; padding:12px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#fbbf24; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ DIFERENCIAIS TECNOL&Oacute;GICOS &bull; EVOLU&Ccedil;&Atilde;O vs. FIBS LEGADO ]</span>
-                  </td>
-                </tr>
-                <tr>
-                  <td bgcolor="#1e293b" style="background-color:#1e293b; padding:14px 16px 12px 16px;">
-                    <p style="margin:0 0 12px 0; color:#cbd5e1; font-size:13px; line-height:1.6;">
-                      Diferente das ferramentas e rotinas b&aacute;sicas do passado (como o <strong>FIBS antigo / Phobibs</strong>), que se limitavam a c&oacute;pias simples e com risco de congelamento na recep&ccedil;&atilde;o, o <strong style="color:#ffffff;">MEC Shield Enterprise</strong> entrega engenharia moderna de alta disponibilidade:
-                    </p>
-                    
-                    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse; margin-bottom:4px;">
-                      <tr bgcolor="#0f172a">
-                        <td width="26%" style="padding:8px 10px; border:1px solid #334155; color:#94a3b8; font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">Recurso / Pilar</td>
-                        <td width="37%" style="padding:8px 10px; border:1px solid #334155; color:#f87171; font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">FIBS Antigo (Legado)</td>
-                        <td width="37%" style="padding:8px 10px; border:1px solid #334155; color:#34d399; font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">MEC Shield Enterprise</td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
-                          Impacto no Sismotel / Recep&ccedil;&atilde;o
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#94a3b8; font-size:11.5px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
-                          <span style="color:#f87171; font-weight:bold;">&#10006; Risco de Travamento:</span> C&oacute;pias com reten&ccedil;&atilde;o ou disputa de I/O, causando lentid&atilde;o e travamentos ao fechar contas ou entrar su&iacute;tes.
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:11.5px; line-height:1.5; vertical-align:top; background-color:#132338;">
-                          <span style="color:#34d399; font-weight:bold;">&#10004; Zero-Lock Hot-Backup:</span> Extra&ccedil;&atilde;o online oficial GBAK com prioridade CPU <em>BelowNormal</em>. 100% invis&iacute;vel, sem travar a recep&ccedil;&atilde;o.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
-                          Auditoria de Integridade F&iacute;sica
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#94a3b8; font-size:11.5px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
-                          <span style="color:#f87171; font-weight:bold;">&#10006; C&oacute;pia Cega:</span> Copiava arquivos sem validar a sa&uacute;de interna. Se o banco corrompesse, o backup nascia corrompido sem aviso.
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:11.5px; line-height:1.5; vertical-align:top; background-color:#132338;">
-                          <span style="color:#34d399; font-weight:bold;">&#10004; Sandbox Di&aacute;ria (03:30h):</span> Restaura e valida p&aacute;ginas f&iacute;sicas (<em>gfix -v -full</em>) e Transaction Gap em ambiente isolado toda madrugada.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
-                          Conting&ecirc;ncia Externa 24h
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#94a3b8; font-size:11.5px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
-                          <span style="color:#f87171; font-weight:bold;">&#10006; Falha Silenciosa:</span> Se a m&aacute;quina remota desligasse ou o compartilhamento ca&iacute;sse, ficava semanas sem backup externo sem avisar.
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:11.5px; line-height:1.5; vertical-align:top; background-color:#132338;">
-                          <span style="color:#34d399; font-weight:bold;">&#10004; Watchdog Universal 24h:</span> Monitora em tempo real caminhos UNC e unidades mapeadas. Alerta com diagn&oacute;stico se passar 24h sem nova c&oacute;pia.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
-                          Atualiza&ccedil;&otilde;es e Manuten&ccedil;&atilde;o
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#94a3b8; font-size:11.5px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
-                          <span style="color:#f87171; font-weight:bold;">&#10006; Script Est&aacute;tico:</span> Exigia visita presencial de t&eacute;cnico ou acessos remotos trabalhosos para atualizar cada servidor manualmente.
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:11.5px; line-height:1.5; vertical-align:top; background-color:#132338;">
-                          <span style="color:#34d399; font-weight:bold;">&#10004; MEC LiveUpdate em Nuvem:</span> Integra&ccedil;&atilde;o cont&iacute;nua via CDN GitHub corporativa; atualiza em segundo plano de forma autom&aacute;tica e segura.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
-                          Pol&iacute;tica de Comunica&ccedil;&atilde;o
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#94a3b8; font-size:11.5px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
-                          <span style="color:#f87171; font-weight:bold;">&#10006; Spam ou Omiss&atilde;o:</span> Lotava a caixa de entrada com dezenas de mensagens vazias ou n&atilde;o avisava quando o banco parava de verdade.
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:11.5px; line-height:1.5; vertical-align:top; background-color:#132338;">
-                          <span style="color:#34d399; font-weight:bold;">&#10004; Pol&iacute;tica Zero-Spam:</span> Rotinas de sucesso s&atilde;o 100% silenciosas; alertas imediatos apenas em falhas reais com cooldown de 12h.
-                        </td>
-                      </tr>
-                    </table>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-
-          <!-- CARD 3: TAREFAS CONFIGURADAS -->
+          <!-- CARD 2: BANCO DE DADOS E HDs DETECTADOS NO SERVIDOR -->
           <tr>
             <td bgcolor="#111827" style="background-color:#111827; padding:8px 28px;">
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#34d399; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ TAREFAS E AGENDAMENTOS CONFIGURADOS ]</span>
+                    <span style="color:#a78bfa; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 2. HDs, ESPA&Ccedil;O LIVRE E BANCO DE DADOS DETECTADOS ]</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td bgcolor="#1e293b" style="background-color:#1e293b; padding:14px 16px; border-bottom:1px solid #334155;">
+                    <div style="color:#94a3b8; font-size:12px; font-weight:700; text-transform:uppercase; margin-bottom:6px;">Banco de Dados do Sismotel Protegido:</div>
+                    $($srvInventory.DbInfoHtml)
+                  </td>
+                </tr>
+                $($srvInventory.DisksHtml)
+                <tr>
+                  <td bgcolor="#0f172a" style="background-color:#0f172a; padding:10px 16px; color:#94a3b8; font-size:12px; line-height:1.5;">
+                    &#128737; <strong>Prote&ccedil;&atilde;o autom&aacute;tica de espa&ccedil;o:</strong> O sistema preserva sempre pelo menos <strong>8 GB livres</strong> no disco onde roda o Sismotel e <strong>5 GB livres</strong> nos demais discos, limpando backups antigos antes que o HD encha.
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- CARD 3: TAREFAS E HORARIOS CONFIGURADOS -->
+          <tr>
+            <td bgcolor="#111827" style="background-color:#111827; padding:8px 28px;">
+              <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
+                <tr>
+                  <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
+                    <span style="color:#34d399; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 3. ROTINAS DE BACKUP CONFIGURADAS NESTE SERVIDOR ]</span>
                   </td>
                 </tr>
                 $tasksHtml
@@ -3164,18 +3279,94 @@ function Send-WelcomeEmail {
             </td>
           </tr>
 
-          <!-- CARD 4: COMPROMISSO DE CONTINUIDADE OPERACIONAL -->
+          <!-- CARD 4: BENEFICIOS REAIS (O QUE MUDOU DO FIBS ANTIGO PARA O NOVO) -->
           <tr>
             <td bgcolor="#111827" style="background-color:#111827; padding:8px 28px 20px 28px;">
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
                 <tr>
-                  <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#10b981; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ SEGURAN&Ccedil;A PATRIMONIAL &bull; OPERA&Ccedil;&Atilde;O 24/7 ]</span>
+                  <td bgcolor="#0f172a" style="background-color:#0f172a; padding:12px 16px; border-bottom:1px solid #334155;">
+                    <span style="color:#fbbf24; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 4. O QUE MUDOU NA PR&Aacute;TICA: FIBS ANTIGO vs. MEC SHIELD ]</span>
                   </td>
                 </tr>
                 <tr>
-                  <td bgcolor="#1e293b" style="background-color:#1e293b; padding:16px 18px; font-size:13.5px; color:#e2e8f0; line-height:1.7;">
-                    Seus dados de faturamento, ocupa&ccedil;&atilde;o de su&iacute;tes, controle de estoque e registros fiscais do <strong>Sismotel</strong> agora est&atilde;o sob a cust&oacute;dia de um motor de conting&ecirc;ncia avan&ccedil;ado. Em caso de necessidade de suporte t&eacute;cnico, nossa equipe possui os canais de conex&atilde;o remota catalogados acima para pronto atendimento.
+                  <td bgcolor="#1e293b" style="background-color:#1e293b; padding:14px 16px 14px 16px;">
+                    <p style="margin:0 0 12px 0; color:#cbd5e1; font-size:13.5px; line-height:1.55;">
+                      Veja de forma simples as fun&ccedil;&otilde;es reais que foram adicionadas em rela&ccedil;&atilde;o ao FIBS antigo:
+                    </p>
+                    
+                    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse; margin-bottom:4px;">
+                      <tr bgcolor="#0f172a">
+                        <td width="26%" style="padding:8px 10px; border:1px solid #334155; color:#94a3b8; font-size:11px; font-weight:800; text-transform:uppercase;">Fun&ccedil;&atilde;o</td>
+                        <td width="35%" style="padding:8px 10px; border:1px solid #334155; color:#f87171; font-size:11px; font-weight:800; text-transform:uppercase;">Como era no FIBS Antigo</td>
+                        <td width="39%" style="padding:8px 10px; border:1px solid #334155; color:#34d399; font-size:11px; font-weight:800; text-transform:uppercase;">Como funciona agora</td>
+                      </tr>
+                      <tr>
+                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
+                          Funcionamento sem usu&aacute;rio logado
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
+                          Dependia do programa aberto na tela. Se o PC reiniciasse e ficasse na tela de senha, o backup parava.
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
+                          <span style="color:#34d399; font-weight:bold;">&#10004; Roda como Servi&ccedil;o do Windows:</span> Funciona sozinho em segundo plano, mesmo que o servidor reinicie de madrugada.
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
+                          Desempenho na Recep&ccedil;&atilde;o
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
+                          Usava prioridade normal do processador, podendo deixar o Sismotel lento na hora de compactar.
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
+                          <span style="color:#34d399; font-weight:bold;">&#10004; Prioridade Leve:</span> Roda em modo leve para n&atilde;o pesar no Sismotel durante o fechamento de contas.
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
+                          Controle de HD e Espa&ccedil;o Livre
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
+                          N&atilde;o verificava a sa&uacute;de do HD nem o espa&ccedil;o livre antes de iniciar o backup.
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
+                          <span style="color:#34d399; font-weight:bold;">&#10004; Monitora HD, Espa&ccedil;o e Google Drive:</span> Apaga backups antigos sozinho, avisa se o HD apresentar defeito f&iacute;sico e gerencia o limite de 15 GB do Google Drive.
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
+                          C&oacute;pia em Outro PC da Rede
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
+                          Fazia apenas uma tentativa simples; se o outro PC estivesse desligado ou pedisse senha, falhava sem plano reserva.
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
+                          <span style="color:#34d399; font-weight:bold;">&#10004; 3 Tentativas de Rede + Reserva Local:</span> Tenta pelo sistema, pela senha configurada e pelo usu&aacute;rio logado. Se o outro PC estiver desligado, guarda c&oacute;pia de seguran&ccedil;a e avisa ap&oacute;s 24h.
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
+                          Teste se o Backup Abre de Verdade
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
+                          Apenas criava o arquivo compactado, sem testar se o banco dentro dele estava corrompido.
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
+                          <span style="color:#34d399; font-weight:bold;">&#10004; Teste Di&aacute;rio de Restaura&ccedil;&atilde;o (03:30):</span> Confere cada arquivo salvo e toda madrugada faz uma restaura&ccedil;&atilde;o de teste em pasta separada para garantir que o backup abre sem erro.
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
+                          Envio de E-mails e Atualiza&ccedil;&atilde;o
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
+                          Exigia atualiza&ccedil;&atilde;o manual computador por computador e mandava mensagens pouco claras.
+                        </td>
+                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
+                          <span style="color:#34d399; font-weight:bold;">&#10004; Avisos Claros e Atualiza&ccedil;&atilde;o Autom&aacute;tica:</span> S&oacute; envia e-mail quando precisa de aten&ccedil;&atilde;o (explicando a causa e o que fazer) e recebe melhorias automaticamente.
+                        </td>
+                      </tr>
+                    </table>
                   </td>
                 </tr>
               </table>
@@ -3243,6 +3434,63 @@ function Send-WelcomeEmail {
     }
 }
 
+# Traduz a mensagem tecnica de falha de rede/destino em um resumo claro e humano
+# para quem recebe o e-mail (sem precisar entender termos como UNC, SYSTEM ou sessao).
+function Format-NetworkFailureForEmail {
+    param(
+        [string]$RawReason,
+        [string]$RawDestination,
+        [string]$UncHost,
+        [string]$TerminalName,
+        [bool]$IsLocalServerDest
+    )
+    $alvoLabel = if (-not [string]::IsNullOrWhiteSpace($TerminalName)) { ConvertTo-HtmlSafe $TerminalName } elseif (-not [string]::IsNullOrWhiteSpace($UncHost)) { $UncHost } else { "computador de destino" }
+    $pcRede = if (-not [string]::IsNullOrWhiteSpace($UncHost)) { " (<code>\\$UncHost</code>)" } else { "" }
+    $destSafe = ConvertTo-HtmlSafe $RawDestination
+
+    $resumoCausa = ""
+    $acaoAgora = ""
+
+    if ($IsLocalServerDest) {
+        if ($RawReason -match "GBAK|Banco") {
+            $resumoCausa = "O backup n&atilde;o p&ocirc;de ser gerado porque houve erro ao ler o banco de dados do Sismotel."
+            $acaoAgora = "Acessar o servidor via AnyDesk/TeamViewer e verificar o servi&ccedil;o do Firebird e o log da tarefa."
+        } elseif ($RawReason -match "Espaco|cheio|insuficiente|disk is full") {
+            $resumoCausa = "O disco local onde fica a pasta <code>$destSafe</code> est&aacute; sem espa&ccedil;o livre suficiente."
+            $acaoAgora = "Acessar o servidor e liberar espa&ccedil;o no disco onde os backups s&atilde;o salvos."
+        } else {
+            $resumoCausa = "A pasta local <code>$destSafe</code> no servidor n&atilde;o recebeu novos arquivos de backup."
+            $acaoAgora = "Acessar o servidor, abrir o painel do MEC Shield e clicar em Executar Agora para testar a grava&ccedil;&atilde;o."
+        }
+    } else {
+        if ($RawReason -match "Acesso negado|Access is denied|permissao|recusou a gravacao|bloqueou") {
+            $resumoCausa = "O computador <strong>$alvoLabel</strong>$pcRede est&aacute; ligado na rede, mas a pasta compartilhada <code>$destSafe</code> bloqueou a grava&ccedil;&atilde;o (falta permiss&atilde;o de leitura/grava&ccedil;&atilde;o ou a senha de rede mudou)."
+            $acaoAgora = "No computador <strong>$alvoLabel</strong>, liberar permiss&atilde;o de Grava&ccedil;&atilde;o/Modificar na pasta compartilhada ou atualizar a senha de rede no painel do MEC Shield."
+        } elseif ($RawReason -match "Google Drive|Unidade mapeada|unidade do usuario|nao existe na sessao") {
+            $resumoCausa = "A unidade externa ou Google Drive (<code>$destSafe</code>) est&aacute; desconectada ou fechada no servidor."
+            $acaoAgora = "Acessar o servidor e confirmar se o aplicativo do Google Drive (ou HD externo) est&aacute; aberto e conectado."
+        } elseif ($RawReason -match "Espaco|cheio|insuficiente|disk is full") {
+            $resumoCausa = "O HD do computador externo <strong>$alvoLabel</strong>$pcRede est&aacute; cheio e n&atilde;o tem espa&ccedil;o para receber novos backups."
+            $acaoAgora = "Liberar espa&ccedil;o no disco do computador <strong>$alvoLabel</strong>."
+        } elseif ($RawReason -match "caminho da rede|inacessivel|nao abre nem para este usuario|nao respondeu ao ping|network path was not found|nao foi encontrado") {
+            $resumoCausa = "O computador <strong>$alvoLabel</strong>$pcRede n&atilde;o foi encontrado na rede (pode estar desligado, com cabo de rede desconectado, com nome alterado ou a pasta deixou de ser compartilhada)."
+            $acaoAgora = "Verificar se o computador <strong>$alvoLabel</strong> est&aacute; ligado na rede e se a pasta <code>$destSafe</code> abre normalmente no Windows Explorer do servidor."
+        } elseif (-not [string]::IsNullOrWhiteSpace($RawReason)) {
+            $resumoCausa = "N&atilde;o foi poss&iacute;vel acessar ou gravar na pasta externa <code>$destSafe</code> no computador <strong>$alvoLabel</strong>$pcRede."
+            $acaoAgora = "Verificar se o computador <strong>$alvoLabel</strong> est&aacute; ligado e se a pasta <code>$destSafe</code> abre no Windows Explorer do servidor."
+        } else {
+            $resumoCausa = "A pasta externa <code>$destSafe</code> (<strong>$alvoLabel</strong>) n&atilde;o recebe novas c&oacute;pias de backup."
+            $acaoAgora = "Verificar se o computador <strong>$alvoLabel</strong> est&aacute; ligado e conectado na rede."
+        }
+    }
+
+    return (New-Object PSObject -Property @{
+        ResumoCausa = $resumoCausa
+        AcaoAgora   = $acaoAgora
+        AlvoLabel   = $alvoLabel
+    })
+}
+
 function Send-NetworkFailureAlert {
     param (
         [string]$Destination,
@@ -3280,35 +3528,84 @@ function Send-NetworkFailureAlert {
         $timestampNow = Get-Date -Format 'dd/MM/yyyy HH:mm:ss'
 
         $rawDestination = "$Destination".Trim()
+        $rawFailureReason = "$FailureReason".Trim()
         $isLocalServerDest = (-not $rawDestination.StartsWith("\\")) -and (-not (Test-IsGoogleDrivePath -Path $rawDestination))
         $uncHost = if ($rawDestination -match '^\\\\([^\\\/]+)') { ConvertTo-HtmlSafe $matches[1] } else { "" }
 
+        # Busca o ultimo backup local valido no servidor e o espaco livre para tranquilizar e informar quem le
+        $ultimoLocalTxt = ""
+        $espacoServidorTxt = ""
+        try {
+            $allLocalDests = @()
+            if ($null -ne $global:configData.Tasks) {
+                foreach ($tk in @($global:configData.Tasks)) {
+                    if ($null -ne $tk.Destinations) {
+                        foreach ($dItem in @($tk.Destinations)) {
+                            if (-not [string]::IsNullOrWhiteSpace($dItem) -and -not "$dItem".Trim().StartsWith("\\")) {
+                                $allLocalDests += "$dItem".Trim()
+                            }
+                        }
+                    }
+                }
+            }
+            $prefPrefix = if (-not [string]::IsNullOrWhiteSpace($pref.BackupFilePrefix)) { "$($pref.BackupFilePrefix)" } else { "BKP_SISMOTEL" }
+            $ultimoLocalTxt = Get-LastGoodBackupText -Prefix $prefPrefix -Destinations $allLocalDests
+        } catch {}
+        try {
+            $drvCheck = if ($allLocalDests.Count -gt 0) { [System.IO.Path]::GetPathRoot($allLocalDests[0]) } else { "C:\" }
+            if (-not [string]::IsNullOrWhiteSpace($drvCheck)) {
+                $dInf = New-Object System.IO.DriveInfo($drvCheck)
+                if ($dInf.IsReady) {
+                    $fGB = [Math]::Round($dInf.AvailableFreeSpace / 1GB, 1)
+                    $tGB = [Math]::Round($dInf.TotalSize / 1GB, 1)
+                    $espacoServidorTxt = "$drvCheck ($fGB GB livres de $tGB GB)"
+                }
+            }
+        } catch {}
+        $ultimoLocalHtml = ConvertTo-HtmlSafe $ultimoLocalTxt
+        $espacoServidorHtml = ConvertTo-HtmlSafe $espacoServidorTxt
+
         $clientNameHtml = ConvertTo-HtmlSafe $clientName
         $TaskNameHtml = ConvertTo-HtmlSafe $TaskName
-        $TerminalNameHtml = if ([string]::IsNullOrWhiteSpace($TerminalName)) { "(n&atilde;o definido nas credenciais)" } else { ConvertTo-HtmlSafe $TerminalName }
+        $TerminalNameHtml = if ([string]::IsNullOrWhiteSpace($TerminalName)) { "(n&atilde;o informado)" } else { ConvertTo-HtmlSafe $TerminalName }
         $Destination = ConvertTo-HtmlSafe $Destination
         $FailureReason = ConvertTo-HtmlSafe $FailureReason
+
+        $netInfo = Format-NetworkFailureForEmail -RawReason $rawFailureReason -RawDestination $rawDestination -UncHost $uncHost -TerminalName $TerminalName -IsLocalServerDest $isLocalServerDest
+
         $pingStepHtml = if (-not [string]::IsNullOrWhiteSpace($uncHost)) {
-            "Abrir o CMD no servidor e executar <code>ping $uncHost</code>."
+            "Confirmar se o computador <strong>$uncHost</strong> est&aacute; ligado na recep&ccedil;&atilde;o/escrit&oacute;rio e conectado na rede (voc&ecirc; pode testar abrindo o CMD no servidor e digitando <code>ping $uncHost</code>)."
         } else {
-            "Confirmar no Explorer do servidor se a unidade e a pasta <code>$Destination</code> est&atilde;o conectadas e acess&iacute;veis."
+            "Confirmar no Windows Explorer do servidor se a unidade e a pasta <code>$Destination</code> est&atilde;o conectadas e abrindo normalmente."
         }
         $daysStr = if ($DelayHours -ge 24) { "$([Math]::Floor($DelayHours / 24)) dia(s) e $($DelayHours % 24)h" } else { "${DelayHours}h" }
         $urgencyColor = if ($DelayHours -ge 48) { "#b91c1c" } elseif ($DelayHours -ge 24) { "#dc2626" } else { "#d97706" }
         $urgencyLabel = if ($DelayHours -ge 48) {
-            if ($isLocalServerDest) { "URGENTE - MAIS DE 2 DIAS SEM BACKUP LOCAL" } else { "URGENTE - MAIS DE 2 DIAS" }
+            if ($isLocalServerDest) { "URGENTE - MAIS DE 2 DIAS SEM BACKUP LOCAL" } else { "ATEN&Ccedil;&Atilde;O - MAIS DE 2 DIAS SEM C&Oacute;PIA EXTERNA" }
         } elseif ($DelayHours -ge 24) {
-            if ($isLocalServerDest) { "ATENCAO - 24H SEM BACKUP LOCAL" } else { "ATENCAO - 24H SEM COPIA EXTERNA" }
+            if ($isLocalServerDest) { "ATEN&Ccedil;&Atilde;O - 24H SEM BACKUP LOCAL" } else { "ATEN&Ccedil;&Atilde;O - 24H SEM C&Oacute;PIA EXTERNA" }
         } else {
-            "PREVENTIVO - MONITORANDO"
+            "AVISO PREVENTIVO"
         }
-        $bannerSubtitle = if ($isLocalServerDest) { "BACKUP LOCAL PENDENTE" } else { "BACKUP EXTERNO PENDENTE" }
-        $introHeading = if ($isLocalServerDest) { "Destino Local Sem Backup h&aacute; $daysStr" } else { "Destino Externo Sem C&oacute;pia h&aacute; $daysStr" }
-        $introBodyHtml = if ($isLocalServerDest) {
-            "O FIBS detectou que a pasta local de backup no servidor est&aacute; <strong style='color:#ef4444;'>sem receber novos backups h&aacute; $daysStr</strong>. Verifique se o servi&ccedil;o e o agendador est&atilde;o ativos e se h&aacute; espa&ccedil;o livre no disco."
+        $bannerSubtitle = if ($isLocalServerDest) { "PASTA LOCAL SEM NOVO BACKUP" } else { "COMPUTADOR EXTERNO INACESS&Iacute;VEL NA REDE" }
+
+        # Resumo de 3 perguntas no topo (claro e direto para qualquer pessoa entender em 5 segundos)
+        $topoAconteceu = if ($isLocalServerDest) {
+            "A pasta local <code>$Destination</code> no servidor <strong>$hostName</strong> est&aacute; sem receber novos backups h&aacute; <strong>$daysStr</strong>. $($netInfo.ResumoCausa)"
         } else {
-            "O FIBS detectou que a c&oacute;pia de conting&ecirc;ncia para o destino listado abaixo est&aacute; <strong style='color:#ef4444;'>interrompida h&aacute; $daysStr</strong>. Esta ferramenta &eacute; respons&aacute;vel por salvar o motel caso ocorra sinistro ou parada no servidor. A c&oacute;pia de emerg&ecirc;ncia externa precisa de aten&ccedil;&atilde;o t&eacute;cnica imediata."
+            "Faz <strong>$daysStr</strong> que o servidor n&atilde;o consegue enviar a c&oacute;pia extra do backup para a pasta <code>$Destination</code>. $($netInfo.ResumoCausa)"
         }
+
+        $topoSeguroCor = if ($isLocalServerDest -or ($rawFailureReason -match "GBAK|Banco")) { "#fecaca" } else { "#a7f3d0" }
+        $topoSeguro = if ($rawFailureReason -match "GBAK|Banco") {
+            "<strong>ATEN&Ccedil;&Atilde;O:</strong> O banco de dados do Sismotel apresentou erro durante a leitura do backup e precisa ser verificado pela equipe t&eacute;cnica."
+        } elseif ($isLocalServerDest) {
+            "<strong>ATEN&Ccedil;&Atilde;O:</strong> Esta pasta local do servidor n&atilde;o est&aacute; recebendo arquivos novos h&aacute; $daysStr." + $(if ($ultimoLocalHtml) { " &Uacute;ltimo backup salvo no servidor: <strong>$ultimoLocalHtml</strong>." } else { "" })
+        } else {
+            "<strong>SIM, NO SERVIDOR PRINCIPAL EST&Aacute; 100% SEGURO.</strong> Os backups principais continuam sendo salvos normalmente dentro do servidor <strong>$hostName</strong>" + $(if ($ultimoLocalHtml) { " (&uacute;ltimo backup salvo: <strong>$ultimoLocalHtml</strong>)" } else { "" }) + ". O problema &eacute; <strong>somente na c&oacute;pia extra</strong> para o outro computador."
+        }
+
+        $topoFazer = $netInfo.AcaoAgora
 
         $htmlBody = @"
 <!DOCTYPE html>
@@ -3338,196 +3635,140 @@ function Send-NetworkFailureAlert {
             </td>
           </tr>
 
-          <!-- INTRODUCAO -->
+          <!-- QUADRO RESUMO NO TOPO (3 RESPOSTAS CLARAS E DIRETAS) -->
           <tr>
-            <td bgcolor="#111827" style="padding:22px 28px 10px 28px;">
-              <h2 style="margin:0 0 6px 0; color:#fef2f2; font-size:20px; font-weight:700;">$introHeading</h2>
-              <p style="margin:0; color:#cbd5e1; font-size:14px; line-height:1.65;">
-                $introBodyHtml
-              </p>
+            <td bgcolor="#111827" style="background-color:#111827; padding:18px 28px 8px 28px;">
+              <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#0f172a" style="background-color:#0f172a; border:1px solid #334155; border-left:6px solid $urgencyColor; border-radius:8px;">
+                <tr><td style="padding:14px 18px 2px 18px; color:#94a3b8; font-size:12px; font-weight:800; letter-spacing:0.6px;">O QUE ACONTECEU</td></tr>
+                <tr><td style="padding:0 18px 12px 18px; color:#ffffff; font-size:15.5px; line-height:1.55;">$topoAconteceu</td></tr>
+                <tr><td style="padding:2px 18px 2px 18px; color:#94a3b8; font-size:12px; font-weight:800; letter-spacing:0.6px;">O BACKUP DO MOTEL EST&Aacute; SEGURO?</td></tr>
+                <tr><td style="padding:0 18px 12px 18px; color:$topoSeguroCor; font-size:15.5px; line-height:1.55;">$topoSeguro</td></tr>
+                <tr><td style="padding:2px 18px 2px 18px; color:#94a3b8; font-size:12px; font-weight:800; letter-spacing:0.6px;">O QUE FAZER AGORA</td></tr>
+                <tr><td style="padding:0 18px 14px 18px; color:#ffffff; font-size:15.5px; line-height:1.55;">$topoFazer</td></tr>
+              </table>
             </td>
           </tr>
 
-          <!-- CARD 1: IDENTIFICACAO DO PROBLEMA -->
+          <!-- CARD 1: DADOS DO CLIENTE, ACESSO REMOTO E DIAGNOSTICO -->
           <tr>
             <td bgcolor="#111827" style="padding:8px 28px;">
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border-radius:8px; border:1px solid #334155; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#f59e0b; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ IDENTIFICA&Ccedil;&Atilde;O DO PROBLEMA ]</span>
+                    <span style="color:#38bdf8; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 1. DADOS DO CLIENTE E DIAGN&Oacute;STICO DO DESTINO ]</span>
                   </td>
                 </tr>
                 <tr>
                   <td bgcolor="#1e293b" style="padding:16px 18px;">
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#ffffff;">
                       <tr>
-                        <td width="36%" bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Cliente / Empresa:</td>
-                        <td bgcolor="#1e293b" style="padding:7px 0; font-weight:800; color:#ffffff; font-size:16px;">$clientNameHtml</td>
+                        <td width="38%" bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;">Cliente / Motel:</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; font-weight:800; color:#ffffff; font-size:16px;">$clientNameHtml</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Servidor / Hostname:</td>
-                        <td bgcolor="#1e293b" style="padding:7px 0; font-family:Consolas,monospace; font-weight:700; color:#38bdf8; font-size:14.5px;">$hostName</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;">Servidor Principal:</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; font-family:Consolas,monospace; font-weight:700; color:#38bdf8; font-size:14.5px;">$hostName</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Tarefa Afetada:</td>
-                        <td bgcolor="#1e293b" style="padding:7px 0; font-weight:700; color:#f1f5f9; font-size:15px;">$TaskNameHtml</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;">AnyDesk do Servidor:</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0;">$($remoteBadges.AnyDesk)</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Terminal Configurado:</td>
-                        <td bgcolor="#1e293b" style="padding:7px 0; font-weight:700; color:#fbbf24; font-size:14.5px;">$TerminalNameHtml</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;">TeamViewer do Servidor:</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0;">$($remoteBadges.TeamViewer)</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Caminho do Destino:</td>
-                        <td bgcolor="#1e293b" style="padding:7px 0; font-family:Consolas,monospace; font-size:12.5px; color:#fca5a5; word-break:break-all;">$Destination</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;">Rotina / Tarefa:</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; font-weight:700; color:#f1f5f9; font-size:14.5px;">$TaskNameHtml</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Tempo sem C&oacute;pia:</td>
-                        <td bgcolor="#1e293b" style="padding:7px 0; font-weight:800; color:#ef4444; font-size:16px;">$daysStr</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;">Computador de Destino:</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; font-weight:700; color:#fbbf24; font-size:14.5px;">$TerminalNameHtml $(if ($uncHost) { "<span style='color:#94a3b8; font-family:Consolas,monospace; font-size:13px;'>(\\$uncHost)</span>" })</td>
                       </tr>
-                      $(if ($FailureReason) {
+                      <tr>
+                        <td bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;">Pasta que N&atilde;o Abre:</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; font-family:Consolas,monospace; font-size:13px; color:#fca5a5; word-break:break-all;">$Destination</td>
+                      </tr>
+                      <tr>
+                        <td bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;">Tempo sem C&oacute;pia Externa:</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; font-weight:800; color:#ef4444; font-size:15.5px;">$daysStr</td>
+                      </tr>
+                      $(if ($ultimoLocalHtml) {
                       "<tr>
-                        <td bgcolor='#1e293b' style='padding:7px 0; color:#94a3b8; font-weight:600;'>Causa Identificada:</td>
-                        <td bgcolor='#1e293b' style='padding:7px 0; font-weight:700; color:#fbbf24; font-size:13.5px;'>$FailureReason</td>
+                        <td bgcolor='#1e293b' style='padding:6px 0; color:#94a3b8; font-weight:600;'>&Uacute;ltimo Backup no Servidor:</td>
+                        <td bgcolor='#1e293b' style='padding:6px 0; color:#34d399; font-weight:700; font-size:13.5px;'>&#10004; $ultimoLocalHtml</td>
+                      </tr>"
+                      })
+                      $(if ($espacoServidorHtml) {
+                      "<tr>
+                        <td bgcolor='#1e293b' style='padding:6px 0; color:#94a3b8; font-weight:600;'>Espa&ccedil;o Livre no Servidor:</td>
+                        <td bgcolor='#1e293b' style='padding:6px 0; font-family:Consolas,monospace; color:#cbd5e1; font-size:13.5px;'>$espacoServidorHtml</td>
                       </tr>"
                       })
                       <tr>
-                        <td bgcolor="#1e293b" style="padding:7px 0; color:#94a3b8; font-weight:600;">Data deste Alerta:</td>
-                        <td bgcolor="#1e293b" style="padding:7px 0; color:#cbd5e1; font-size:13.5px;">$timestampNow</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;" valign="top">Motivo Identificado:</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; color:#fde68a; font-size:13.5px; line-height:1.5;">$($netInfo.ResumoCausa)</td>
+                      </tr>
+                      <tr>
+                        <td bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;">Data deste Aviso:</td>
+                        <td bgcolor="#1e293b" style="padding:6px 0; color:#cbd5e1; font-size:13.5px;">$timestampNow</td>
                       </tr>
                     </table>
+                    $(if ($FailureReason) {
+                    "<div style='margin-top:12px; padding:10px 12px; background-color:#0f172a; border:1px solid #334155; border-radius:6px;'>
+                      <div style='color:#94a3b8; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px;'>Detalhe t&eacute;cnico do teste (para o suporte):</div>
+                      <div style='color:#cbd5e1; font-family:Consolas,monospace; font-size:12px; line-height:1.5; word-break:break-word;'>$FailureReason</div>
+                    </div>"
+                    })
                   </td>
                 </tr>
               </table>
             </td>
           </tr>
 
-          <!-- CARD 2: ESTADO DO SERVIDOR LOCAL -->
-          $(if ($FailureReason -match "GBAK|Banco") {
-          "<tr>
-            <td bgcolor='#111827' style='padding:8px 28px;'>
-              <div style='background-color:#450a0a; border:1px solid #7f1d1d; border-left:4px solid #ef4444; border-radius:8px; padding:14px 18px; font-size:14px; color:#fca5a5; line-height:1.65;'>
-                <strong style='color:#f87171; font-size:15px;'>&#9888; ATEN&Ccedil;&Atilde;O: FALHA NA EXTRA&Ccedil;&Atilde;O DO BANCO DE DADOS</strong><br/>
-                <div style='margin-top:6px; color:#fee2e2;'>
-                  O backup n&atilde;o p&ocirc;de ser gerado porque a ferramenta gbak.exe encontrou erros no banco de dados Sismotel. O banco necessita de valida&ccedil;&atilde;o de integridade da equipe t&eacute;cnica MEC.
-                </div>
-              </div>
-            </td>
-          </tr>"
-          } elseif ($isLocalServerDest) {
-          "<tr>
-            <td bgcolor='#111827' style='padding:8px 28px;'>
-              <div style='background-color:#450a0a; border:1px solid #7f1d1d; border-left:4px solid #ef4444; border-radius:8px; padding:14px 18px; font-size:14px; color:#fca5a5; line-height:1.65;'>
-                <strong style='color:#f87171; font-size:15px;'>&#9888; ATEN&Ccedil;&Atilde;O: PASTA LOCAL DO SERVIDOR SEM NOVOS BACKUPS</strong><br/>
-                <div style='margin-top:6px; color:#fee2e2;'>
-                  A pasta local <strong>$Destination</strong> no servidor <strong>$hostName</strong> n&atilde;o recebe um novo arquivo de backup h&aacute; <strong>$daysStr</strong>. Verifique se o servi&ccedil;o <code>MEC Shield Service</code> est&aacute; em execu&ccedil;&atilde;o, se h&aacute; espa&ccedil;o livre no disco e consulte o log da tarefa.
-                </div>
-              </div>
-            </td>
-          </tr>"
-          } else {
-          "<tr>
-            <td bgcolor='#111827' style='padding:8px 28px;'>
-              <div style='background-color:#052e16; border:1px solid #065f46; border-left:4px solid #10b981; border-radius:8px; padding:14px 18px; font-size:14px; color:#a7f3d0; line-height:1.65;'>
-                <strong style='color:#34d399; font-size:15px;'>&#10004; SERVIDOR LOCAL: BACKUP 100% SEGURO E PROTEGIDO</strong><br/>
-                <div style='margin-top:6px; color:#d1fae5;'>
-                  Os backups locais continuam sendo gravados normalmente no servidor <strong>$hostName</strong> a cada ciclo de rotina.
-                  O banco de dados do Sismotel est&aacute; totalmente protegido localmente. O problema est&aacute; exclusivamente na c&oacute;pia de conting&ecirc;ncia externa para o terminal.
-                </div>
-              </div>
-            </td>
-          </tr>"
-          })
-
-          <!-- CARD 3: CAUSAS MAIS PROVAVEIS -->
-          <tr>
-            <td bgcolor="#111827" style="padding:8px 28px;">
-              <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border-radius:8px; border:1px solid #334155; overflow:hidden;">
-                <tr>
-                  <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#f87171; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ CAUSAS MAIS FREQ&Uuml;ENTES ]</span>
-                  </td>
-                </tr>
-                <tr>
-                  <td bgcolor="#1e293b" style="padding:16px 18px; font-size:13.5px; color:#e2e8f0; line-height:1.75;">
-                    <div style="margin-bottom:10px; display:flex; align-items:flex-start;">
-                      <span style="color:#f59e0b; font-weight:800; min-width:22px; margin-right:8px;">1.</span>
-                      <div><strong style="color:#fbbf24;">Terminal da Recep&ccedil;&atilde;o Desligado</strong> &mdash; O computador ou switch de rede pode estar sem energia, em hiberna&ccedil;&atilde;o ou suspens&atilde;o.</div>
-                    </div>
-                    <div style="margin-bottom:10px; display:flex; align-items:flex-start;">
-                      <span style="color:#f59e0b; font-weight:800; min-width:22px; margin-right:8px;">2.</span>
-                      <div><strong style="color:#fbbf24;">Formata&ccedil;&atilde;o ou Troca de Computador</strong> &mdash; O computador pode ter sido formatado recentemente ou substitu&iacute;do na recep&ccedil;&atilde;o, desfazendo o compartilhamento da pasta.</div>
-                    </div>
-                    <div style="margin-bottom:10px; display:flex; align-items:flex-start;">
-                      <span style="color:#f59e0b; font-weight:800; min-width:22px; margin-right:8px;">3.</span>
-                      <div><strong style="color:#fbbf24;">Credenciais Alteradas</strong> &mdash; O usu&aacute;rio ou senha do Windows na recep&ccedil;&atilde;o foram alterados ou o administrador foi desativado.</div>
-                    </div>
-                    <div style="margin-bottom:10px; display:flex; align-items:flex-start;">
-                      <span style="color:#f59e0b; font-weight:800; min-width:22px; margin-right:8px;">4.</span>
-                      <div><strong style="color:#fbbf24;">Mudan&ccedil;a de IP ou Cabo Solto</strong> &mdash; O endere&ccedil;o IP variou pelo roteador ou o cabo de rede foi desconectado na limpeza.</div>
-                    </div>
-                    <div style="display:flex; align-items:flex-start;">
-                      <span style="color:#f59e0b; font-weight:800; min-width:22px; margin-right:8px;">5.</span>
-                      <div><strong style="color:#fbbf24;">Erro F&iacute;sico no Banco Firebird</strong> &mdash; O gbak n&atilde;o conseguiu concluir a extra&ccedil;&atilde;o devido a corrup&ccedil;&atilde;o f&iacute;sica de registros ou p&aacute;ginas.</div>
-                    </div>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-
-          <!-- CARD 4: CHECKLIST DO TECNICO -->
-          <tr>
-            <td bgcolor="#111827" style="padding:8px 28px;">
-              <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border-radius:8px; border:1px solid #334155; overflow:hidden;">
-                <tr>
-                  <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#38bdf8; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ CHECKLIST DE DIAGN&Oacute;STICO &bull; SUPORTE MEC ]</span>
-                  </td>
-                </tr>
-                <tr>
-                  <td bgcolor="#1e293b" style="padding:16px 18px; font-size:13.5px; color:#cbd5e1; line-height:1.75;">
-                    <div style="margin-bottom:8px;">
-                      <strong>1. Acessar o Servidor:</strong> Conectar via AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).
-                    </div>
-                    <div style="margin-bottom:8px;">
-                      <strong>2. Testar Conex&atilde;o / Destino:</strong> $pingStepHtml
-                    </div>
-                    <div style="margin-bottom:8px;">
-                      <strong>3. Validar Pasta de Destino:</strong> Pressionar <code>Win+R</code> e abrir o caminho do destino para confirmar exist&ecirc;ncia e permiss&atilde;o de grava&ccedil;&atilde;o.
-                    </div>
-                    <div style="margin-bottom:8px;">
-                      <strong>4. Revalidar Credenciais:</strong> Abrir o <strong>MEC Shield</strong>, clicar em <em>Editar Tarefa</em> e usar o bot&atilde;o <em>Testar Conex&atilde;o</em>.
-                    </div>
-                    <div>
-                      <strong>5. Consultar Logs:</strong> Verificar <code>C:\Microtecs\FIBS\logs\backup_${TaskNameHtml}_log.txt</code>.
-                    </div>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-
-          <!-- CARD 5: ACESSO REMOTO -->
+          <!-- CARD 2: COMO RESOLVER PASSO A PASSO -->
           <tr>
             <td bgcolor="#111827" style="padding:8px 28px 20px 28px;">
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border-radius:8px; border:1px solid #334155; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#a78bfa; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ ACESSO REMOTO AO SERVIDOR &bull; MEC SUPORTE ]</span>
+                    <span style="color:#fbbf24; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 2. COMO RESOLVER PASSO A PASSO ]</span>
                   </td>
                 </tr>
                 <tr>
-                  <td bgcolor="#1e293b" style="padding:16px 18px;">
-                    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#ffffff;">
-                      <tr>
-                        <td width="36%" bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;">AnyDesk ID:</td>
-                        <td bgcolor="#1e293b" style="padding:6px 0;">$($remoteBadges.AnyDesk)</td>
-                      </tr>
-                      <tr>
-                        <td bgcolor="#1e293b" style="padding:6px 0; color:#94a3b8; font-weight:600;">TeamViewer ID:</td>
-                        <td bgcolor="#1e293b" style="padding:6px 0;">$($remoteBadges.TeamViewer)</td>
-                      </tr>
-                    </table>
+                  <td bgcolor="#1e293b" style="padding:16px 18px; font-size:13.5px; color:#e2e8f0; line-height:1.75;">
+                    $(if ($isLocalServerDest) {
+                    @"
+                    <div style="margin-bottom:10px;">
+                      <strong style="color:#fbbf24;">1. Acessar o Servidor:</strong> Conecte no servidor <strong>$hostName</strong> pelo AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).
+                    </div>
+                    <div style="margin-bottom:10px;">
+                      <strong style="color:#fbbf24;">2. Verificar a Pasta e o Espa&ccedil;o em Disco:</strong> Confira se a pasta <code>$Destination</code> existe e se o disco tem espa&ccedil;o livre.
+                    </div>
+                    <div>
+                      <strong style="color:#fbbf24;">3. Testar pelo Painel:</strong> Abra o <strong>MEC Shield</strong> na &aacute;rea de trabalho e clique em <em>Executar Agora</em> para acompanhar o backup.
+                    </div>
+"@
+                    } else {
+                    @"
+                    <div style="margin-bottom:10px;">
+                      <strong style="color:#fbbf24;">1. Verificar se o outro computador est&aacute; ligado:</strong> $pingStepHtml
+                    </div>
+                    <div style="margin-bottom:10px;">
+                      <strong style="color:#fbbf24;">2. Testar se a pasta abre no Servidor:</strong> No servidor <strong>$hostName</strong>, aperte as teclas <code>Windows + R</code>, digite <code>$Destination</code> e d&ecirc; Enter:
+                      <div style="margin-top:4px; margin-left:14px; color:#cbd5e1; font-size:13px;">
+                        &bull; <strong>Se der erro dizendo que n&atilde;o foi encontrado:</strong> O outro computador est&aacute; desligado, com cabo de rede solto, trocou de nome ou a pasta parou de ser compartilhada (ex.: ap&oacute;s formata&ccedil;&atilde;o).<br/>
+                        &bull; <strong>Se pedir usu&aacute;rio e senha ou der Acesso Negado:</strong> No outro computador, clique com o bot&atilde;o direito na pasta de backup &rarr; <em>Propriedades</em> &rarr; <em>Compartilhamento</em> e libere permiss&atilde;o de grava&ccedil;&atilde;o/altera&ccedil;&atilde;o.
+                      </div>
+                    </div>
+                    <div style="margin-bottom:10px;">
+                      <strong style="color:#fbbf24;">3. Confirmar no Painel do MEC Shield:</strong> Abra o <strong>MEC Shield</strong> no servidor, clique em <em>Editar Tarefa</em> (<strong>$TaskNameHtml</strong>) e use o bot&atilde;o <em>Testar Conex&atilde;o</em>.
+                    </div>
+                    <div style="padding:10px 12px; background-color:#052e16; border:1px solid #065f46; border-radius:6px; color:#d1fae5; font-size:13px;">
+                      &#10004; <strong>Fique tranquilo quanto ao banco de dados:</strong> Enquanto voc&ecirc; ajusta a conex&atilde;o com esse computador externo, o <strong>Sismotel</strong> e os backups locais dentro do servidor principal continuam funcionando normalmente.
+                    </div>
+"@
+                    })
                   </td>
                 </tr>
               </table>
@@ -3584,7 +3825,27 @@ function Send-NetworkFailureAlert {
             $altView.LinkedResources.Add($res)
         }
         $mail.AlternateViews.Add($altView)
-        Add-MecMailDeliverability -Mail $mail -Sender $sender -HtmlBody $htmlBody
+
+        $txtNet = @()
+        $txtNet += "MEC Shield - Alerta: $identificacao sem backup ha $daysStr"
+        $txtNet += ""
+        $txtNet += "O QUE ACONTECEU"
+        $txtNet += (ConvertTo-MailPlainText -Html $topoAconteceu)
+        $txtNet += ""
+        $txtNet += "O BACKUP DO MOTEL ESTA SEGURO?"
+        $txtNet += (ConvertTo-MailPlainText -Html $topoSeguro)
+        $txtNet += ""
+        $txtNet += "O QUE FAZER AGORA"
+        $txtNet += (ConvertTo-MailPlainText -Html $topoFazer)
+        $txtNet += ""
+        $txtNet += "Cliente: $clientName | Servidor: $hostName | Tarefa: $TaskName | Destino: $rawDestination"
+        $txtNet += "AnyDesk: $(ConvertTo-MailPlainText -Html $anyDeskId) | TeamViewer: $(ConvertTo-MailPlainText -Html $teamViewerId)"
+        if (-not [string]::IsNullOrWhiteSpace($rawFailureReason)) {
+            $txtNet += ""
+            $txtNet += "DETALHE TECNICO:"
+            $txtNet += $rawFailureReason
+        }
+        Add-MecMailDeliverability -Mail $mail -Sender $sender -HtmlBody $htmlBody -PlainText ($txtNet -join "`r`n")
 
         Send-MailWithRetry -Mail $mail -SmtpServer $smtpServer -Port $port -UseSsl $useSsl -Pref $pref
         try { $mail.Dispose() } catch {}
@@ -3740,6 +4001,7 @@ function Test-ExternalDestinationsHealth {
                     if ($hoursSince -lt $alertHours) {
                         $netTracker[$destTrim].FirstFailure = $null
                         $netTracker[$destTrim].LastAlert = $null
+                        $netTracker[$destTrim].LastFailureReason = $null
                     } else {
                         if (-not $netTracker[$destTrim].FirstFailure) {
                             $netTracker[$destTrim].FirstFailure = $realLastBackupTime.ToString("o")
@@ -3761,6 +4023,9 @@ function Test-ExternalDestinationsHealth {
                 }
             } else {
                 # Destino inacessivel (desligado, descompartilhado, rede fora ou credenciais recusadas)
+                if (-not [string]::IsNullOrWhiteSpace($FailureReason)) {
+                    $netTracker[$destTrim].LastFailureReason = $FailureReason
+                }
                 if (-not $netTracker[$destTrim].FirstFailure) {
                     $netTracker[$destTrim].FirstFailure = if ($netTracker[$destTrim].LastSuccess) { $netTracker[$destTrim].LastSuccess } else { (Get-Date).ToString("o") }
                 }
@@ -3768,7 +4033,9 @@ function Test-ExternalDestinationsHealth {
                 $hoursSince = ((Get-Date) - $firstFail).TotalHours
                 if ([string]::IsNullOrWhiteSpace($detectedReason)) {
                     $raizDestino = [System.IO.Path]::GetPathRoot($destTrim)
-                    $detectedReason = if (-not [string]::IsNullOrWhiteSpace($authFailureReason)) {
+                    $detectedReason = if (-not [string]::IsNullOrWhiteSpace("$($netTracker[$destTrim].LastFailureReason)")) {
+                        "$($netTracker[$destTrim].LastFailureReason)"
+                    } elseif (-not [string]::IsNullOrWhiteSpace($authFailureReason)) {
                         $authFailureReason
                     } elseif (-not $destTrim.StartsWith("\\") -and -not [string]::IsNullOrWhiteSpace($raizDestino) -and -not (Test-Path $raizDestino)) {
                         "A unidade $raizDestino so existe com um usuario logado (Google Drive, OneDrive ou unidade do usuario): ninguem logado no servidor, aplicativo de sincronizacao fechado ou a copia pela sessao do usuario falhou."
@@ -3976,13 +4243,27 @@ function Send-AuditAlertNotification {
         $gapText = if ($TransactionGap -lt 0) { "n&atilde;o verificado" } else { "$TransactionGap" }
         $limitText = if ($NextTransaction -le 0) { "n&atilde;o verificado" } else { "$NextTransaction" }
 
+        $auditAconteceu = if ($diagnosisHtml) {
+            "No teste di&aacute;rio autom&aacute;tico do backup (03:30), o sistema identificou um aviso interno no banco de dados: <strong>$diagnosisHtml</strong>"
+        } else {
+            "No teste di&aacute;rio autom&aacute;tico do backup (03:30), o sistema identificou registros ou transa&ccedil;&otilde;es acumuladas no banco de dados que precisam de manuten&ccedil;&atilde;o preventiva."
+        }
+        $auditSeguro = "<strong>SIM, O SISMOTEL CONTINUA FUNCIONANDO NORMALMENTE.</strong> Este teste &eacute; feito em uma c&oacute;pia separada de madrugada, sem mexer no sistema em uso na recep&ccedil;&atilde;o."
+        $auditFazer = if ($RecordErrors -gt 0 -or $PageErrors -gt 0) {
+            "Agendar um hor&aacute;rio de menor movimento no motel para o suporte executar a limpeza/reparo preventivo do banco (<code>ReparadorFB.exe</code>)."
+        } elseif ($TransactionGap -ge 200000 -or $NextTransaction -ge 1500000000) {
+            "Verificar se h&aacute; algum computador com tela do Sismotel aberta h&aacute; muitos dias sem fechar, ou agendar limpeza preventiva com o suporte."
+        } else {
+            "Acessar o servidor via AnyDesk/TeamViewer em hor&aacute;rio tranquilo para conferir o log do teste."
+        }
+
         $htmlBody = @"
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
   <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MEC Shield - Auditoria de Integridade</title>
+  <title>MEC Shield - Teste Di&aacute;rio do Banco</title>
 </head>
 <body bgcolor="#090d16" style="margin:0; padding:0; background-color:#090d16; font-family:'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, Helvetica, Arial, sans-serif; color:#f8fafc;">
   <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#090d16" style="background-color:#090d16; padding:25px 10px;">
@@ -3990,7 +4271,7 @@ function Send-AuditAlertNotification {
       <td align="center">
         <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#111827" style="max-width:660px; background-color:#111827; border-radius:12px; overflow:hidden; border:1px solid #1e293b; box-shadow:0 20px 25px -5px rgba(0, 0, 0, 0.7);">
           
-          <!-- BANNER OFICIAL MEC (INLINE CID - 100% LIMPO E NITIDO) -->
+          <!-- BANNER OFICIAL MEC -->
           <tr>
             <td align="center" bgcolor="#0f172a" style="background-color:#0f172a; padding:0; margin:0; line-height:0;">
               <img src="cid:mec_header" alt="MEC Shield Enterprise" width="660" style="display:block; width:100%; max-width:660px; height:auto; border:0;" />
@@ -4000,18 +4281,21 @@ function Send-AuditAlertNotification {
           <!-- FAIXA DE STATUS PRINCIPAL -->
           <tr>
             <td bgcolor="#b91c1c" style="background-color:#b91c1c; color:#ffffff; padding:13px 28px; font-weight:800; font-size:14.5px; letter-spacing:0.5px; text-transform:uppercase;">
-              &#9679; AUDITORIA PREVENTIVA &bull; $headlineHtml
+              &#9679; TESTE PREVENTIVO DO BANCO &bull; $headlineHtml
             </td>
           </tr>
 
-          <!-- TITULO -->
+          <!-- QUADRO RESUMO NO TOPO (3 PERGUNTAS DIRETAS) -->
           <tr>
-            <td bgcolor="#111827" style="background-color:#111827; padding:22px 28px 10px 28px;">
-              <h2 style="margin:0 0 6px 0; color:#fef2f2; font-size:20px; font-weight:700;">Inconsist&ecirc;ncia Identificada na Auditoria em Sandbox</h2>
-              <p style="margin:0; color:#cbd5e1; font-size:14px; line-height:1.65;">
-                A auditoria preventiva di&aacute;ria executada em sandbox isolado identificou anomalias no banco de dados Firebird. <span style="color:#34d399; font-weight:600;">O banco ativo no motel permanece operando normalmente sem paradas</span>, por&eacute;m requer interven&ccedil;&atilde;o t&eacute;cnica preventiva programada da equipe MEC para preservar a integridade dos dados.
-              </p>
-              $(if ($diagnosisHtml) { "<p style='margin:12px 0 0 0; padding:12px 14px; background-color:#450a0a; border-left:4px solid #ef4444; border-radius:6px; color:#fecaca; font-size:14px; line-height:1.6;'><strong>Diagn&oacute;stico:</strong> $diagnosisHtml</p>" })
+            <td bgcolor="#111827" style="background-color:#111827; padding:18px 28px 8px 28px;">
+              <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#0f172a" style="background-color:#0f172a; border:1px solid #334155; border-left:6px solid #b91c1c; border-radius:8px;">
+                <tr><td style="padding:14px 18px 2px 18px; color:#94a3b8; font-size:12px; font-weight:800; letter-spacing:0.6px;">O QUE ACONTECEU</td></tr>
+                <tr><td style="padding:0 18px 12px 18px; color:#ffffff; font-size:15.5px; line-height:1.55;">$auditAconteceu</td></tr>
+                <tr><td style="padding:2px 18px 2px 18px; color:#94a3b8; font-size:12px; font-weight:800; letter-spacing:0.6px;">O SISMOTEL EST&Aacute; FUNCIONANDO NORMALMENTE?</td></tr>
+                <tr><td style="padding:0 18px 12px 18px; color:#a7f3d0; font-size:15.5px; line-height:1.55;">$auditSeguro</td></tr>
+                <tr><td style="padding:2px 18px 2px 18px; color:#94a3b8; font-size:12px; font-weight:800; letter-spacing:0.6px;">O QUE FAZER AGORA</td></tr>
+                <tr><td style="padding:0 18px 14px 18px; color:#ffffff; font-size:15.5px; line-height:1.55;">$auditFazer</td></tr>
+              </table>
             </td>
           </tr>
 
@@ -4021,18 +4305,18 @@ function Send-AuditAlertNotification {
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#38bdf8; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ DADOS DO CLIENTE &bull; ACESSO REMOTO ]</span>
+                    <span style="color:#38bdf8; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 1. DADOS DO CLIENTE E ACESSO REMOTO ]</span>
                   </td>
                 </tr>
                 <tr>
                   <td bgcolor="#1e293b" style="background-color:#1e293b; padding:16px 18px;">
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#ffffff;">
                       <tr>
-                        <td width="36%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Cliente / Empresa:</td>
+                        <td width="36%" bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Cliente / Motel:</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-weight:800; color:#ffffff; font-size:16px;">$(ConvertTo-HtmlSafe $cleanClient)</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Terminal / Servidor:</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Servidor:</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-weight:700; color:#38bdf8; font-size:14.5px;">$hostName</td>
                       </tr>
                       <tr>
@@ -4044,11 +4328,11 @@ function Send-AuditAlertNotification {
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0;">$($remoteBadges.TeamViewer)</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Banco Auditado:</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Banco Verificado:</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; font-family:Consolas,monospace; font-size:13px; color:#cbd5e1; word-break:break-all;">$DbPath</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Data da Auditoria:</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#94a3b8; font-weight:600;">Data da Verifica&ccedil;&atilde;o:</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:6px 0; color:#cbd5e1; font-size:13.5px;">$timestampNow</td>
                       </tr>
                     </table>
@@ -4058,32 +4342,32 @@ function Send-AuditAlertNotification {
             </td>
           </tr>
 
-          <!-- CARD 2: RESULTADO DO DIAGNOSTICO FISICO -->
+          <!-- CARD 2: RESULTADO DO TESTE DO BANCO -->
           <tr>
             <td bgcolor="#111827" style="background-color:#111827; padding:8px 28px;">
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#f87171; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ M&Eacute;TRICAS DE INTEGRIDADE &bull; SANDBOX FIREBIRD ]</span>
+                    <span style="color:#f87171; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 2. RESULTADO DO TESTE DE SA&Uacute;DE DO BANCO ]</span>
                   </td>
                 </tr>
                 <tr>
                   <td bgcolor="#1e293b" style="background-color:#1e293b; padding:16px 18px;">
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#e2e8f0;">
                       <tr>
-                        <td width="55%" bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Erros de N&iacute;vel de Registro (Record Errors):</td>
+                        <td width="58%" bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Registros que precisam de reparo (Record Errors):</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:800; font-size:15px; color:$recordColor;">$recordText</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Erros de P&aacute;ginas de Banco (Page Errors):</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">P&aacute;ginas do banco com falha (Page Errors):</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:800; font-size:15px; color:$pageColor;">$pageText</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Transaction Gap (Next - Oldest):</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Opera&ccedil;&otilde;es pendentes acumuladas (Transaction Gap):</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:800; font-size:15px; color:$gapColor;">$gapText</td>
                       </tr>
                       <tr>
-                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Contador de Transa&ccedil;&otilde;es (Pr&oacute;xima):</td>
+                        <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Contador total de opera&ccedil;&otilde;es do banco:</td>
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:700; font-size:14.5px; color:$limitColor;">$limitText</td>
                       </tr>
                     </table>
@@ -4093,25 +4377,25 @@ function Send-AuditAlertNotification {
             </td>
           </tr>
 
-          <!-- CARD 3: PLANO DE ACAO RECOMENDADO -->
+          <!-- CARD 3: COMO RESOLVER -->
           <tr>
             <td bgcolor="#111827" style="background-color:#111827; padding:8px 28px;">
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#fbbf24; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ PROCEDIMENTO RECOMENDADO &bull; SUPORTE MEC ]</span>
+                    <span style="color:#fbbf24; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 3. COMO RESOLVER PASSO A PASSO ]</span>
                   </td>
                 </tr>
                 <tr>
                   <td bgcolor="#1e293b" style="background-color:#1e293b; padding:16px 18px; font-size:13.5px; color:#cbd5e1; line-height:1.7;">
                     <div style="margin-bottom:8px;">
-                      <strong>1. Acesso Remoto:</strong> Conectar via AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).
+                      <strong style="color:#fbbf24;">1. Acessar o Servidor:</strong> Conecte pelo AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).
                     </div>
                     <div style="margin-bottom:8px;">
-                      <strong>2. Se Record Errors &gt; 0:</strong> Agendar manuten&ccedil;&atilde;o preventiva em hor&aacute;rio de menor fluxo e executar o utilit&aacute;rio <code>ReparadorFB.exe</code> para saneamento.
+                      <strong style="color:#fbbf24;">2. Se houver Registros ou P&aacute;ginas com falha:</strong> Agende um hor&aacute;rio de pouco movimento no motel e execute o utilit&aacute;rio <code>ReparadorFB.exe</code> para corrigir o banco.
                     </div>
                     <div>
-                      <strong>3. Se Transaction Gap Elevado:</strong> Investigar esta&ccedil;&otilde;es com telas presas no Sismotel ou executar varredura de Sweep / <code>fixtranslimit.exe</code>.
+                      <strong style="color:#fbbf24;">3. Se houver Opera&ccedil;&otilde;es Pendentes elevadas (Transaction Gap):</strong> Verifique se h&aacute; computadores com telas do Sismotel abertas sem fechar h&aacute; muito tempo ou execute a limpeza <code>fixtranslimit.exe</code>.
                     </div>
                   </td>
                 </tr>
@@ -7011,7 +7295,7 @@ $netTracker = @{}
 $trackerKeys = @()
 foreach ($successPath in ($networkSuccessList + $localSuccessList)) {
     $destDir = Split-Path $successPath -Parent
-    $netTracker[$destDir] = @{ LastSuccess = (Get-Date).ToString("o"); FirstFailure = $null; LastAlert = $null }
+    $netTracker[$destDir] = @{ LastSuccess = (Get-Date).ToString("o"); FirstFailure = $null; LastAlert = $null; LastFailureReason = $null }
     $trackerKeys += $destDir
 }
 if ($trackerKeys.Count -gt 0) {
@@ -7020,10 +7304,8 @@ if ($trackerKeys.Count -gt 0) {
 }
 
 # Verificacao Blindada de Saude de Destinos Externos / Rede (24 Horas)
-$isExternalTask = ($TaskName -match "EXTERN" -or $TaskName -eq "BKP_EXTERNO")
-if ($failedDestinations.Count -gt 0 -or $isExternalTask) {
-    $destsToCheck = if ($failedDestinations.Count -gt 0) { $failedDestinations } else { $allDestinations }
-    foreach ($destToCheck in $destsToCheck) {
+if ($failedDestinations.Count -gt 0) {
+    foreach ($destToCheck in $failedDestinations) {
         $failureReasonForDestination = $networkConfigFailureReason
         if ($destinationFailureReasons.ContainsKey($destToCheck)) {
             $failureReasonForDestination = $destinationFailureReasons[$destToCheck]
