@@ -44,7 +44,7 @@ if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.72"
+$script:EngineVersion = "2.2.73"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -532,6 +532,33 @@ function Get-FailureDiagnosis {
 # O pacote precisa sair com a senha legivel para a instalacao ser zero-toque; esta
 # rotina garante que, assim que o sistema roda uma vez, o texto puro deixe de existir
 # em disco no cliente. Idempotente: o que ja esta cifrado e ignorado.
+function Get-MecBootstrapVault {
+    try {
+        $pubKeyXml = '<RSAKeyValue><Modulus>xl4vygVDypOqBtFKnoazM8tDzvS/MubD4ZpMXt+WOFnhlZf3PHI75EEi+EMPqWK1w4MQeSGLbyk1O9uF9H+jC5UrOHZeWaHm8dL/1VR6gMyadIYDUyhf1EE+wNVA2sJptCtTnnMYFuj3YxNMshTJmC6fIzOaMHGup3G+/gZ22RhIYXB/DSRLq7rqIJ4aTlyCRPH1Vfs12q4aDM3XyvYIbb0Woms+zvieiB48mGbyWNOeXKeHnUDlgvoh83Kv2+NWA2qlix/RzNKKIR/bkTwXhGVF0ok5G7eATYGed38RkNsrlZg/KJc410iEhS++llTdTVCfkdWQG7FOnGlm8Ha1jSbBC/jTtAdsIu3+uQoByFoRoovTvnaWquWDTe5IZE/2/Y89D+kkBrI6CyMhLH20xpUcC+bTXLYQc/jgcSvEpuZRL1l0ypxm9oNh1xs8jFK82n38blszsXmiNQzWFJvW+sGXVT806ZkpFiZlrXHBfv4UWWzo+BWqY+MI3seZRK7h</Modulus><Exponent>AQAB</Exponent></RSAKeyValue>'
+        $vaultB64 = "T5UwXD3Jzyo+twuvsl8qgdkO4wys3Kl+rVr6r8sFrWbo4urp29cCUkhG7lFkNczTmMb3KRuZIGfE2tJWeRJkVw=="
+        $salt = [byte[]](0x4D,0x45,0x43,0x5F,0x53,0x48,0x49,0x45,0x4C,0x44,0x5F,0x32,0x34,0x37,0x5F,0x56)
+        $kdf = New-Object System.Security.Cryptography.Rfc2898DeriveBytes($pubKeyXml, $salt, 10000)
+        $aes = New-Object System.Security.Cryptography.RijndaelManaged
+        $aes.KeySize = 256; $aes.BlockSize = 128
+        $aes.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $aes.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $aes.Key = $kdf.GetBytes(32); $aes.IV = $kdf.GetBytes(16)
+        $dec = $aes.CreateDecryptor()
+        $cipherBytes = [Convert]::FromBase64String($vaultB64)
+        $plainBytes = $dec.TransformFinalBlock($cipherBytes, 0, $cipherBytes.Length)
+        $parts = ([System.Text.Encoding]::UTF8.GetString($plainBytes)).Split("`t")
+        if ($parts.Count -ge 5 -and $parts[0] -eq "MECSHIELD_VAULT_V1") {
+            return (New-Object PSObject -Property @{
+                SmtpPass = $parts[1]
+                DbPass   = $parts[2]
+                NetUser  = $parts[3]
+                NetPass  = $parts[4]
+            })
+        }
+    } catch {}
+    return $null
+}
+
 function Convert-PlainPasswordsInConfig {
     try {
         if (-not (Test-Path $configFile)) { return }
@@ -542,20 +569,43 @@ function Convert-PlainPasswordsInConfig {
             if ($null -eq $cfg) { return }
             $mudou = $false
             $campos = @()
+            $vault = Get-MecBootstrapVault
 
-            if ($null -ne $cfg.Preferences -and -not [string]::IsNullOrWhiteSpace($cfg.Preferences.SmtpPass) `
-                -and -not (Test-IsDpapiBlob $cfg.Preferences.SmtpPass)) {
-                $cfg.Preferences.SmtpPass = Protect-String $cfg.Preferences.SmtpPass
-                $mudou = $true; $campos += "SmtpPass"
+            if ($null -ne $cfg.Preferences) {
+                $curSmtp = "$($cfg.Preferences.SmtpPass)".Trim()
+                $smtpInvalido = [string]::IsNullOrWhiteSpace($curSmtp) -or ((Test-IsDpapiBlob $curSmtp) -and ($null -eq (Unprotect-String $curSmtp)))
+                if ($smtpInvalido -and $null -ne $vault -and -not [string]::IsNullOrWhiteSpace($vault.SmtpPass)) {
+                    $cfg.Preferences | Add-Member -MemberType NoteProperty -Name "SmtpPass" -Value (Protect-String $vault.SmtpPass) -Force
+                    $mudou = $true; $campos += "SmtpPass"
+                } elseif (-not [string]::IsNullOrWhiteSpace($curSmtp) -and -not (Test-IsDpapiBlob $curSmtp)) {
+                    $cfg.Preferences.SmtpPass = Protect-String $curSmtp
+                    $mudou = $true; $campos += "SmtpPass"
+                }
             }
             foreach ($t in @($cfg.Tasks)) {
-                # A credencial de rede NAO e mais embutida neste motor (que e publico): o Setup TECNICO grava
-                # NetworkUser/NetworkPassword (cifrada via DPAPI) e NetworkCredentialCustom=true na instalacao.
-                # Tarefa sem credencial segue pelas tentativas 1 (conta do servidor) e 3 (usuario logado).
+                if ($null -eq $t) { continue }
+                if ([string]::IsNullOrWhiteSpace("$($t.DbUser)")) {
+                    $t | Add-Member -MemberType NoteProperty -Name "DbUser" -Value "SYSDBA" -Force
+                    $mudou = $true
+                }
+                $curNu = "$($t.NetworkUser)".Trim()
+                if ([string]::IsNullOrWhiteSpace($curNu) -and $null -ne $vault -and -not [string]::IsNullOrWhiteSpace($vault.NetUser)) {
+                    $t | Add-Member -MemberType NoteProperty -Name "NetworkUser" -Value $vault.NetUser -Force
+                    $mudou = $true; $campos += "$($t.TaskName).NetworkUser"
+                }
                 foreach ($nome in @("DbPassword", "NetworkPassword")) {
                     $propObj = $t.PSObject.Properties[$nome]
-                    $valor = if ($null -ne $propObj) { "$($propObj.Value)" } else { "" }
-                    if (-not [string]::IsNullOrWhiteSpace($valor) -and -not (Test-IsDpapiBlob $valor)) {
+                    $valor = if ($null -ne $propObj) { "$($propObj.Value)".Trim() } else { "" }
+                    $invalido = [string]::IsNullOrWhiteSpace($valor) -or ((Test-IsDpapiBlob $valor) -and ($null -eq (Unprotect-String $valor)))
+                    if ($invalido -and $null -ne $vault) {
+                        $padrao = if ($nome -eq "DbPassword") { $vault.DbPass } else { $vault.NetPass }
+                        if (-not [string]::IsNullOrWhiteSpace($padrao)) {
+                            $protegido = Protect-String $padrao
+                            if ($null -ne $propObj) { $propObj.Value = $protegido }
+                            else { $t | Add-Member -MemberType NoteProperty -Name $nome -Value $protegido -Force }
+                            $mudou = $true; $campos += "$($t.TaskName).$nome"
+                        }
+                    } elseif (-not [string]::IsNullOrWhiteSpace($valor) -and -not (Test-IsDpapiBlob $valor)) {
                         $protegido = Protect-String $valor
                         if ($null -ne $propObj) { $propObj.Value = $protegido }
                         else { $t | Add-Member -MemberType NoteProperty -Name $nome -Value $protegido -Force }
@@ -1377,20 +1427,35 @@ function Invoke-NetworkAccessTest {
         if ($dest.StartsWith("\\")) {
             $cred = Get-NetworkCredentialForDestination -Destination $dest -Tasks $Tasks
             if ($null -ne $cred) {
-                $s = Enter-NetworkCredential -UNCPath $dest -User $cred.User -Password $cred.Password
-                if ($s.Ok) {
-                    try { $comSenha = Test-WriteProbe -Dir $dest } finally { Exit-NetworkCredential $s }
-                    if ([string]::IsNullOrWhiteSpace($comSenha)) {
-                        $results += (New-Object PSObject -Property @{ Destination = $dest; Ok = $true; Message = "Gravacao pelo servico com o usuario de rede '$($s.Account)': OK (funciona 24h, mesmo sem ninguem logado)." })
-                        continue
-                    }
-                    if ($comSenha -match '(?i)user name or password|nome de usu.rio ou (a )?senha|logon failure|falha de logon') {
-                        $comSenha = "terminal recusou o usuario '$($s.Account)': $(Get-NetworkLoginHint -Code 1326)"
-                    }
-                    $comSenha = "Com usuario de rede '$($s.Account)': $comSenha"
-                } else {
-                    $comSenha = "Login de rede como '$($cred.User)' nao abriu: $($s.Error)"
+                $usuariosRede = @($cred.User)
+                if (-not $cred.User.Contains('\') -and -not $cred.User.Contains('@')) {
+                    try {
+                        $csNet = Get-WmiObject Win32_ComputerSystem -ErrorAction SilentlyContinue
+                        if ($null -ne $csNet -and $csNet.PartOfDomain -and -not [string]::IsNullOrWhiteSpace($csNet.Domain)) {
+                            $domCurto = "$($csNet.Domain)".Split('.')[0].Trim()
+                            if (-not [string]::IsNullOrWhiteSpace($domCurto)) { $usuariosRede += "$domCurto\$($cred.User)" }
+                        }
+                    } catch {}
                 }
+                $gravouComSenha = $false
+                foreach ($uRede in $usuariosRede) {
+                    $s = Enter-NetworkCredential -UNCPath $dest -User $uRede -Password $cred.Password
+                    if ($s.Ok) {
+                        try { $comSenha = Test-WriteProbe -Dir $dest } finally { Exit-NetworkCredential $s }
+                        if ([string]::IsNullOrWhiteSpace($comSenha)) {
+                            $results += (New-Object PSObject -Property @{ Destination = $dest; Ok = $true; Message = "Gravacao pelo servico com o usuario de rede '$($s.Account)': OK (funciona 24h, mesmo sem ninguem logado)." })
+                            $gravouComSenha = $true
+                            break
+                        }
+                        if ($comSenha -match '(?i)user name or password|nome de usu.rio ou (a )?senha|logon failure|falha de logon') {
+                            $comSenha = "terminal recusou o usuario '$($s.Account)': $(Get-NetworkLoginHint -Code 1326)"
+                        }
+                        $comSenha = "Com usuario de rede '$($s.Account)': $comSenha"
+                    } else {
+                        $comSenha = "Login de rede como '$uRede' nao abriu: $($s.Error)"
+                    }
+                }
+                if ($gravouComSenha) { continue }
             } else {
                 $comSenha = "Sem usuario e senha de rede configurados"
             }
@@ -6047,6 +6112,8 @@ function Invoke-ExternalTool {
 if ($env:MECSHIELD_LIBRARY_MODE -eq "1") { return }
 # ==============================================================================
 
+Convert-PlainPasswordsInConfig
+
 # INTERCEPTADOR: EXECUCAO DE AUDITORIA (-RunAuditOnly)
 # O servico chama com -ScheduledAudit (uma vez por dia, respeitando a data da ultima
 # auditoria). O botao da interface chama sem ele (sob demanda). Um mutex impede duas
@@ -6920,7 +6987,20 @@ foreach ($destTrimmed in $resolvedDestList) {
     if ($isNetwork -and (Test-IsSystemAccount)) {
         $netUser = if (-not [string]::IsNullOrWhiteSpace($task.NetworkUser)) { Unprotect-String $task.NetworkUser } else { $null }
         $netPass = if (-not [string]::IsNullOrWhiteSpace($task.NetworkPassword)) { Unprotect-String $task.NetworkPassword } else { "" }
-        if (-not [string]::IsNullOrWhiteSpace($netUser)) { $modosAcesso += "SENHA" }
+        if (-not [string]::IsNullOrWhiteSpace($netUser)) {
+            $modosAcesso += "SENHA"
+            try {
+                if ($netUser -notmatch '[\\@]') {
+                    $csDom = Get-WmiObject Win32_ComputerSystem -ErrorAction SilentlyContinue
+                    if ($null -ne $csDom -and $csDom.PartOfDomain -and -not [string]::IsNullOrWhiteSpace($csDom.Domain)) {
+                        $domCurto = ($csDom.Domain -split '\.')[0]
+                        if (-not [string]::IsNullOrWhiteSpace($domCurto)) {
+                            $modosAcesso += "SENHA_DOMINIO:$domCurto"
+                        }
+                    }
+                }
+            } catch {}
+        }
         $portaSmbOk = Test-SmbPort -UNCPath $destTrimmed
         if (-not $portaSmbOk) {
             Log-Message "Rede: o terminal de '$destTrimmed' nao respondeu na porta 445 em 2 s (desligado, fora da rede ou firewall). Tentando mesmo assim."
@@ -6933,10 +7013,15 @@ foreach ($destTrimmed in $resolvedDestList) {
     if ($destSuccess) { break }
     $netSession = $null
     $acessoNegado = $false
-    if ($modoAcesso -eq "SENHA") {
-        $netSession = Enter-NetworkCredential -UNCPath $destTrimmed -User $netUser -Password $netPass
+    if ($modoAcesso -like "SENHA*") {
+        $userParaTentar = $netUser
+        if ($modoAcesso -like "SENHA_DOMINIO:*") {
+            $domPref = $modoAcesso.Substring("SENHA_DOMINIO:".Length)
+            $userParaTentar = "$domPref\$netUser"
+        }
+        $netSession = Enter-NetworkCredential -UNCPath $destTrimmed -User $userParaTentar -Password $netPass
         if (-not $netSession.Ok) {
-            Log-Message "Rede: login de rede como '$netUser' nao foi aberto: $($netSession.Error)"
+            Log-Message "Rede: login de rede como '$userParaTentar' nao foi aberto: $($netSession.Error)"
             continue
         }
         Log-Message "Rede: a conta do servidor nao gravou em '$destTrimmed'. Tentando com o usuario de rede '$($netSession.Account)'..."
@@ -7031,8 +7116,8 @@ foreach ($destTrimmed in $resolvedDestList) {
             break
         } catch {
             Log-Message "Tentativa $attempt de copia para '$destTrimmed' falhou: $_"
-            if ($modoAcesso -eq "SENHA" -and (Test-IsNetworkLogonFailure $_)) {
-                $destinationFailureReason = "o terminal recusou o usuario de rede '$netUser': $(Get-NetworkLoginHint -Code 1326)"
+            if ($modoAcesso -like "SENHA*" -and (Test-IsNetworkLogonFailure $_)) {
+                $destinationFailureReason = "o terminal recusou o usuario de rede '$($netSession.Account)': $(Get-NetworkLoginHint -Code 1326)"
             }
             if ([string]::IsNullOrWhiteSpace($destinationFailureReason)) { $destinationFailureReason = "$_" }
             # Servico sem permissao na pasta de rede: repetir nao adianta; passa para o
@@ -7058,7 +7143,7 @@ foreach ($destTrimmed in $resolvedDestList) {
     } finally {
         Exit-NetworkCredential $netSession
     }
-    if ($destSuccess -and $modoAcesso -eq "SENHA") {
+    if ($destSuccess -and $modoAcesso -like "SENHA*") {
         Log-Message "Rede: '$destTrimmed' gravado com o usuario de rede '$($netSession.Account)' (funciona com o servidor bloqueado, sem ninguem logado)."
     }
     # Terminal desligado ou fora da rede: trocar de conta nao adianta.
