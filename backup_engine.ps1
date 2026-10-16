@@ -44,7 +44,7 @@ if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.73"
+$script:EngineVersion = "2.2.74"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -442,6 +442,145 @@ function ConvertTo-HtmlSafe {
     return [System.Net.WebUtility]::HtmlEncode($Text)
 }
 
+# Identifica no log detalhado (-v) do gbak qual foi o ultimo objeto ou tabela que o
+# Firebird estava lendo no exato momento em que o backup abortou.
+function Get-GbakStoppedObject {
+    param([string]$LogText)
+    if ([string]::IsNullOrWhiteSpace($LogText)) { return $null }
+    $tableData = $null
+    $lastObject = $null
+    $lastKind = $null
+    foreach ($line in ($LogText -split "`r?`n")) {
+        $l = "$line".Trim()
+        if ($l -match '(?i)writing data for table\s+([A-Za-z0-9_\$]+)') {
+            $tableData = $matches[1].Trim()
+            $lastObject = $tableData
+            $lastKind = "TABELA_DADOS"
+        } elseif ($l -match '(?i)writing\s+(table|index|trigger|procedure|view|domain|generator|exception|filter|function|role)\s+([A-Za-z0-9_\$]+)') {
+            $lastKind = $matches[1].ToUpperInvariant()
+            $lastObject = $matches[2].Trim()
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($lastObject)) { return $null }
+    return (New-Object PSObject -Property @{
+        Kind      = $lastKind
+        Object    = $lastObject
+        TableName = $tableData
+    })
+}
+
+# Raio-X Universal pos-falha do gbak (100% somente leitura, prioridade BelowNormal,
+# timeout curto): descobre em qual tabela/objeto o gbak parou e, se parou lendo os
+# dados de uma tabela, testa as colunas via isql.exe (SELECT COUNT) para identificar
+# qual coluna especifica esta truncada ou corrompida, sem nunca alterar o banco.
+function Invoke-GbakFailureDiagnostic {
+    param(
+        [string]$DbPath,
+        [string]$GbakPath,
+        [hashtable]$FbEnv,
+        [string]$GbakErrorText,
+        [string]$TempDir
+    )
+    $linhasDiag = @()
+    try {
+        $parada = Get-GbakStoppedObject -LogText $GbakErrorText
+        if ($null -eq $parada) { return "" }
+
+        if ($parada.Kind -eq "TABELA_DADOS" -and -not [string]::IsNullOrWhiteSpace($parada.TableName)) {
+            $tbl = $parada.TableName
+            $linhasDiag += "RAIO-X DO GBAK (SOMENTE LEITURA): O backup falhou exatamente ao ler os dados da tabela '$tbl'."
+            $isqlPath = if (-not [string]::IsNullOrWhiteSpace($GbakPath)) { Join-Path (Split-Path $GbakPath -Parent) "isql.exe" } else { "" }
+            if (-not [string]::IsNullOrWhiteSpace($isqlPath) -and (Test-Path $isqlPath) -and -not [string]::IsNullOrWhiteSpace($DbPath)) {
+                $workDir = if (-not [string]::IsNullOrWhiteSpace($TempDir) -and (Test-Path $TempDir)) { $TempDir } else { [System.IO.Path]::GetTempPath() }
+                $sqlMeta = Join-Path $workDir "mec_diag_meta_$PID.sql"
+                $sqlCols = Join-Path $workDir "mec_diag_cols_$PID.sql"
+                try {
+                    $tblSafe = $tbl -replace '[^A-Za-z0-9_\$]', ''
+                    $metaQuery = @"
+SET NAMES NONE;
+SET HEADING OFF;
+SELECT 'COLMETA|' || TRIM(rf.RDB`$FIELD_NAME) || '|' || COALESCE(f.RDB`$FIELD_TYPE, 0) || '|' || COALESCE(f.RDB`$CHARACTER_LENGTH, f.RDB`$FIELD_LENGTH, 0)
+FROM RDB`$RELATION_FIELDS rf
+JOIN RDB`$FIELDS f ON rf.RDB`$FIELD_SOURCE = f.RDB`$FIELD_NAME
+WHERE TRIM(rf.RDB`$RELATION_NAME) = '$tblSafe'
+ORDER BY rf.RDB`$FIELD_POSITION;
+EXIT;
+"@
+                    [System.IO.File]::WriteAllText($sqlMeta, $metaQuery, (New-Object System.Text.UTF8Encoding($false)))
+                    $rMeta = Invoke-ExternalTool -FilePath $isqlPath -Arguments "-q -i `"$sqlMeta`" `"localhost:$DbPath`"" -Environment $FbEnv -TimeoutMs 10000
+                    $colunas = @()
+                    if (-not $rMeta.TimedOut -and -not [string]::IsNullOrWhiteSpace($rMeta.StdOut)) {
+                        foreach ($ml in ($rMeta.StdOut -split "`r?`n")) {
+                            if ($ml -match 'COLMETA\|([^|]+)\|(\d+)\|(\d+)') {
+                                $cName = $matches[1].Trim()
+                                $cType = [int]$matches[2]
+                                $cLen  = [int]$matches[3]
+                                $tipoStr = switch ($cType) {
+                                    37  { "VARCHAR($cLen)" }
+                                    14  { "CHAR($cLen)" }
+                                    261 { "BLOB" }
+                                    7   { "SMALLINT" }
+                                    8   { "INTEGER" }
+                                    16  { "BIGINT/NUMERIC" }
+                                    35  { "TIMESTAMP" }
+                                    12  { "DATE" }
+                                    13  { "TIME" }
+                                    27  { "DOUBLE PRECISION" }
+                                    default { "TIPO_$cType($cLen)" }
+                                }
+                                $colunas += (New-Object PSObject -Property @{ Name = $cName; TypeCode = $cType; Length = $cLen; TypeDesc = $tipoStr })
+                            }
+                        }
+                    }
+                    if ($colunas.Count -gt 0 -and $colunas.Count -le 60) {
+                        $sbProbe = New-Object System.Text.StringBuilder
+                        [void]$sbProbe.AppendLine("SET NAMES NONE;")
+                        [void]$sbProbe.AppendLine("SET HEADING OFF;")
+                        foreach ($c in $colunas) {
+                            $cn = $c.Name -replace '[^A-Za-z0-9_\$]', ''
+                            if (-not [string]::IsNullOrWhiteSpace($cn)) {
+                                [void]$sbProbe.AppendLine("SELECT 'COL_OK_${cn}|' || COUNT(`"$cn`") FROM `"$tblSafe`";")
+                            }
+                        }
+                        [void]$sbProbe.AppendLine("EXIT;")
+                        [System.IO.File]::WriteAllText($sqlCols, $sbProbe.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+                        $rCols = Invoke-ExternalTool -FilePath $isqlPath -Arguments "-q -i `"$sqlCols`" `"localhost:$DbPath`"" -Environment $FbEnv -TimeoutMs 15000
+                        if (-not $rCols.TimedOut) {
+                            $outCols = "$($rCols.StdOut)"
+                            $colsComErro = @()
+                            foreach ($c in $colunas) {
+                                $cn = $c.Name -replace '[^A-Za-z0-9_\$]', ''
+                                if (-not [string]::IsNullOrWhiteSpace($cn) -and $outCols -notmatch ("COL_OK_" + [regex]::Escape($cn) + "\|")) {
+                                    $colsComErro += $c
+                                }
+                            }
+                            if ($colsComErro.Count -gt 0) {
+                                $listaDesc = @($colsComErro | ForEach-Object { "$($_.Name) ($($_.TypeDesc))" }) -join ", "
+                                $linhasDiag += "COLUNA(S) COM ERRO IDENTIFICADA(S) NA TABELA '$tblSafe': $listaDesc"
+                                foreach ($ce in $colsComErro) {
+                                    if ($GbakErrorText -match 'string right truncation' -and ($ce.TypeCode -eq 37 -or $ce.TypeCode -eq 14)) {
+                                        $novoTam = if ($ce.Length -lt 255) { 255 } elseif ($ce.Length -lt 1000) { 1000 } else { 4000 }
+                                        $linhasDiag += "CAUSA PROVAVEL: A coluna '$($ce.Name)' esta definida como $($ce.TypeDesc), mas possui registro(s) gravado(s) com texto maior que $($ce.Length) caracteres (provavel alteracao manual via IBExpert/script)."
+                                        $linhasDiag += "SUGESTAO PARA O SUPORTE AVALIAR (IBExpert ou isql): ALTER TABLE $tblSafe ALTER COLUMN $($ce.Name) TYPE VARCHAR($novoTam);"
+                                    } else {
+                                        $linhasDiag += "SUGESTAO PARA O SUPORTE AVALIAR: Inspecionar os registros da coluna '$($ce.Name)' ($($ce.TypeDesc)) na tabela '$tblSafe' via IBExpert."
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } finally {
+                    if (Test-Path $sqlMeta) { Remove-Item $sqlMeta -Force -ErrorAction SilentlyContinue }
+                    if (Test-Path $sqlCols) { Remove-Item $sqlCols -Force -ErrorAction SilentlyContinue }
+                }
+            }
+        } else {
+            $linhasDiag += "RAIO-X DO GBAK (SOMENTE LEITURA): O backup falhou ao processar $($parada.Kind) '$($parada.Object)'."
+        }
+    } catch {}
+    return ($linhasDiag -join "`n")
+}
+
 # Traduz o erro tecnico para o e-mail: o que aconteceu, a causa provavel e o passo a
 # passo especifico. O texto original continua no e-mail como detalhe tecnico.
 # Textos em HTML com entidades (o motor e so ASCII). A ordem importa: vale a primeira
@@ -461,10 +600,20 @@ function Get-FailureDiagnosis {
            Causa  = "O mesmo arquivo de backup, lido duas vezes sem ningu&eacute;m gravar nele, deu resultados diferentes. Isso n&atilde;o &eacute; defeito do MEC Shield nem do compactador: &eacute; disco (SSD/HD, cabo, controladora) ou mem&oacute;ria RAM falhando. O MEC Shield refez o backup do zero e, se poss&iacute;vel, em outro disco."
            Passos = @("Ver o bloco <b>SAUDE DO ARMAZENAMENTO</b> no detalhe t&eacute;cnico: disco de cada pasta, SMART e erros de disco registrados pelo Windows (evento 153/7/51 = disco; WHEA = mem&oacute;ria/placa).", "Abrir o CrystalDiskInfo e conferir todos os discos (Sa&uacute;de, setores realocados/pendentes, vida &uacute;til do SSD).", "Fora do hor&aacute;rio de pico, testar a mem&oacute;ria com <code>mdsched</code> (reinicia o servidor).", "Planejar a troca do disco com alerta. Enquanto isso, garantir uma c&oacute;pia externa (rede/outro computador).") }
         @{ Codigo = "BANCO_CORROMPIDO"
-           Padrao = "database file appears corrupt|wrong page type|checksum error|consistency check|is of wrong type|record .* is corrupt"
+           Padrao = "database file appears corrupt|wrong page type|checksum error|consistency check|is of wrong type|record .* is corrupt|decompression overran buffer"
            Titulo = "O banco de dados do Sismotel tem p&aacute;ginas danificadas"
            Causa  = "O Firebird encontrou dados corrompidos dentro do banco ao ler para o backup. Isso costuma vir de queda de energia ou de disco com defeito."
-           Passos = @("<b>N&atilde;o</b> reiniciar nem mexer no banco antes de avaliar.", "Guardar o &uacute;ltimo backup bom (o mais recente sem alerta).", "Acionar o suporte Microtecs para reparo com <code>gfix -v -full</code>.", "Verificar a sa&uacute;de do disco do banco (CrystalDiskInfo).") }
+           Passos = @("<b>N&atilde;o</b> reiniciar nem mexer no banco antes de avaliar.", "Ver no detalhe t&eacute;cnico (bloco <b>RAIO-X DO GBAK</b>) em qual tabela ou objeto o gbak encontrou o erro.", "Guardar o &uacute;ltimo backup bom (o mais recente sem alerta) e acionar o suporte Microtecs para reparo com <code>gfix -v -full</code>.", "Verificar a sa&uacute;de do disco do banco (CrystalDiskInfo).") }
+        @{ Codigo = "GBAK_DADOS_TABELA"
+           Padrao = "string right truncation|numeric overflow|conversion error from string|malformed string|Cannot transliterate"
+           Titulo = "Coluna com tamanho menor que os dados ou valor inv&aacute;lido em tabela do banco"
+           Causa  = "O gbak parou ao ler os registros de uma tabela porque existe um texto gravado maior do que o tamanho atual definido na coluna (ex.: coluna diminu&iacute;da via IBExpert/script ap&oacute;s j&aacute; existirem registros maiores) ou um campo com formato/acento inv&aacute;lido. O Sismotel continua operando, mas o Firebird recusa o backup at&eacute; que a coluna ou registro seja ajustado."
+           Passos = @("Ver o bloco <b>RAIO-X DO GBAK</b> no detalhe t&eacute;cnico abaixo: ele identifica automaticamente a <b>Tabela</b> e a <b>Coluna</b> exata onde o gbak parou.", "Se for erro de <code>string right truncation</code> em coluna <code>VARCHAR</code>, avaliar no IBExpert (ou via isql) o comando <code>ALTER TABLE ... ALTER COLUMN ... TYPE VARCHAR(...)</code> indicado no detalhe t&eacute;cnico para ampliar a coluna sem perder dados.", "Ap&oacute;s o ajuste, clicar em <b>Executar</b> no painel do MEC Shield para confirmar a gera&ccedil;&atilde;o do backup.") }
+        @{ Codigo = "GBAK_METADADOS"
+           Padrao = "invalid request BLR|column .* is not defined|table .* is not defined|function .* is not defined"
+           Titulo = "Trigger, Procedure ou View com refer&ecirc;ncia inv&aacute;lida no banco de dados"
+           Causa  = "O gbak encontrou uma Trigger, Procedure ou View que faz refer&ecirc;ncia a uma coluna, tabela ou fun&ccedil;&atilde;o que n&atilde;o existe mais ou foi alterada no banco."
+           Passos = @("Ver no detalhe t&eacute;cnico abaixo (bloco <b>RAIO-X DO GBAK</b>) o objeto exato onde o gbak parou.", "Abrir o banco no IBExpert, recompilar ou corrigir a Trigger/Procedure indicada e rodar a tarefa novamente pelo painel.") }
         @{ Codigo = "SENHA_BANCO"
            Padrao = "user name and password are not defined|Senha do Banco Ilegivel|DbPassword"
            Titulo = "Senha do banco (SYSDBA) recusada"
@@ -6744,13 +6893,19 @@ Log-Message "Executando gbak.exe (Backup Online Seguro em Prioridade Baixa)..."
 
 $gbakSuccess = $false
 $gbakError = ""
+$gbakTailVerbose = ""
 for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
     try {
         if (Test-Path $tempFbk) { Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue }
         if (Test-Path $gbakLog) { Remove-Item $gbakLog -Force -ErrorAction SilentlyContinue }
 
+        # Na 1a tentativa roda sem -v (zero I/O extra de log em 99,9% dos backups).
+        # Se a 1a tentativa falhar, ativa -v na retentativa para descobrir em qual
+        # tabela/objeto do banco o gbak parou.
+        $gbakArgsRun = if ($attempt -gt 1 -or $retryCount -le 1) { "-b -t -v" + $gbakArgs.Substring(5) } else { $gbakArgs }
+
         # Timeout de 2 horas (7200000 ms)
-        $r = Invoke-ExternalTool -FilePath $gbakPath -Arguments $gbakArgs -Environment $fbEnv -TimeoutMs 7200000
+        $r = Invoke-ExternalTool -FilePath $gbakPath -Arguments $gbakArgsRun -Environment $fbEnv -TimeoutMs 7200000
         if ($r.TimedOut) {
             $gbakError = "gbak excedeu o limite de 2 horas e foi finalizado."
             Log-Message "Tentativa $attempt falhou: $gbakError"
@@ -6763,7 +6918,13 @@ for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
             break
         } else {
             $gbakError = "$($r.StdErr)".Trim()
-            if (Test-Path $gbakLog) { $gbakError = ((Get-Content $gbakLog | Select-Object -Last 5) -join "`n") + "`n" + $gbakError }
+            if (Test-Path $gbakLog) {
+                $ultimasLinhas = @(Get-Content $gbakLog -ErrorAction SilentlyContinue | Select-Object -Last 25)
+                if ($ultimasLinhas.Count -gt 0) {
+                    $gbakTailVerbose = ($ultimasLinhas -join "`n")
+                    $gbakError = (($ultimasLinhas | Select-Object -Last 8) -join "`n") + "`n" + $gbakError
+                }
+            }
             if ([string]::IsNullOrWhiteSpace($gbakError)) { $gbakError = "Sem detalhes no log." }
             Log-Message "Tentativa $attempt falhou. Codigo: $($r.ExitCode). Erro: $gbakError"
         }
@@ -6779,7 +6940,16 @@ for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
 }
 
 if (-not $gbakSuccess) {
+    $diagRaioX = Invoke-GbakFailureDiagnostic -DbPath $dbPath -GbakPath $gbakPath -FbEnv $fbEnv -GbakErrorText "$gbakTailVerbose`n$gbakError" -TempDir $tempDir
+    if (-not [string]::IsNullOrWhiteSpace($diagRaioX)) {
+        foreach ($dl in ($diagRaioX -split "`r?`n")) {
+            if (-not [string]::IsNullOrWhiteSpace($dl)) { Log-Message $dl }
+        }
+    }
     $errMsg = "ERRO CRITICO: Falha no gbak em todas as $retryCount tentativas. Backup abortado. Detalhes: $gbakError"
+    if (-not [string]::IsNullOrWhiteSpace($diagRaioX)) {
+        $errMsg += "`n`n$diagRaioX"
+    }
     Log-Message $errMsg
     # FBK parcial (gbak abortado/morto) nao pode ficar ocupando o disco
     if (Test-Path $tempFbk) { Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue }

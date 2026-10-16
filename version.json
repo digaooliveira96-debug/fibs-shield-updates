@@ -1,11 +1,11 @@
 {
-  "version": "2.2.73",
-  "releaseDate": "2026-10-15",
-  "minEngineVersion": "2.1.0",
-  "downloadUrl": "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
-  "setupUrl": "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-  "changelog": "1. Blindagem 24/7 contra reinicio de servidor (Windows Server / Windows 10/11 na tela de login sem usuario logado): recuperacao e criptografia DPAPI local automatica das credenciais de rede, banco e SMTP no primeiro ciclo apos atualizacao via LiveUpdate ou nova instalacao.\\n2. Suporte duplo em rede (Workgroup TERMINAL\\\\administrador e Dominio Active Directory DOMINIO\\\\administrador) via LogonUser NEW_CREDENTIALS.\\n3. Novos e-mails e alertas inteligentes com diagnostico completo de HDs, espaco livre e saude do banco Firebird.",
-  "setupSha256": "811545891914FC9D6EA510115EC9285C62EBF7921D9E4B3319A58549AF769300",
-  "engineSha256": "8CB9FA9F783A8173EFA927E72E9A7B49AC5EC92087B55FDB5E45D2F689FD013A",
-  "signature": "EwLNgLQrjpU7rSHfMMwx94Tr2HxCviS0c6Bf75+AtTHMFWtI7B15LFzRFrkT92/5KrW/Bjz2OcX04Gi3Mk13Zdq1KdvDl/xqiAKXGcK+M33Bji6Bu1eebdtQo5Sf0IdfL2zwn9BuESCbmjLvNqqWdewmdMVYBobpIZE6YWdZlUZT0RRzmi78zKD3QG8R2tqg8RY44YDIVpJz//U40HuVARP8gHN4Q0N4BtJDiUfbKxUx+JFhsKintbwv1A+KeZD/SiG2TW2clvoI+q1eDn1CsWHkeh53VE9WSr0x8T8wlW3no0spCku1VRh+XaDGcE/agAaC+HviXvemL4mALCCBC2UnOUsIirX6ARqJEU6Tm4XTpJg1diylVISeRyW89vbu9qr7lbBvZhKUs2CQHNSjxgy45iJofV7Jd/HyeMLxyTEMOZRGCQJuHgpVRhvh9AGnZeX1chdsGB1H3RfYqAZkREVle5XDq5UZ73NhU/ctHe7PGVoEL3PnMyAu9AhugMvc"
+    "version":  "2.2.74",
+    "releaseDate":  "2026-10-16",
+    "minEngineVersion":  "2.1.0",
+    "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
+    "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
+    "changelog":  "1. Raio-X Universal do GBAK (100% somente leitura e prioridade baixa): quando o gbak falha por truncamento de coluna (string right truncation), overflow, registro corrompido ou erro de Trigger/Procedure, identifica automaticamente a Tabela e a Coluna exata afetada e inclui o diagnostico e sugestao de comando SQL no log e no e-mail de alerta imediato, sem alterar o banco em producao.\\n2. Blindagem 24/7 contra reinicio de servidor na tela de login: recuperacao e criptografia DPAPI local automatica das credenciais de rede, banco e SMTP no LiveUpdate e no Setup.\\n3. Suporte duplo em rede (Workgroup TERMINAL\\\\administrador e Dominio Active Directory DOMINIO\\\\administrador).",
+    "setupSha256":  "426A178C6F70979C4267B8066252FBECB3D7D9E9EE849705FF6A191538C529B2",
+    "engineSha256":  "D2DF53D2F8A7817427EC747FBAF3581BBE1E08C5CB305B41C01B6A5C8455147A",
+    "signature":  "B6SBO8ayb2krZe1A8L7mRD5TJ+9p2+RJ/Vj8Lofu6Yxh+nLnG8CifZUM9LEyIGlt3tICCkpb7wrm7RcG/etcQv0kSNg96oCff6zTLv35DS9omwqMG/lxaQb8NGtJ23ZXdBMZlQyVcB90dZY7CkLtF6qLrEmJKndMXcpkFGRMULWBvEqftQ0WCCtPWyRzvH3ksfRjrkrYZKiywa37MznJkSGMm3xKKr8/0bsPVZrEovZnT7yDCqj3jcfApoVmE2dsZuNodgzJ2pHIA64zab2r0LWEjGnWk1w+Gi3nRA5tuVjUTtfBfaOr/jFg2aVYGg7JVsU5aGEG0YfsPrPU7t3n6ZATze2Kdf4L8wS4obiFuiCW7MrOeVdVXHkg5BO5rQP11R8cko98cTL1bh61BVfF6BczX1GFLlES4/AmLlGDZ0qDcAQXgjb7Tr5f1nK3zWI3jqJSc2/TNvC7jx2lcELuDztO0mXQtFUs1tJxEJQipa2uAER/Q6jWBv5AFBe1xrUv"
 }
