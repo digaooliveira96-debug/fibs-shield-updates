@@ -44,7 +44,7 @@ if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.74"
+$script:EngineVersion = "2.2.75"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -625,7 +625,7 @@ function Get-FailureDiagnosis {
            Causa  = "O gbak n&atilde;o conseguiu se conectar ao Firebird. O servi&ccedil;o est&aacute; parado ou travado."
            Passos = @("Abrir <code>services.msc</code> e iniciar o <code>Firebird Server</code> (e o <code>Firebird Guardian</code>, se existir).", "Confirmar que o Sismotel abre normalmente na recep&ccedil;&atilde;o.", "Rodar a tarefa manualmente pelo painel.") }
         @{ Codigo = "DISCO_TEMPORARIO"
-           Padrao = "corrompido e ileg|corrupted and unreadable|cannot open status and error output file|nao aceita gravacao|nao aceite gravacao|e que aceite gravacao"
+           Padrao = "corrompido e ileg|corrupted and unreadable|cannot open status and error output file|cannot open backup file|nao aceita gravacao|nao aceite gravacao|e que aceite gravacao"
            Titulo = "Um disco do servidor recusou a grava&ccedil;&atilde;o"
            Causa  = "A pasta de trabalho do backup n&atilde;o p&ocirc;de ser criada ou gravada. Normalmente &eacute; o sistema de arquivos (NTFS) do disco com erro depois de queda de energia. O disco f&iacute;sico pode estar bom."
            Passos = @("No PowerShell como Administrador: <code>Get-Volume | select DriveLetter,HealthStatus</code>. O disco com problema aparece diferente de <code>Healthy</code>.", "Fora do hor&aacute;rio de pico, rodar <code>chkdsk X: /f</code> no disco indicado (X = letra do disco).", "Conferir a sa&uacute;de f&iacute;sica com o CrystalDiskInfo.", "Rodar a tarefa manualmente pelo painel.") }
@@ -2766,6 +2766,22 @@ function Send-BackupNotification {
                         $freeGB = [Math]::Round($dInfo.AvailableFreeSpace / 1GB, 1)
                         $totalGB = [Math]::Round($dInfo.TotalSize / 1GB, 1)
                         $FreeSpaceInfo = "$driveLetter ($freeGB GB livres de $totalGB GB)"
+                        $curTempDir = Get-Variable -Name tempDir -ValueOnly -ErrorAction SilentlyContinue
+                        $tempDrive = if (-not [string]::IsNullOrWhiteSpace("$curTempDir")) { [System.IO.Path]::GetPathRoot("$curTempDir") } else { "" }
+                        if (-not [string]::IsNullOrWhiteSpace($tempDrive) -and $tempDrive -ine $driveLetter) {
+                            try {
+                                $tInfo = New-Object System.IO.DriveInfo($tempDrive)
+                                if ($tInfo.IsReady) {
+                                    $tFreeGB = [Math]::Round($tInfo.AvailableFreeSpace / 1GB, 1)
+                                    $tTotalGB = [Math]::Round($tInfo.TotalSize / 1GB, 1)
+                                    $FreeSpaceInfo += " | Temp ${tempDrive} ($tFreeGB GB livres de $tTotalGB GB)"
+                                } else {
+                                    $FreeSpaceInfo += " | Temp ${tempDrive} (indisponivel)"
+                                }
+                            } catch {
+                                $FreeSpaceInfo += " | Temp ${tempDrive} (inacessivel)"
+                            }
+                        }
                     }
                 }
             } catch {}
@@ -4452,7 +4468,7 @@ function Send-AuditAlertNotification {
         $pageColor = if ($PageErrors -gt 0) { "#ef4444" } elseif ($PageErrors -lt 0) { "#94a3b8" } else { "#10b981" }
         $recordText = if ($RecordErrors -lt 0) { "n&atilde;o verificado" } else { "$RecordErrors" }
         $pageText = if ($PageErrors -lt 0) { "n&atilde;o verificado" } else { "$PageErrors" }
-        $gapColor = if ($TransactionGap -ge 200000) { "#f59e0b" } elseif ($TransactionGap -lt 0) { "#94a3b8" } else { "#10b981" }
+        $gapColor = "#94a3b8"
         $limitColor = if ($NextTransaction -ge 1500000000) { "#ef4444" } elseif ($NextTransaction -le 0) { "#94a3b8" } else { "#10b981" }
         $gapText = if ($TransactionGap -lt 0) { "n&atilde;o verificado" } else { "$TransactionGap" }
         $limitText = if ($NextTransaction -le 0) { "n&atilde;o verificado" } else { "$NextTransaction" }
@@ -4465,8 +4481,8 @@ function Send-AuditAlertNotification {
         $auditSeguro = "<strong>SIM, O SISMOTEL CONTINUA FUNCIONANDO NORMALMENTE.</strong> Este teste &eacute; feito em uma c&oacute;pia separada de madrugada, sem mexer no sistema em uso na recep&ccedil;&atilde;o."
         $auditFazer = if ($RecordErrors -gt 0 -or $PageErrors -gt 0) {
             "Agendar um hor&aacute;rio de menor movimento no motel para o suporte executar a limpeza/reparo preventivo do banco (<code>ReparadorFB.exe</code>)."
-        } elseif ($TransactionGap -ge 200000 -or $NextTransaction -ge 1500000000) {
-            "Verificar se h&aacute; algum computador com tela do Sismotel aberta h&aacute; muitos dias sem fechar, ou agendar limpeza preventiva com o suporte."
+        } elseif ($NextTransaction -ge 1500000000) {
+            "Agendar manuten&ccedil;&atilde;o preventiva com o suporte para reiniciar o contador de transa&ccedil;&otilde;es do banco (<code>fixtranslimit.exe</code>)."
         } else {
             "Acessar o servidor via AnyDesk/TeamViewer em hor&aacute;rio tranquilo para conferir o log do teste."
         }
@@ -4609,7 +4625,7 @@ function Send-AuditAlertNotification {
                       <strong style="color:#fbbf24;">2. Se houver Registros ou P&aacute;ginas com falha:</strong> Agende um hor&aacute;rio de pouco movimento no motel e execute o utilit&aacute;rio <code>ReparadorFB.exe</code> para corrigir o banco.
                     </div>
                     <div>
-                      <strong style="color:#fbbf24;">3. Se houver Opera&ccedil;&otilde;es Pendentes elevadas (Transaction Gap):</strong> Verifique se h&aacute; computadores com telas do Sismotel abertas sem fechar h&aacute; muito tempo ou execute a limpeza <code>fixtranslimit.exe</code>.
+                      <strong style="color:#fbbf24;">3. Conferir ap&oacute;s o reparo:</strong> Abra o painel do MEC Shield e clique em <strong>Auditar Banco</strong> para confirmar que Page Errors e Record Errors zeraram.
                     </div>
                   </td>
                 </tr>
@@ -5121,9 +5137,9 @@ function Invoke-DatabaseHealthAudit {
         $auditState.ConsecutiveInconclusive = [int]$auditState.ConsecutiveInconclusive + 1
         $auditState.ConsecutiveNotRestorable = 0
         Log-Message "[AUDITORIA INCONCLUSIVA] A integridade NAO foi comprovada hoje ($($auditState.ConsecutiveInconclusive) dia(s) seguido(s)). Motivo: $diagnostico"
-        # Falha persistente (2 auditorias seguidas) avisa; um soluco isolado nao.
+        # Zero Spam: auditoria inconclusiva (ex.: falta de espaco para sandbox) nunca envia e-mail.
         if ($auditState.ConsecutiveInconclusive -ge 2 -and -not (Test-WithinCooldown -Timestamp $auditState.LastInconclusiveAlert -Hours 20)) {
-            $headline = "AUDITORIA NAO CONSEGUE VALIDAR O BANCO"
+            Log-Message "[AUDITORIA ZERO SPAM] Auditoria inconclusiva registrada apenas em log local (sem envio de e-mail: alerta de banco restrito a Page/Record Errors)."
         }
     } elseif ($verdict -eq "NAO_RESTAURAVEL") {
         # Anti-spam: um GZ corrompido por backup interrompido e transitorio (o proximo ciclo corrige).
@@ -5152,16 +5168,16 @@ function Invoke-DatabaseHealthAudit {
     if ($null -ne $headline) {
         $global:mailSent = $false
         # CooldownHours e LastAlertTimestamp: dupla protecao contra envios duplicados.
-        # INCONCLUSIVO e NAO_RESTAURAVEL: 20h (ja controlados pelos contadores, mas a funcao
+        # NAO_RESTAURAVEL: 20h (ja controlado pelo contador, mas a funcao
         # tambem se auto-defende caso seja chamada forcadamente mais de uma vez no mesmo dia).
         # CORROMPIDO/LIMITE_TRANSACOES: sem cooldown (risco real e urgente, sempre dispara).
         $alertCooldownH = switch ($verdict) {
-            "INCONCLUSIVO"    { 20 }
+            # INCONCLUSIVO e silencioso (Zero-Spam v2.2.75)
             "NAO_RESTAURAVEL" { 20 }
             default           { 0 }
         }
         $alertLastTs = switch ($verdict) {
-            "INCONCLUSIVO"    { $auditState.LastInconclusiveAlert }
+            # INCONCLUSIVO nao dispara e-mail
             "NAO_RESTAURAVEL" { $auditState.LastNotRestorableAlert }
             default           { $null }
         }
@@ -6257,6 +6273,14 @@ function Invoke-ExternalTool {
 }
 
 # ==============================================================================
+# Identifica quando o gbak falhou por nao conseguir abrir/gravar o arquivo temporario (.fbk ou log)
+# na pasta temporaria selecionada (ex.: SRVFLOW E:\FIBS_TEMP recusando escrita do gbak).
+function Test-GbakTempDirError {
+    param([string]$ErrorText)
+    if ([string]::IsNullOrWhiteSpace($ErrorText)) { return $false }
+    return ($ErrorText -match '(?i)cannot open backup file|cannot open status and error output file|corrupted and unreadable|corrompido e ileg|Access is denied|Acesso negado|not enough space|disk is full|I/O error.*(open|CreateFile|write)')
+}
+
 # Modo biblioteca (testes Pester): carrega as funcoes e para aqui, sem executar nada.
 if ($env:MECSHIELD_LIBRARY_MODE -eq "1") { return }
 # ==============================================================================
@@ -6870,6 +6894,7 @@ $rodada1Temp = ""
 $rodada1Falha = ""
 $rodada1Instavel = $false
 $rodada1Diag = ""
+$gbakExcludedRoots = @()
 for ($rodada = 1; $rodada -le $rodadaMax; $rodada++) {
 if ($rodada -gt 1) {
     Log-Message "=== RODADA $rodada de $rodadaMax (gbak novo) | Diretorio temporario de processamento I/O: $tempDir ==="
@@ -6934,6 +6959,30 @@ for ($attempt = 1; $attempt -le $retryCount; $attempt++) {
     }
 
     if ($attempt -lt $retryCount) {
+        if (Test-GbakTempDirError -ErrorText $gbakError) {
+            if (Test-Path $tempFbk) { Remove-Item $tempFbk -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $gbakLog) { Remove-Item $gbakLog -Force -ErrorAction SilentlyContinue }
+            $oldTempDir = $tempDir
+            $oldRoot = [System.IO.Path]::GetPathRoot($oldTempDir)
+            Add-SuspectTempDir -Path $oldTempDir -Days 7 -Motivo $gbakError
+            $sysRoot = [System.IO.Path]::GetPathRoot($scriptDir)
+            if (-not [string]::IsNullOrWhiteSpace($oldRoot) -and ($oldRoot -ine $sysRoot) -and ($gbakExcludedRoots -notcontains $oldRoot)) {
+                $gbakExcludedRoots += $oldRoot
+            }
+            $altGbakTemp = Select-BackupTempDir -Destinations $resolvedDestList -DbDrive $dbDrive -DbSizeMB $dbSizeMB -ExcludeRoots $gbakExcludedRoots
+            if ($null -ne $altGbakTemp.Dir -and $altGbakTemp.Dir -ine $oldTempDir) {
+                $tempDir = $altGbakTemp.Dir
+                $tempFbk = Join-Path $tempDir "$basePrefix-$seqStr.fbk"
+                $tempGz  = Join-Path $tempDir "$basePrefix-$seqStr.GZ"
+                $gbakLog = Join-Path $tempDir "gbak_$($TaskName)_log.txt"
+                $gbakArgs = "-b -t"
+                if ($noGarbageCollection) { $gbakArgs += " -g" }
+                if ($convertExternal)    { $gbakArgs += " -co" }
+                $gbakArgs += " -y `"$gbakLog`""
+                $gbakArgs += " `"localhost:$dbPath`" `"$tempFbk`""
+                Log-Message "Failover automatico de pasta temporaria: '$oldTempDir' recusou a gravacao do gbak. Alternando para '$tempDir' na tentativa $($attempt + 1)..."
+            }
+        }
         Log-Message "Aguardando $retryInterval segundos antes de retentar..."
         Start-Sleep -Seconds $retryInterval
     }
@@ -7080,7 +7129,8 @@ if (-not $compSuccessFinal) {
         $rodada1Instavel = $origemInstavel
         $rodada1Diag = $diagOrigem
         Log-Message "RODADA $rodada de $rodadaMax falhou na integridade ($lastCompError). Refazendo a rodada completa (gbak + compactacao) para nao ficar sem backup..."
-        $alt = Select-BackupTempDir -Destinations $resolvedDestList -DbDrive $dbDrive -DbSizeMB $dbSizeMB -ExcludeRoots @([System.IO.Path]::GetPathRoot($tempDir))
+        $excludeRodada2 = @($gbakExcludedRoots + [System.IO.Path]::GetPathRoot($tempDir)) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+        $alt = Select-BackupTempDir -Destinations $resolvedDestList -DbDrive $dbDrive -DbSizeMB $dbSizeMB -ExcludeRoots $excludeRodada2
         if ($null -ne $alt.Dir) {
             $tempDir = $alt.Dir
             Log-Message "Rodada $($rodada + 1): usando pasta temporaria alternativa em outro disco/particao: $tempDir"

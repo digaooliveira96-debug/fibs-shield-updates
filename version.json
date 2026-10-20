@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.74",
-    "releaseDate":  "2026-10-16",
+    "version":  "2.2.75",
+    "releaseDate":  "2026-10-19",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Raio-X Universal do GBAK (100% somente leitura e prioridade baixa): quando o gbak falha por truncamento de coluna (string right truncation), overflow, registro corrompido ou erro de Trigger/Procedure, identifica automaticamente a Tabela e a Coluna exata afetada e inclui o diagnostico e sugestao de comando SQL no log e no e-mail de alerta imediato, sem alterar o banco em producao.\\n2. Blindagem 24/7 contra reinicio de servidor na tela de login: recuperacao e criptografia DPAPI local automatica das credenciais de rede, banco e SMTP no LiveUpdate e no Setup.\\n3. Suporte duplo em rede (Workgroup TERMINAL\\\\administrador e Dominio Active Directory DOMINIO\\\\administrador).",
-    "setupSha256":  "426A178C6F70979C4267B8066252FBECB3D7D9E9EE849705FF6A191538C529B2",
-    "engineSha256":  "D2DF53D2F8A7817427EC747FBAF3581BBE1E08C5CB305B41C01B6A5C8455147A",
-    "signature":  "B6SBO8ayb2krZe1A8L7mRD5TJ+9p2+RJ/Vj8Lofu6Yxh+nLnG8CifZUM9LEyIGlt3tICCkpb7wrm7RcG/etcQv0kSNg96oCff6zTLv35DS9omwqMG/lxaQb8NGtJ23ZXdBMZlQyVcB90dZY7CkLtF6qLrEmJKndMXcpkFGRMULWBvEqftQ0WCCtPWyRzvH3ksfRjrkrYZKiywa37MznJkSGMm3xKKr8/0bsPVZrEovZnT7yDCqj3jcfApoVmE2dsZuNodgzJ2pHIA64zab2r0LWEjGnWk1w+Gi3nRA5tuVjUTtfBfaOr/jFg2aVYGg7JVsU5aGEG0YfsPrPU7t3n6ZATze2Kdf4L8wS4obiFuiCW7MrOeVdVXHkg5BO5rQP11R8cko98cTL1bh61BVfF6BczX1GFLlES4/AmLlGDZ0qDcAQXgjb7Tr5f1nK3zWI3jqJSc2/TNvC7jx2lcELuDztO0mXQtFUs1tJxEJQipa2uAER/Q6jWBv5AFBe1xrUv"
+    "changelog":  "1. Zero Spam na Auditoria de Banco (03:30): alertas de e-mail do banco restritos exclusivamente a corrupcao real (Page Errors / Record Errors) ou backup nao restauravel; auditorias inconclusivas (como falta de espaco extra para sandbox) e Transaction Gap ficam apenas no log local, sem disparar e-mail desnecessario.\\n2. Failover automatico de pasta temporaria no GBAK (caso SRVFLOW): quando o gbak falha ao abrir/gravar o .fbk na unidade temporaria secundaria (ex.: E:\\\\FIBS_TEMP), marca a pasta como suspeita por 7 dias e alterna automaticamente para a pasta temporaria do sistema na tentativa seguinte, concluindo o backup em silencio.",
+    "setupSha256":  "D489C80C456B3700D113C532210423D164C87E45444F2427EAC3EFFE86B16A57",
+    "engineSha256":  "5D690E4FBBB831542E221B8E58099D5C247B23C6337630FB0DDD2CBFB025B763",
+    "signature":  "B+Kg0Qx4vIP6s7Mb1myYcbL3C7cdj+2BT9ovUrYLqr1zykUpyAs0zrKJbT2AllWov0haII5XTMU0Ysabkvgk1RadU4INb0MD6QslbYTXJaA4GsRjD8oIeCas52FRQryvA8elstn8QHJZvqqQLhbDelATUDvAxTczAVWOdbmqtNvcyN+IC10xratI0ScM0OsIaq2XEQyduIaZfmdNpnLHGV15FbUjwMnxP093ub/SkukyS5f9jboqHDlg5brPpLo44/eMRG0nPbOl0AJwEabde/fYQbBnBGPu4aBhaDAhTTfyb/NBDNdDi2BTJWwL/OW+TNZbNBLkDVpI3JeSinWlhKMpFlsAeTM8LXnujL4poVzlzy/nUoNR/Ka7norekjzu0lAH6USIbCqdq58rojEf+tDMmjCse7v/zPll83kbKkLghjMlXShessDXGz3XmzOZIbjcXfcZ3FOs9qJksmQshL5iWgjf6424Sp2H/sOjKYjaSDkz+mdDr7tCOV7tpW1K"
 }
