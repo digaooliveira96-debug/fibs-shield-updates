@@ -1,11 +1,11 @@
 {
     "version":  "2.2.75",
-    "releaseDate":  "2026-10-19",
+    "releaseDate":  "2026-10-20",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
     "changelog":  "1. Zero Spam na Auditoria de Banco (03:30): alertas de e-mail do banco restritos exclusivamente a corrupcao real (Page Errors / Record Errors) ou backup nao restauravel; auditorias inconclusivas (como falta de espaco extra para sandbox) e Transaction Gap ficam apenas no log local, sem disparar e-mail desnecessario.\\n2. Failover automatico de pasta temporaria no GBAK (caso SRVFLOW): quando o gbak falha ao abrir/gravar o .fbk na unidade temporaria secundaria (ex.: E:\\\\FIBS_TEMP), marca a pasta como suspeita por 7 dias e alterna automaticamente para a pasta temporaria do sistema na tentativa seguinte, concluindo o backup em silencio.",
-    "setupSha256":  "55E45A186AF1F00F0EA84B7DEBE8C05F85D63B420DD931B85854824CC615955C",
+    "setupSha256":  "2E03656FDB4C7970F67D8223596A27F3ED3822325F0832A84FC11F91F50E4365",
     "engineSha256":  "5D690E4FBBB831542E221B8E58099D5C247B23C6337630FB0DDD2CBFB025B763",
-    "signature":  "KZad0pEgF7uxgeBNpMwlzjvGlcRBoapIQUMfMzI1Pk8keoRIOu+GZ+7LbI5ZGmBWt1GJBgawPDJZKVTBOvg1yRgYC06zVMwoIH0U7RMUIAxssTyi0w4oHgv+m+jlx+QsYjTIr9CKr9Gh8c0OznIhK13vf9ARGqmnvFSrefEH+620ikLgDlbZVuviVXu7OJ2OOCOk0ruzF9fWD+SE8vaLfpVEiAIcb28bGrXjUD3Kn1zWhSO33dxhxhTiy2jxjlflXzRV8latf0M5S+jCAZcHmoJNm7mKu/6O/BP2y5MJ0yMNj44ADWi852SPQw0pftxIhrpYobNcZRaJzAlJy2gSu9g3/6uieMUKD7AY1fQVe17+EFSxQzpvfNCUIdWmgg2Sl4Q1ElBqiwkpFI1estGJ6QCRbTs+JCItwcLHD3R5kbouuX6LYpH8n3QuGjA1P5h5U/OQOYnbDPPsXfELJkcR65ClMcFCViaqSMk9QDEeeredNogUoNF+acEx/di2Xwev"
+    "signature":  "h/V0E6dciKT+wvHRbkz2xIYVrCuEUQdegN75U/bX8GheQV6TuC3TZrXwkiPIzVr6JB++w3j/PikPJTtzBMQm8LdQMbHOF1nCsFE2MonRFido8d3JQBa4OvIFb3gzej3Fz0oKrTiRgR8/GOezt9gtVFHrCReoPJQlzS/1EQ2iP2Mwc0iGM7cFGAfxXXept1b4MgY5Jl1UtbzYL8dIQTj0i+pVlYheO1W1srj0tWne/ElgKw5QN5+uDUXZ/v+rmDLX5Hj+D8gC5CucrdAdJ7XFgwP04UtgB15dgXmr7HX00r+ffMVOPD9iibABdOx2jtg8kmwwzEp5U2Y2ITrCM3gFkS0/zPgzbFqLcbLxPgZlV5kQbOa1SSPGbIK6lwrQDIMAK5PZvAI0AxKs6o+yp7SLXwlVTMFXTEWC3rMDTxxPejp3jgYLI5B0Mj3o8bvsdmcsGwK3cICyn/e9S1aKsl5fOVld9L2MsiW3URDd705zyuNTAmQyzz4Gzu1KsJiTWIRw"
 }
