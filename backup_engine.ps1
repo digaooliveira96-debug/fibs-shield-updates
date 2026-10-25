@@ -44,7 +44,7 @@ if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.75"
+$script:EngineVersion = "2.2.76"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -99,7 +99,7 @@ function Invoke-MecConvertFromJson {
     param([Parameter(ValueFromPipeline = $true)]$InputObject)
     process {
         if ($null -eq $InputObject) { return $null }
-        $raw = "$InputObject".Trim()
+        $raw = ("$InputObject" -replace "`0", "").Trim()
         if ($raw.Length -gt 0 -and [int][char]$raw[0] -eq 0xFEFF) { $raw = $raw.Substring(1).Trim() }
         if ($raw.Length -eq 0) { return $null }
         try { Add-Type -AssemblyName System.Web.Extensions -ErrorAction SilentlyContinue } catch {}
@@ -369,7 +369,17 @@ function Write-TextFileAtomic {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
     $tmp = "$Path.$PID.tmp"
-    [System.IO.File]::WriteAllText($tmp, $Content, (New-Object System.Text.UTF8Encoding($true)))
+    $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+    $preamble = $utf8Bom.GetPreamble()
+    $bodyBytes = $utf8Bom.GetBytes("$Content")
+    $fs = New-Object System.IO.FileStream($tmp, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    try {
+        if ($null -ne $preamble -and $preamble.Length -gt 0) { $fs.Write($preamble, 0, $preamble.Length) }
+        if ($null -ne $bodyBytes -and $bodyBytes.Length -gt 0) { $fs.Write($bodyBytes, 0, $bodyBytes.Length) }
+        $fs.Flush($true)
+    } finally {
+        $fs.Close()
+    }
     # Outro processo lendo o arquivo naquele instante (antivirus, interface) pode
     # impedir a troca: tenta algumas vezes antes de desistir.
     for ($i = 1; $i -le 5; $i++) {
@@ -403,6 +413,24 @@ function Save-JsonState {
     Write-TextFileAtomic -Path $Path -Content $json
 }
 
+# Le um arquivo .json de estado com tolerancia total a corrupcao por queda de energia
+# (bytes nulos \0 ou JSON truncado): remove \0 e BOM e devolve $null se ilegivel,
+# nunca lancando excecao que impeca o Save-JsonState de reconstruir o arquivo.
+function Read-JsonStateSafe {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path $Path)) { return $null }
+    try {
+        $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+        if ($null -eq $raw) { return $null }
+        $clean = ($raw -replace "`0", "").Trim()
+        if ($clean.Length -gt 0 -and [int][char]$clean[0] -eq 0xFEFF) { $clean = $clean.Substring(1).Trim() }
+        if ([string]::IsNullOrWhiteSpace($clean)) { return $null }
+        return ($clean | ConvertFrom-Json)
+    } catch {
+        return $null
+    }
+}
+
 # Le e interpreta o config.json. Se o arquivo estiver ilegivel (truncado), usa a
 # ultima copia boa (config.json.bak) gerada pela gravacao atomica.
 function Read-ConfigData {
@@ -412,7 +440,10 @@ function Read-ConfigData {
         for ($i = 1; $i -le 3; $i++) {
             try {
                 $raw = [System.IO.File]::ReadAllText($candidate, [System.Text.Encoding]::UTF8)
-                $obj = $raw | ConvertFrom-Json
+                $cleanCfg = ($raw -replace "`0", "").Trim()
+                if ($cleanCfg.Length -gt 0 -and [int][char]$cleanCfg[0] -eq 0xFEFF) { $cleanCfg = $cleanCfg.Substring(1).Trim() }
+                if ([string]::IsNullOrWhiteSpace($cleanCfg)) { break }
+                $obj = $cleanCfg | ConvertFrom-Json
                 if ($null -ne $obj -and $null -ne $obj.Tasks) {
                     if ($candidate -ne $Path) {
                         Log-Message "ATENCAO: config.json ilegivel. Usando a ultima copia valida: $candidate"
@@ -898,7 +929,7 @@ function Resolve-MappedDrivePath {
                 Invoke-WithMecLock -Name "State" -Script {
                     $cache = @{}
                     if (Test-Path $cacheFile) {
-                        $cache = ConvertTo-HashtableCompat ([System.IO.File]::ReadAllText($cacheFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json)
+                        $cache = ConvertTo-HashtableCompat (Read-JsonStateSafe -Path $cacheFile)
                     }
                     if ($cache[$driveLetter] -ne $remotePath) {
                         $cache[$driveLetter] = $remotePath
@@ -909,7 +940,7 @@ function Resolve-MappedDrivePath {
         } else {
             try {
                 if (Test-Path $cacheFile) {
-                    $cache = ConvertTo-HashtableCompat ([System.IO.File]::ReadAllText($cacheFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json)
+                    $cache = ConvertTo-HashtableCompat (Read-JsonStateSafe -Path $cacheFile)
                     if (-not [string]::IsNullOrWhiteSpace($cache[$driveLetter])) {
                         $remotePath = $cache[$driveLetter]
                         Log-Message "Unidade ${driveLetter}: nao visivel para esta conta; usando a ultima traducao conhecida: $remotePath"
@@ -1894,20 +1925,114 @@ function Test-BackupGzIntegrity {
     }
 }
 
+function Get-NetworkAuthUserCandidates {
+    param([string]$User)
+    if ([string]::IsNullOrWhiteSpace($User)) { return @() }
+    $cands = @($User)
+    try {
+        if ($User -notmatch '[\\@]') {
+            $csDom = Get-WmiObject Win32_ComputerSystem -ErrorAction SilentlyContinue
+            if ($null -ne $csDom -and $csDom.PartOfDomain -and -not [string]::IsNullOrWhiteSpace($csDom.Domain)) {
+                $domCurto = ($csDom.Domain -split '\.')[0]
+                if (-not [string]::IsNullOrWhiteSpace($domCurto)) {
+                    $cands += "$domCurto\$User"
+                }
+            }
+        }
+    } catch {}
+    return $cands
+}
+
+function Get-MaxBackupNumberInFolder {
+    param(
+        [string]$Directory,
+        [string]$Prefix,
+        [string]$NetworkUser = "",
+        [string]$NetworkPassword = ""
+    )
+    if ([string]::IsNullOrWhiteSpace($Directory)) { return -1 }
+    if ([string]::IsNullOrWhiteSpace($Prefix)) { $Prefix = "BKP_SISMOTEL" }
+    $dirClean = $Directory.Trim().Trim('"', "'").TrimEnd('\', '/')
+    if ([string]::IsNullOrWhiteSpace($dirClean)) { return -1 }
+
+    $escapedPfx = [regex]::Escape($Prefix)
+    $maxNum = -1
+
+    # 1. Tenta leitura direta (destinos locais ou UNC ja acessivel para a conta atual)
+    $openedDirect = $false
+    try {
+        if (Test-Path $dirClean) {
+            $openedDirect = $true
+            $files = @(Get-ChildItem -Path $dirClean -Filter "$Prefix-*.*" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer })
+            foreach ($f in $files) {
+                if ($f.Name -match "^${escapedPfx}-(\d+)\.(zip|gz|rar|fbk)$") {
+                    $num = [int]$matches[1]
+                    if ($num -gt $maxNum) { $maxNum = $num }
+                }
+            }
+            return $maxNum
+        }
+    } catch {}
+
+    # 2. Se for compartilhamento UNC (\\servidor\pasta) que exige credencial de rede (LogonUser),
+    # abre sessao temporaria para enxergar o maior arquivo existente (evita voltar para -0000.GZ
+    # e sobrescrever o backup 0000 quando backup_sequence.json foi resetado ou corrompido).
+    if (-not $openedDirect -and $dirClean.StartsWith("\\")) {
+        $uCred = $NetworkUser
+        $pCred = $NetworkPassword
+        if ([string]::IsNullOrWhiteSpace($uCred)) {
+            try {
+                $tasksCfg = if ($null -ne $global:configData -and $null -ne $global:configData.Tasks) { $global:configData.Tasks } else { $null }
+                $foundCred = Get-NetworkCredentialForDestination -Destination $dirClean -Tasks $tasksCfg
+                if ($null -ne $foundCred -and -not [string]::IsNullOrWhiteSpace($foundCred.User)) {
+                    $uCred = $foundCred.User
+                    $pCred = "$($foundCred.Password)"
+                }
+            } catch {}
+        }
+        if (-not [string]::IsNullOrWhiteSpace($uCred)) {
+            foreach ($uTry in @(Get-NetworkAuthUserCandidates -User $uCred)) {
+                $netSeqSess = $null
+                try {
+                    $netSeqSess = Enter-NetworkCredential -UNCPath $dirClean -User $uTry -Password "$pCred"
+                    if (-not $netSeqSess.Ok) { continue }
+                    if (Test-Path $dirClean) {
+                        $files = @(Get-ChildItem -Path $dirClean -Filter "$Prefix-*.*" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer })
+                        foreach ($f in $files) {
+                            if ($f.Name -match "^${escapedPfx}-(\d+)\.(zip|gz|rar|fbk)$") {
+                                $num = [int]$matches[1]
+                                if ($num -gt $maxNum) { $maxNum = $num }
+                            }
+                        }
+                        break
+                    }
+                } catch {
+                } finally {
+                    Exit-NetworkCredential $netSeqSess
+                }
+            }
+        }
+    }
+
+    return $maxNum
+}
+
 # Funcao de Gestao da Numeracao Sequencial Limpa (ex: BKP_SISMOTEL-0000.GZ)
 function Get-NextBackupSequenceNumber {
     param (
         [string]$Prefix,
         [string[]]$DestinationPaths,
         [int]$ConfiguredNextNumber = 0,
-        [string]$SequenceFilePath
+        [string]$SequenceFilePath,
+        [string]$NetworkUser = "",
+        [string]$NetworkPassword = ""
     )
     if ([string]::IsNullOrWhiteSpace($Prefix)) { $Prefix = "BKP_SISMOTEL" }
 
     $seqData = @{}
     if (Test-Path $SequenceFilePath) {
         try {
-            $raw = [System.IO.File]::ReadAllText($SequenceFilePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            $raw = Read-JsonStateSafe -Path $SequenceFilePath
             if ($null -ne $raw) {
                 foreach ($prop in $raw.psobject.Properties) {
                     $seqData[$prop.Name] = [int]$prop.Value
@@ -1922,6 +2047,8 @@ function Get-NextBackupSequenceNumber {
         foreach ($dest in $DestinationPaths) {
             if ([string]::IsNullOrWhiteSpace($dest)) { continue }
             $resolved = Resolve-MappedDrivePath $dest
+            $dirMax = Get-MaxBackupNumberInFolder -Directory $resolved -Prefix $Prefix -NetworkUser $NetworkUser -NetworkPassword $NetworkPassword
+            if ($dirMax -gt $maxFound) { $maxFound = $dirMax }
             if (Test-Path $resolved) {
                 try {
                     $files = Get-ChildItem -Path $resolved -Filter "$Prefix-*.*" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer }
@@ -1963,9 +2090,15 @@ function Save-BackupSequenceNumber {
         Invoke-WithMecLock -Name "State" -Script {
             $seqData = @{}
             if (Test-Path $SequenceFilePath) {
-                $raw = [System.IO.File]::ReadAllText($SequenceFilePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+                $raw = Read-JsonStateSafe -Path $SequenceFilePath
+                if ($null -eq $raw) {
+                    Log-Message "Auto-reparo: arquivo de sequencia '$SequenceFilePath' estava corrompido (queda de energia) e foi reconstruido automaticamente."
+                }
                 if ($null -ne $raw) {
-                    foreach ($prop in $raw.psobject.Properties) { $seqData[$prop.Name] = [int]$prop.Value }
+                    foreach ($prop in $raw.psobject.Properties) {
+                        $vSeq = 0
+                        if ([int]::TryParse("$($prop.Value)", [ref]$vSeq)) { $seqData[$prop.Name] = $vSeq }
+                    }
                 }
             }
             $next = $UsedNumber + 1
@@ -2162,7 +2295,7 @@ function Get-MailBudgetState {
     $f = Get-MailBudgetFile
     try {
         if (Test-Path $f) {
-            $raw = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            $raw = Read-JsonStateSafe -Path $f; if ($null -eq $raw) { $raw = New-Object PSObject }
             $agora = Get-Date
             $validos = @()
             foreach ($e in @($raw.Envios)) {
@@ -2426,7 +2559,7 @@ function Get-TaskNotificationState {
     $state = New-TaskNotificationState
     try {
         if (Test-Path $stateFile) {
-            $raw = [System.IO.File]::ReadAllText($stateFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            $raw = Read-JsonStateSafe -Path $stateFile
             $src = $null
             if ($null -ne $raw.Tasks -and $null -ne $raw.Tasks.PSObject.Properties[$TaskName]) {
                 $src = $raw.Tasks.PSObject.Properties[$TaskName].Value
@@ -2455,7 +2588,7 @@ function Save-TaskNotificationState {
             $all = @{}
             if (Test-Path $stateFile) {
                 try {
-                    $raw = [System.IO.File]::ReadAllText($stateFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+                    $raw = Read-JsonStateSafe -Path $stateFile
                     if ($null -ne $raw.Tasks) {
                         foreach ($p in $raw.Tasks.PSObject.Properties) { $all[$p.Name] = $p.Value }
                     }
@@ -2492,7 +2625,7 @@ function Send-BackupNotification {
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
             if (Test-Path $configFile) {
-                try { $global:configData = [System.IO.File]::ReadAllText($configFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
+                try { $global:configData = Read-ConfigData -Path $configFile } catch {}
             }
         }
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) { return }
@@ -3734,7 +3867,7 @@ function Send-NetworkFailureAlert {
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
             if (Test-Path $configFile) {
-                try { $global:configData = [System.IO.File]::ReadAllText($configFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
+                try { $global:configData = Read-ConfigData -Path $configFile } catch {}
             }
         }
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) { return }
@@ -4103,7 +4236,7 @@ function Save-NetworkTrackerEntries {
         Invoke-WithMecLock -Name "State" -Script {
             $current = @{}
             if (Test-Path $trackerFile) {
-                try { $current = ConvertTo-HashtableCompat ([System.IO.File]::ReadAllText($trackerFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json) } catch {}
+                try { $current = ConvertTo-HashtableCompat (Read-JsonStateSafe -Path $trackerFile) } catch {}
             }
             foreach ($k in ($Keys | Select-Object -Unique)) {
                 if ($Entries.ContainsKey($k)) { $current[$k] = $Entries[$k] }
@@ -4128,7 +4261,7 @@ function Test-ExternalDestinationsHealth {
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Tasks) {
             if (Test-Path $configFile) {
-                try { $global:configData = [System.IO.File]::ReadAllText($configFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
+                try { $global:configData = Read-ConfigData -Path $configFile } catch {}
             }
         }
         if ($null -eq $global:configData -or $null -eq $global:configData.Tasks) { return }
@@ -4161,7 +4294,7 @@ function Test-ExternalDestinationsHealth {
         $networkTrackerFile = Join-Path $scriptDir "network_tracker.json"
         $netTracker = @{}
         if (Test-Path $networkTrackerFile) {
-            try { $netTracker = ConvertTo-HashtableCompat ([System.IO.File]::ReadAllText($networkTrackerFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json) }
+            try { $netTracker = ConvertTo-HashtableCompat (Read-JsonStateSafe -Path $networkTrackerFile) }
     catch { Log-Message "Aviso: falha ao ler o rastreador de destinos: $_" }
         }
 
@@ -4179,7 +4312,7 @@ function Test-ExternalDestinationsHealth {
             if ($destResolved -ne $destTrim) {
                 $destTrim = $destResolved.TrimEnd('\', '/')
             }
-            $destGd = Resolve-GoogleDriveDestinationPath -Path $destTrim
+            $destGd = Resolve-GoogleDriveDestinationPath -Path $destTrim -DefaultFolder $nomeTarefaReal
             if ($destGd -ne $destTrim) {
                 $destTrim = $destGd.TrimEnd('\', '/')
             }
@@ -4209,7 +4342,11 @@ function Test-ExternalDestinationsHealth {
                     }
                     if (Test-Path $destTrim) {
                         $destAccessible = $true
-                        $existingGzs = @(Get-ChildItem -Path "$destTrim\*" -Include "*.GZ", "*.zip" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | Sort-Object LastWriteTime -Descending)
+                        $pfxMon = if (-not [string]::IsNullOrWhiteSpace($tConf.BackupFilePrefix)) { "$($tConf.BackupFilePrefix)".Trim() } elseif ($nomeTarefaReal -like "*EXTERNO*") { "BKP_EXTERNO" } else { "BKP_SISMOTEL" }
+                        $existingGzs = @(Get-PrefixBackupFiles -Directory $destTrim -Prefix $pfxMon | Where-Object { $_.Length -gt 0 })
+                        if ($existingGzs.Count -eq 0) {
+                            $existingGzs = @(Get-ChildItem -Path "$destTrim\*" -Include "*.GZ", "*.zip" -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer -and $_.Length -gt 0 -and ($pfxMon -ne "BKP_EXTERNO" -or $_.Name -notmatch '^BKP_SISMOTEL[-_]') } | Sort-Object LastWriteTime -Descending)
+                        }
                         if ($existingGzs.Count -gt 0) {
                             $realLastBackupTime = $existingGzs[0].LastWriteTime
                         }
@@ -4383,7 +4520,7 @@ function Get-AuditState {
     $st = (New-Object PSObject -Property @{ LastAuditDate = ""; LastResult = ""; ConsecutiveInconclusive = 0; LastInconclusiveAlert = $null; ConsecutiveNotRestorable = 0; LastNotRestorableAlert = $null; LastIndexWarning = ""; LastIndexWarningDate = "" })
     try {
         if (Test-Path $f) {
-            $raw = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            $raw = Read-JsonStateSafe -Path $f; if ($null -eq $raw) { $raw = New-Object PSObject }
             foreach ($p in @($st.PSObject.Properties)) {
                 $prop = $p.Name
                 if ($null -ne $raw.PSObject.Properties[$prop]) { $st.PSObject.Properties[$prop].Value = $raw.PSObject.Properties[$prop].Value }
@@ -4440,7 +4577,7 @@ function Send-AuditAlertNotification {
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
             if (Test-Path $configFile) {
-                try { $global:configData = [System.IO.File]::ReadAllText($configFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
+                try { $global:configData = Read-ConfigData -Path $configFile } catch {}
             }
         }
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) { return }
@@ -5277,7 +5414,10 @@ function Invoke-MecLiveUpdate {
         $fibsStateFile = Join-Path $scriptDir "fibs_state.json"
         $fibsState = $null
         if (Test-Path $fibsStateFile) {
-            try { $fibsState = [System.IO.File]::ReadAllText($fibsStateFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
+            $fibsState = Read-JsonStateSafe -Path $fibsStateFile
+            if ($null -eq $fibsState) {
+                $fibsState = (New-Object PSObject -Property @{ WelcomeEmailSent = $true; LastUpdateCheck = "" })
+            }
         }
         if ($null -eq $fibsState) {
             $fibsState = (New-Object PSObject -Property @{ WelcomeEmailSent = $false; LastUpdateCheck = "" })
@@ -5837,7 +5977,7 @@ function Get-SuspectTempDirs {
     $out = @()
     try {
         if (Test-Path $f) {
-            $raw = [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            $raw = Read-JsonStateSafe -Path $f; if ($null -eq $raw) { $raw = New-Object PSObject }
             foreach ($e in @($raw.Pastas)) {
                 if ($null -eq $e -or [string]::IsNullOrWhiteSpace("$($e.Pasta)") -or [string]::IsNullOrWhiteSpace("$($e.Ate)")) { continue }
                 try { if ([DateTime]::Parse("$($e.Ate)") -gt (Get-Date)) { $out += $e } } catch {}
@@ -6498,7 +6638,12 @@ if ($null -ne $cfgRecarregado) { $global:configData = $cfgRecarregado }
 $fibsStateFile = Join-Path $scriptDir "fibs_state.json"
 $fibsState = $null
 if (Test-Path $fibsStateFile) {
-    try { $fibsState = [System.IO.File]::ReadAllText($fibsStateFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
+    $fibsState = Read-JsonStateSafe -Path $fibsStateFile
+    if ($null -eq $fibsState) {
+        Log-Message "Auto-reparo: fibs_state.json estava corrompido (queda de energia) e foi reconstruido automaticamente."
+        $fibsState = (New-Object PSObject -Property @{ WelcomeEmailSent = $true; LastUpdateCheck = "" })
+        try { Invoke-WithMecLock -Name "State" -Script { Save-JsonState -Path $fibsStateFile -Data $fibsState -Depth 5 } } catch {}
+    }
 }
 if ($null -eq $fibsState) {
     $fibsState = (New-Object PSObject -Property @{ WelcomeEmailSent = $false; LastUpdateCheck = "" })
@@ -6555,7 +6700,11 @@ $dedupeMinutes = 10
 if (-not $Manual) {
     try {
         if (Test-Path $lastRunFile) {
-            $lastRuns = [System.IO.File]::ReadAllText($lastRunFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            $lastRuns = Read-JsonStateSafe -Path $lastRunFile
+            if ($null -eq $lastRuns) {
+                Log-Message "Auto-reparo: registro last_run.json estava corrompido (queda de energia) e foi limpo automaticamente."
+                try { Invoke-WithMecLock -Name "State" -Script { Save-JsonState -Path $lastRunFile -Data @{} } } catch {}
+            }
             $prevProp = if ($null -ne $lastRuns) { $lastRuns.PSObject.Properties[$TaskName] } else { $null }
             $prev = if ($null -ne $prevProp) { "$($prevProp.Value)" } else { $null }
             if (-not [string]::IsNullOrWhiteSpace($prev)) {
@@ -6881,7 +7030,9 @@ $basePrefix = if (-not [string]::IsNullOrWhiteSpace($task.BackupFilePrefix)) {
 
 $seqFile = Join-Path $scriptDir "backup_sequence.json"
 $confSeq = if ($null -ne $task.NextSequenceNumber -and $task.NextSequenceNumber -ge 0) { [int]$task.NextSequenceNumber } else { 0 }
-$seqNumber = Get-NextBackupSequenceNumber -Prefix $basePrefix -DestinationPaths $resolvedDestList -ConfiguredNextNumber $confSeq -SequenceFilePath $seqFile
+$seqNetUser = if (-not [string]::IsNullOrWhiteSpace($task.NetworkUser)) { Unprotect-String $task.NetworkUser } else { "" }
+$seqNetPass = if (-not [string]::IsNullOrWhiteSpace($task.NetworkPassword)) { Unprotect-String $task.NetworkPassword } else { "" }
+$seqNumber = Get-NextBackupSequenceNumber -Prefix $basePrefix -DestinationPaths $resolvedDestList -ConfiguredNextNumber $confSeq -SequenceFilePath $seqFile -NetworkUser "$seqNetUser" -NetworkPassword "$seqNetPass"
 $seqStr = "{0:D4}" -f $seqNumber
 
 # Rodadas completas (gbak + compactacao + conferencia). A 2a so acontece se a 1a
@@ -7332,6 +7483,11 @@ foreach ($destTrimmed in $resolvedDestList) {
             Log-Message "Backup GZ gravado e CONFERIDO em: $finalPath (SHA-256 identico a origem)"
 
             # Politica de Retencao (Expurgo dos mais antigos por tarefa / prefixo)
+            $maxInDest = Get-MaxBackupNumberInFolder -Directory $destClean -Prefix $basePrefix
+            if ($maxInDest -gt $seqNumber) {
+                Log-Message "Auto-reparo de sequencia em '$destClean': maior numeracao encontrada na pasta ($($maxInDest.ToString('0000'))) supera a atual ($($seqNumber.ToString('0000'))). Ajustando proxima sequencia."
+                $seqNumber = $maxInDest
+            }
             Invoke-RetentionPolicy -Directory $destClean -Prefix $basePrefix -Keep $keepBackupsCount
             break
         } catch {
@@ -7570,7 +7726,10 @@ try {
     Invoke-WithMecLock -Name "State" -Script {
         $runs = @{}
         if (Test-Path $lastRunFile) {
-            $prevRuns = [System.IO.File]::ReadAllText($lastRunFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            $prevRuns = Read-JsonStateSafe -Path $lastRunFile
+            if ($null -eq $prevRuns) {
+                Log-Message "Auto-reparo: registro last_run.json estava corrompido (queda de energia) e foi reconstruido automaticamente."
+            }
             if ($null -ne $prevRuns) {
                 foreach ($prop in $prevRuns.psobject.Properties) { $runs[$prop.Name] = "$($prop.Value)" }
             }

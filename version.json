@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.75",
-    "releaseDate":  "2026-10-20",
+    "version":  "2.2.76",
+    "releaseDate":  "2026-10-25",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Zero Spam na Auditoria de Banco (03:30): alertas de e-mail do banco restritos exclusivamente a corrupcao real (Page Errors / Record Errors) ou backup nao restauravel; auditorias inconclusivas (como falta de espaco extra para sandbox) e Transaction Gap ficam apenas no log local, sem disparar e-mail desnecessario.\\n2. Failover automatico de pasta temporaria no GBAK (caso SRVFLOW): quando o gbak falha ao abrir/gravar o .fbk na unidade temporaria secundaria (ex.: E:\\\\FIBS_TEMP), marca a pasta como suspeita por 7 dias e alterna automaticamente para a pasta temporaria do sistema na tentativa seguinte, concluindo o backup em silencio.",
-    "setupSha256":  "2E03656FDB4C7970F67D8223596A27F3ED3822325F0832A84FC11F91F50E4365",
-    "engineSha256":  "5D690E4FBBB831542E221B8E58099D5C247B23C6337630FB0DDD2CBFB025B763",
-    "signature":  "h/V0E6dciKT+wvHRbkz2xIYVrCuEUQdegN75U/bX8GheQV6TuC3TZrXwkiPIzVr6JB++w3j/PikPJTtzBMQm8LdQMbHOF1nCsFE2MonRFido8d3JQBa4OvIFb3gzej3Fz0oKrTiRgR8/GOezt9gtVFHrCReoPJQlzS/1EQ2iP2Mwc0iGM7cFGAfxXXept1b4MgY5Jl1UtbzYL8dIQTj0i+pVlYheO1W1srj0tWne/ElgKw5QN5+uDUXZ/v+rmDLX5Hj+D8gC5CucrdAdJ7XFgwP04UtgB15dgXmr7HX00r+ffMVOPD9iibABdOx2jtg8kmwwzEp5U2Y2ITrCM3gFkS0/zPgzbFqLcbLxPgZlV5kQbOa1SSPGbIK6lwrQDIMAK5PZvAI0AxKs6o+yp7SLXwlVTMFXTEWC3rMDTxxPejp3jgYLI5B0Mj3o8bvsdmcsGwK3cICyn/e9S1aKsl5fOVld9L2MsiW3URDd705zyuNTAmQyzz4Gzu1KsJiTWIRw"
+    "changelog":  "1. Auto-Reparo Blindado de Estados JSON apos Queda de Energia: gravacao com FileStream.Flush(true) fisico em disco antes da troca atomica e leitura segura (Read-JsonStateSafe) em todos os 11 arquivos de estado (backup_sequence.json, last_run.json, fibs_state.json, network_tracker.json, backup_state.json, audit_state.json, mail_budget.json, mapped_drives_cache.json, temp_suspeito.json, config.json), eliminando falhas por bytes nulos (JSON primitivo invalido) e reconstruindo automaticamente qualquer estado corrompido sem disparar falso e-mail de Nova Instalacao.\\n2. Recuperacao Automatica de Sequencia em Rede UNC (Anti-Travamento em 0000): Get-NextBackupSequenceNumber e a Fase 5 agora autenticam na pasta UNC com as credenciais da tarefa (Enter-NetworkCredential) para descobrir a maior numeracao real existente no destino remoto, destravando automaticamente qualquer cliente que tenha caido para -0000.GZ apos queda de energia.",
+    "setupSha256":  "BFDDC0CC556479EAE5895F50F6AFC8869C753B8DBC84F85F821C8AB28ABC4AF5",
+    "engineSha256":  "EBFD6470F92B5B5F7834B280F9D9B9CE5C809D69C4D2F8D4EA3C5C035C5966FD",
+    "signature":  "QeefpKoCaFje//NbrienxVtFDcjUfOdA1HEq1p3kmDra3iLJWKad2xw9O/2hClefDpCZyxq7HioetbuyXS+t96N/ISkdN2P/JHhQXnkf6MPU8XarLUtMAy8F0t2cBX37EwZmAtYYpvECOxaWoByvIRsfR866htH7prougiBWmNNntNyt3B62BlBRhOfG8+QBlv1nSK/K96NEnmvZge9YJiwv4kjXc3KuR4WUS7UxUmAhIhSWHR8/j2xkuzGjgt6dquvCUN0jNSFlaJIN1UT/cYeWaBf+fRhfZ1oeWh199ysU3cOYMU2LO2ni+P6BSh+WbOUupOMY6EqFaOjimXaAUtWK2TSbJuDacAB+bkUi1EHVUBhAX3Bt7v522iC+ZvKX0sVKLYsQGMT47jYVhqOQIeR95ROedV6gHtPSRFBz3UxeGEojuRgkTJ69UdnvpJioL1gNG2K1nJFm9YdtAEd9Kk9d0EHujOkXmUsIbUCTAR7pt+Q646z0er16WOSrQbOa"
 }
