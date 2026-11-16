@@ -44,7 +44,7 @@ if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.76"
+$script:EngineVersion = "2.2.77"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -4517,7 +4517,7 @@ function Get-OptimalSandboxDir {
 # era gravada reescrevendo o config.json inteiro, concorrendo com a interface.
 function Get-AuditState {
     $f = Join-Path $scriptDir "audit_state.json"
-    $st = (New-Object PSObject -Property @{ LastAuditDate = ""; LastResult = ""; ConsecutiveInconclusive = 0; LastInconclusiveAlert = $null; ConsecutiveNotRestorable = 0; LastNotRestorableAlert = $null; LastIndexWarning = ""; LastIndexWarningDate = "" })
+    $st = (New-Object PSObject -Property @{ LastAuditDate = ""; LastResult = ""; ConsecutiveInconclusive = 0; LastInconclusiveAlert = $null; ConsecutiveNotRestorable = 0; LastNotRestorableAlert = $null; LastIndexWarning = ""; LastIndexWarningDate = ""; LastTransactionGap = 0 })
     try {
         if (Test-Path $f) {
             $raw = Read-JsonStateSafe -Path $f; if ($null -eq $raw) { $raw = New-Object PSObject }
@@ -5008,6 +5008,7 @@ function Invoke-DatabaseHealthAudit {
     $oldestTrans = -1
     $nextTrans = -1
     $transGap = -1
+    $dbSizeMB = 0
 
     # 1. Ferramentas Firebird
     $gbakExe = "$($task.GbakPath)"
@@ -5252,6 +5253,7 @@ function Invoke-DatabaseHealthAudit {
     $auditState = Get-AuditState
     $auditState.LastAuditDate = (Get-Date -Format "yyyy-MM-dd")
     $auditState.LastResult = $verdict
+    $auditState.LastTransactionGap = [long]$transGap
     $diagnostico = ($motivos | Select-Object -Unique) -join " "
 
     $headline = $null
@@ -5326,6 +5328,18 @@ function Invoke-DatabaseHealthAudit {
             $auditState.LastNotRestorableAlert = (Get-Date).ToString("o")
         }
     }
+    try {
+        $hwPaths = @($liveDb)
+        if ($null -ne $task.Destinations) { $hwPaths += @($task.Destinations) }
+        $hwCheck = Test-ProactiveDiskDanger -Paths $hwPaths
+        if ($null -ne $hwCheck -and $hwCheck.HasDanger) {
+            Log-Message "[AUDITORIA ALERTA HARDWARE] $($hwCheck.Summary)"
+            $saudeAud = Get-StorageHealthReport -Paths $hwPaths -Days 7
+            $relHw = "LEITURA INSTAVEL DO DISCO/MEMORIA DO SERVIDOR. Alerta preventivo na auditoria: $($hwCheck.Summary)`n`nSAUDE DO ARMAZENAMENTO:`n$saudeAud"
+            $auditTaskName = if (-not [string]::IsNullOrWhiteSpace($task.TaskName)) { $task.TaskName } else { $TaskName }
+            Send-BackupNotification -Status "AVISO_HARDWARE" -SubjectInfo "Alerta Preventivo de Disco ($auditTaskName)" -BodyDetails $relHw -DbPath $liveDb -DbSize "$dbSizeMB" -HardwareSmartFail ([bool]$hwCheck.SmartFail)
+        }
+    } catch {}
     Save-AuditState -State $auditState
     Log-Message "--------------------------------------------------------------------------------"
     return $verdict
@@ -5829,6 +5843,31 @@ function Clear-StaleBackupTemp {
 # apontar a causa ao tecnico. So WMI e Get-WinEvent (Windows 7 / PS 2+), sempre em
 # try: diagnostico nunca derruba o backup.
 # ------------------------------------------------------------------------------
+# Executa um bloco PowerShell em runspace separado com limite de tempo (evita que
+# consultas WMI/SMART travem o motor quando um pendrive/disco USB queimado trava o driver).
+function Invoke-MecScriptWithTimeout {
+    param([string]$ScriptText, [int]$TimeoutMs = 5000)
+    if ([string]::IsNullOrWhiteSpace($ScriptText)) { return @() }
+    $ps = $null
+    try {
+        $ps = [System.Management.Automation.PowerShell]::Create()
+        [void]$ps.AddScript($ScriptText)
+        $iar = $ps.BeginInvoke()
+        if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+            $res = $ps.EndInvoke($iar)
+            try { $ps.Dispose() } catch {}
+            if ($null -eq $res) { return @() }
+            return $res
+        }
+        try { [void]$ps.BeginStop($null, $null) } catch {}
+        Log-Message "AVISO: consulta de hardware excedeu ${TimeoutMs}ms (possivel disco/USB travado); prosseguindo sem bloquear."
+        return @()
+    } catch {
+        if ($null -ne $ps) { try { $ps.Dispose() } catch {} }
+        return @()
+    }
+}
+
 function Get-PhysicalDiskOfPath {
     param([string]$Path)
     try {
@@ -5836,19 +5875,36 @@ function Get-PhysicalDiskOfPath {
         $root = [System.IO.Path]::GetPathRoot($Path)
         if ([string]::IsNullOrWhiteSpace($root) -or $root.StartsWith("\") -or $root.Length -lt 2) { return $null }
         $letter = $root.Substring(0, 2).ToUpper()
-        $parts = @(Get-WmiObject -Query "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='$letter'} WHERE AssocClass=Win32_LogicalDiskToPartition" -ErrorAction Stop)
-        foreach ($p in $parts) {
-            $drives = @(Get-WmiObject -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$($p.DeviceID)'} WHERE AssocClass=Win32_DiskDriveToDiskPartition" -ErrorAction Stop)
-            foreach ($d in $drives) {
-                return (New-Object PSObject -Property @{
-                    Index     = [int]$d.Index
-                    Model     = "$($d.Model)".Trim()
-                    Interface = "$($d.InterfaceType)"
-                    Status    = "$($d.Status)"
-                    PnpId     = "$($d.PNPDeviceID)"
-                    Letter    = $letter
-                })
-            }
+        if ($letter -notmatch '^[A-Z]:$') { return $null }
+        $wmiScript = @'
+Get-WmiObject -Query "ASSOCIATORS OF {Win32_LogicalDisk.DeviceID='__LETTER__'} WHERE AssocClass=Win32_LogicalDiskToPartition" -ErrorAction Stop | ForEach-Object {
+    $partId = "$($_.DeviceID)".Replace("'", "''")
+    Get-WmiObject -Query "ASSOCIATORS OF {Win32_DiskPartition.DeviceID='$partId'} WHERE AssocClass=Win32_DiskDriveToDiskPartition" -ErrorAction Stop
+} | ForEach-Object {
+    $sz = if ($null -ne $_.Size) { [long]$_.Size } else { [long]0 }
+    New-Object PSObject -Property @{
+        Index     = [int]$_.Index
+        Model     = "$($_.Model)".Trim()
+        Interface = "$($_.InterfaceType)"
+        Status    = "$($_.Status)"
+        PnpId     = "$($_.PNPDeviceID)"
+        Size      = $sz
+    }
+}
+'@.Replace("__LETTER__", $letter)
+        $drives = @(Invoke-MecScriptWithTimeout -ScriptText $wmiScript -TimeoutMs 5000)
+        foreach ($d in $drives) {
+            if ($null -eq $d -or $d -is [System.Array]) { continue }
+            if ([string]::IsNullOrWhiteSpace("$($d.Model)") -and [string]::IsNullOrWhiteSpace("$($d.PnpId)")) { continue }
+            if ([long]$d.Size -le 0 -and "$($d.Interface)" -eq "USB") { continue }
+            return (New-Object PSObject -Property @{
+                Index     = [int]$d.Index
+                Model     = "$($d.Model)".Trim()
+                Interface = "$($d.Interface)"
+                Status    = "$($d.Status)"
+                PnpId     = "$($d.PnpId)"
+                Letter    = $letter
+            })
         }
     } catch {}
     return $null
@@ -5858,8 +5914,19 @@ function Get-PhysicalDiskOfPath {
 function Get-SmartPredictFailureMap {
     $map = @{}
     try {
-        $st = @(Get-WmiObject -Namespace "root\wmi" -Class MSStorageDriver_FailurePredictStatus -ErrorAction Stop)
-        foreach ($s in $st) { $map["$($s.InstanceName)".ToUpper()] = [bool]$s.PredictFailure }
+        $smartScript = @'
+Get-WmiObject -Namespace "root\wmi" -Class MSStorageDriver_FailurePredictStatus -ErrorAction Stop | ForEach-Object {
+    New-Object PSObject -Property @{
+        InstanceName   = "$($_.InstanceName)"
+        PredictFailure = [bool]$_.PredictFailure
+    }
+}
+'@
+        $st = @(Invoke-MecScriptWithTimeout -ScriptText $smartScript -TimeoutMs 5000)
+        foreach ($s in $st) {
+            if ($null -eq $s -or [string]::IsNullOrWhiteSpace("$($s.InstanceName)")) { continue }
+            $map["$($s.InstanceName)".ToUpper()] = [bool]$s.PredictFailure
+        }
     } catch {}
     return $map
 }
@@ -5904,9 +5971,9 @@ function Get-DiskErrorEventSummary {
     )
     foreach ($f in $fontes) {
         try {
-            $filtro = @{ LogName = "System"; ProviderName = $f.P; StartTime = $inicio }
+            $filtro = @{ LogName = "System"; ProviderName = $f.P; Level = @(1, 2, 3); StartTime = $inicio }
             if ($f.Ids.Count -gt 0) { $filtro.Id = $f.Ids }
-            $ev = @(Get-WinEvent -FilterHashtable $filtro -MaxEvents 1000 -ErrorAction Stop)
+            $ev = @(Get-WinEvent -FilterHashtable $filtro -MaxEvents 500 -ErrorAction Stop)
             foreach ($g in @($ev | Group-Object Id)) {
                 $discos = @()
                 foreach ($e in @($g.Group)) {
@@ -5942,7 +6009,20 @@ function Get-StorageHealthReport {
             $linhas += "$r -> Disco $($d.Index): $($d.Model) ($($d.Interface)) | status Windows: $($d.Status) | $smTxt"
         }
         try {
-            $todos = @(Get-WmiObject -Class Win32_DiskDrive -ErrorAction Stop | Sort-Object Index)
+            $drivesScript = @'
+Get-WmiObject -Class Win32_DiskDrive -ErrorAction Stop | Sort-Object Index | ForEach-Object {
+    $sz = if ($null -ne $_.Size) { [long]$_.Size } else { [long]0 }
+    New-Object PSObject -Property @{
+        Index         = [int]$_.Index
+        Model         = "$($_.Model)"
+        InterfaceType = "$($_.InterfaceType)"
+        Size          = $sz
+        Status        = "$($_.Status)"
+        PNPDeviceID   = "$($_.PNPDeviceID)"
+    }
+}
+'@
+            $todos = @(Invoke-MecScriptWithTimeout -ScriptText $drivesScript -TimeoutMs 5000)
             if ($todos.Count -gt 0) {
                 $lista = @()
                 foreach ($t in $todos) {
@@ -5968,6 +6048,49 @@ function Get-StorageHealthReport {
         $linhas += "Diagnostico de disco indisponivel: $($_.Exception.Message)"
     }
     return ($linhas -join "`n")
+}
+
+# Avaliacao preventiva de saude fisica dos discos envolvidos no banco/backup.
+# Usada na auditoria diaria para alertar (com escada Zero-Spam) antes que um HD falhe de vez.
+function Test-ProactiveDiskDanger {
+    param([string[]]$Paths, $SmartMap = $null, $RecentEvents = $null)
+    $reasons = @()
+    $smartFail = $false
+    try {
+        $sm = if ($null -ne $SmartMap) { $SmartMap } else { Get-SmartPredictFailureMap }
+        $checkedDisks = @()
+        foreach ($p in @($Paths)) {
+            if ([string]::IsNullOrWhiteSpace($p) -or $p.StartsWith("\")) { continue }
+            $d = Get-PhysicalDiskOfPath -Path $p
+            if ($null -eq $d) { continue }
+            if ("$($d.Interface)" -eq "USB" -and $d.Status -eq "OK") { continue }
+            if ($checkedDisks -contains "$($d.Index)") { continue }
+            $checkedDisks += "$($d.Index)"
+            if ((Test-SmartPredictFailure -Disk $d -Map $sm) -eq $true) {
+                $smartFail = $true
+                $reasons += "SMART preve falha iminente no Disco $($d.Index) ($($d.Model))"
+            }
+        }
+        $evs = if ($null -ne $RecentEvents) { @($RecentEvents) } else { @(Get-DiskErrorEventSummary -Days 1) }
+        foreach ($ev in $evs) {
+            if ($null -eq $ev) { continue }
+            $id = [int]$ev.Id
+            $cnt = [int]$ev.Count
+            $prov = "$($ev.Provider)"
+            if ($prov -eq "disk" -and ($id -eq 7 -or $id -eq 52 -or $id -eq 154)) {
+                $reasons += "Evento critico disk $id x$cnt nas ultimas 24h ($(Get-DiskEventMeaning -Provider $prov -Id $id))"
+            } elseif ($prov -eq "disk" -and ($id -eq 51 -or $id -eq 153) -and $cnt -ge 5) {
+                $reasons += "Instabilidade severa disk $id x$cnt nas ultimas 24h ($(Get-DiskEventMeaning -Provider $prov -Id $id))"
+            } elseif ($prov -match "Ntfs" -and $id -eq 55) {
+                $reasons += "Corrupcao de sistema de arquivos Ntfs 55 x$cnt nas ultimas 24h"
+            }
+        }
+    } catch {}
+    return (New-Object PSObject -Property @{
+        HasDanger = ($reasons.Count -gt 0)
+        SmartFail = $smartFail
+        Summary   = ($reasons -join "; ")
+    })
 }
 
 # Pastas temporarias que deram leitura instavel ficam "suspeitas" por alguns dias:
