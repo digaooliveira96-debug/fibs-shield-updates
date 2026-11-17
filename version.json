@@ -1,11 +1,11 @@
 {
-    "version":  "2.2.77",
-    "releaseDate":  "2026-11-16",
+    "version":  "2.2.78",
+    "releaseDate":  "2026-11-17",
     "minEngineVersion":  "2.1.0",
     "downloadUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/backup_engine.ps1",
     "setupUrl":  "https://raw.githubusercontent.com/digaooliveira96-debug/fibs-shield-updates/main/MEC_Shield_Setup.exe",
-    "changelog":  "1. Painel C# Imune a Travamentos (Not Responding): IsUsableBackupDrive agora verifica DriveType.Fixed antes de IsReady (eliminando congelamento por pendrives queimados ou USB de 0 GB), ParseTasks nao varre discos ao carregar configuracoes existentes, e checagem de gbak/Detectar na Pasta rodam fora da thread da tela.\\n2. Destaque Visual e Resumo da Auditoria: tarefas pausadas ficam destacadas em ambar com alerta na barra de status e exibicao do status da auditoria diaria e Transaction Gap.\\n3. Blindagem de Servico e Motor: timeout de 5s nas consultas WMI/SMART do motor (Invoke-MecScriptWithTimeout), -NonInteractive e guarda anti-zumbi (\u003e150 min) no servico C#, eliminacao do falso positivo Ntfs 98 (is healthy) e alerta preventivo de hardware (Test-ProactiveDiskDanger) na auditoria das 03:30.\\n4. Instalador e Publicador OTA: encerra FIBS.exe legado e limpa inicializacao antiga no Registro; publicar_versao.ps1 limpa instaladores antigos e recria o canal OTA publico no GitHub se ausente.",
-    "setupSha256":  "39C9772C12D68F9B58E5B90AFF1598B488CFF8E41B36F7F41A9C95BCBD70F4A9",
-    "engineSha256":  "CFCEFED60155448E35F56E7EB0D9C627E2AFA4C17FF274B91CD424F15C55339A",
-    "signature":  "GqPCav7Gzpu/Rm00vfPwlEedmJ7lf1SZj1lJCdiuWzwvYACaGsbyTbGGFL6IAE2FlgbEmJe7E/RuStDCmuGObTc1IzRQEuXV+yXtS2VhJjHq1TXJqOJhsqeYVISuraf+AJs/xg5AldogQxHwUbT93UZXv3dui+4R1T2peWeDehNfQcth20h2qOCQCRfMsaMVX6CxyvHJ1m5euf2PaQbgfngEvz5fCC3BupigxfdMhCTo7dVdN/m51yX5LeNPrTzNQIEZVGcEbjPEtPrDpZzCvsPVj5/LJYf5+Wf1nuRz1tGtgSVqKU7gcYaBKBscvxIYOeqzMSKkivzCsw11A300uwNLp/13YgCiB8Y55ahuaFFzBTIiabcfsYZhGHnYXM9oXimCXkCOOV+hDwJkJDDL9UXtUW2Zt/uQHoxwt1yKBlbo9CYIyfqpPq+blmyA+6cbMd1TA3OSK/ghxTlFe0x2KWaOuV7R/CCfTvlpdUsExE72dzn25+jbRHgJZDpNNWl0"
+    "changelog":  "1. Zero-Spam no alerta preventivo de disco da auditoria das 03:30: so conta evento de disco que guarda o banco ou os destinos de backup (HD USB e disco sem backup nao alertam), exige 3 ocorrencias em 24h (SMART Pred Fail e disk 52 continuam alertando na hora; disk 51/153 e eventos sem disco identificado exigem 5; Ntfs 55 exige 2).\\n2. E-mail do aviso preventivo com texto proprio (nao afirma mais que refez o backup em outra pasta) e assunto Aviso preventivo.\\n3. Escada de avisos mantida: 1o aviso, 2o apos 3 dias, 3o apos 7 dias, depois silencio com lembrete a cada 30 dias.",
+    "setupSha256":  "629997C1587B5C8BBE561B33B09E8D3DDDB3921C2513E8FBC06E0EDDAB3344AF",
+    "engineSha256":  "E1B7DB7AAE486E88819DA22017EF7DC8E4FDB8E0B06D2710071E866AC3FF0DE7",
+    "signature":  "siwlfL24nz1H60AYuUJp355/Aq32HbxkHbz3DTm0ac/nr7g07sc9bdZSnhs1O+qT3cHxROfZgjtdEMBzYaW/VYm1wSW43UhoN0os4kyC3x2HylDJfOtrNKbtZPGOPRezVxZK+1msNaeo3EArBLuUf7ncprdS21Z4VbCGgbMIy92k+pFmxJiAVL1p9tfKoNE3k8GkFErPwQco+EQAPppK9j6t/Cwhj4/U5cdI7zbClbiWQCXbqgcAHDzClDSxJMjnVPgk6NiE9D+ypvELz/pCxH3TMnAV0l0vD2AuefwdsjDR2UaEGvnCJ2vAljx9Fjo1moj9W+Dq+YsV5IiXWmnGCi9/s0ebeisv4z+E3aXyF4Dlw8vKmEr6NyFlE9SCkV9wRjwlggGHwsVu4USCFMLy8mxtlIGXdsSH8+NVEYnHrGH0bAqN4nInbuJPZzP134JsSP183ZnzymEW2+Ck3KicsMjJYGF2Ie9VF6NEFdym8Dl9Szq8VLT8B2Ob7PqbpfPD"
 }

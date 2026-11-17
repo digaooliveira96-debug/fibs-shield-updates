@@ -44,7 +44,7 @@ if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.77"
+$script:EngineVersion = "2.2.78"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -2620,6 +2620,7 @@ function Send-BackupNotification {
         [string[]]$SuccessDests = @(),
         [string[]]$WarningDests = @(),
         [bool]$HardwareSmartFail = $false,
+        [bool]$PreventiveAudit = $false,
         [string]$UnverifiedCopy = ""
     )
     try {
@@ -2811,7 +2812,10 @@ function Send-BackupNotification {
             $subjectTag = "[MEC AVISO HARDWARE]"
             $bannerBg = "#d97706"
             $bannerType = "WARNING"
-            if ($hwOrdem -eq 1) {
+            if ($hwOrdem -eq 1 -and $PreventiveAudit) {
+                $statusTitle = "AVISO PREVENTIVO: UM DISCO DO SERVIDOR MOSTRA SINAIS DE FALHA"
+                $assunto = "[MEC Shield] Aviso preventivo: um disco do servidor mostra sinais de falha"
+            } elseif ($hwOrdem -eq 1) {
                 $statusTitle = "BACKUP SALVO, MAS O SERVIDOR TEM DISCO/MEMORIA INSTAVEL"
                 $assunto = "[MEC Shield] Aviso: backup salvo, mas o disco/memoria do servidor esta instavel"
             } elseif ($hwOrdem -eq 2) {
@@ -2864,10 +2868,18 @@ function Send-BackupNotification {
             $topoFazer = if ($primeiroPasso) { $primeiroPasso } else { "Acessar o servidor e seguir os passos de A&Ccedil;&Atilde;O RECOMENDADA abaixo." }
             if ([int]$state.FailureAlertsSent -gt 0) { $topoNota = "Lembrete de uma falha que continua. Enquanto n&atilde;o for resolvida, o MEC Shield avisa no m&aacute;ximo 1 vez por dia." }
         } elseif ($Status -eq "AVISO_HARDWARE") {
-            $topoAconteceu = "O disco ou a mem&oacute;ria do servidor deu leitura inst&aacute;vel. O MEC Shield percebeu, descartou a c&oacute;pia duvidosa e refez o backup em outra pasta."
-            $topoSeguro = "<strong>SIM.</strong> O backup foi salvo e conferido (SHA-256 id&ecirc;ntico ao banco)."
-            if ($ultimoBomHtml) { $topoSeguro += " &Uacute;ltimo backup v&aacute;lido: $ultimoBomHtml." }
-            $topoFazer = "Trocar o disco indicado em SA&Uacute;DE DO ARMAZENAMENTO (abaixo) ou testar a mem&oacute;ria (mdsched). N&atilde;o &eacute; urgente hoje: o MEC Shield est&aacute; contornando sozinho."
+            if ($PreventiveAudit) {
+                # Alerta da auditoria diaria: nenhum backup foi refeito, so ha sinal de risco no disco.
+                $topoAconteceu = "A verifica&ccedil;&atilde;o di&aacute;ria encontrou sinais de que um disco do servidor pode falhar. Nenhuma falha de backup foi detectada."
+                $topoSeguro = "<strong>SIM, at&eacute; agora.</strong> Os backups continuam sendo salvos e conferidos."
+                if ($ultimoBomHtml) { $topoSeguro += " &Uacute;ltimo backup v&aacute;lido: $ultimoBomHtml." }
+                $topoFazer = "Conferir o disco indicado em SA&Uacute;DE DO ARMAZENAMENTO (abaixo) no CrystalDiskInfo e programar a troca. Manter a c&oacute;pia em outro disco ou na rede."
+            } else {
+                $topoAconteceu = "O disco ou a mem&oacute;ria do servidor deu leitura inst&aacute;vel. O MEC Shield percebeu, descartou a c&oacute;pia duvidosa e refez o backup em outra pasta."
+                $topoSeguro = "<strong>SIM.</strong> O backup foi salvo e conferido (SHA-256 id&ecirc;ntico ao banco)."
+                if ($ultimoBomHtml) { $topoSeguro += " &Uacute;ltimo backup v&aacute;lido: $ultimoBomHtml." }
+                $topoFazer = "Trocar o disco indicado em SA&Uacute;DE DO ARMAZENAMENTO (abaixo) ou testar a mem&oacute;ria (mdsched). N&atilde;o &eacute; urgente hoje: o MEC Shield est&aacute; contornando sozinho."
+            }
             $topoNota = if ($hwOrdem -le 3) { "Aviso $hwOrdem de 3. Depois do 3&ordm; o MEC Shield para de repetir este alerta e s&oacute; volta a avisar se piorar." } else { "Lembrete mensal: o problema continua. O MEC Shield segue contornando sozinho." }
         } elseif ($Status -eq "AVISO") {
             $topoAconteceu = if ($null -ne $diag) { $diag.Titulo } else { ConvertTo-HtmlSafe $SubjectInfo }
@@ -5337,7 +5349,7 @@ function Invoke-DatabaseHealthAudit {
             $saudeAud = Get-StorageHealthReport -Paths $hwPaths -Days 7
             $relHw = "LEITURA INSTAVEL DO DISCO/MEMORIA DO SERVIDOR. Alerta preventivo na auditoria: $($hwCheck.Summary)`n`nSAUDE DO ARMAZENAMENTO:`n$saudeAud"
             $auditTaskName = if (-not [string]::IsNullOrWhiteSpace($task.TaskName)) { $task.TaskName } else { $TaskName }
-            Send-BackupNotification -Status "AVISO_HARDWARE" -SubjectInfo "Alerta Preventivo de Disco ($auditTaskName)" -BodyDetails $relHw -DbPath $liveDb -DbSize "$dbSizeMB" -HardwareSmartFail ([bool]$hwCheck.SmartFail)
+            Send-BackupNotification -Status "AVISO_HARDWARE" -SubjectInfo "Alerta Preventivo de Disco ($auditTaskName)" -BodyDetails $relHw -DbPath $liveDb -DbSize "$dbSizeMB" -HardwareSmartFail ([bool]$hwCheck.SmartFail) -PreventiveAudit $true
         }
     } catch {}
     Save-AuditState -State $auditState
@@ -6077,11 +6089,21 @@ function Test-ProactiveDiskDanger {
             $id = [int]$ev.Id
             $cnt = [int]$ev.Count
             $prov = "$($ev.Provider)"
-            if ($prov -eq "disk" -and ($id -eq 7 -or $id -eq 52 -or $id -eq 154)) {
+            # Zero-Spam (v2.2.78): evento so conta se for de um disco do banco/destinos.
+            # Evento de pendrive/HD externo ou de disco que nao guarda backup nao alerta.
+            # Evento sem disco identificado so conta com volume alto (>= 5 em 24h).
+            $evDisks = @($ev.Disks | Where-Object { $null -ne $_ -and "$_" -ne "" })
+            $doMeuDisco = $false
+            foreach ($ed in $evDisks) { if ($checkedDisks -contains "$ed") { $doMeuDisco = $true } }
+            if ($evDisks.Count -gt 0 -and -not $doMeuDisco) { continue }
+            $minimo = if ($doMeuDisco) { 3 } else { 5 }
+            if ($prov -eq "disk" -and $id -eq 52 -and $doMeuDisco) {
+                $reasons += "Evento critico disk $id x$cnt nas ultimas 24h ($(Get-DiskEventMeaning -Provider $prov -Id $id))"
+            } elseif ($prov -eq "disk" -and ($id -eq 7 -or $id -eq 52 -or $id -eq 154) -and $cnt -ge $minimo) {
                 $reasons += "Evento critico disk $id x$cnt nas ultimas 24h ($(Get-DiskEventMeaning -Provider $prov -Id $id))"
             } elseif ($prov -eq "disk" -and ($id -eq 51 -or $id -eq 153) -and $cnt -ge 5) {
                 $reasons += "Instabilidade severa disk $id x$cnt nas ultimas 24h ($(Get-DiskEventMeaning -Provider $prov -Id $id))"
-            } elseif ($prov -match "Ntfs" -and $id -eq 55) {
+            } elseif ($prov -match "Ntfs" -and $id -eq 55 -and $cnt -ge 2) {
                 $reasons += "Corrupcao de sistema de arquivos Ntfs 55 x$cnt nas ultimas 24h"
             }
         }
