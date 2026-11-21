@@ -44,7 +44,7 @@ if ($PSVersionTable.CLRVersion.Major -lt 4 -and $env:MECSHIELD_CLR4_RELAUNCH -ne
 # Versao UNICA do motor. O LiveUpdate compara com o manifesto remoto e os testes
 # garantem que ela e igual a version.json, AssemblyInfo.cs e ao AppVersion do .iss.
 # (Versao divergente fazia o LiveUpdate reinstalar o pacote a cada 2 horas.)
-$script:EngineVersion = "2.2.78"
+$script:EngineVersion = "2.2.79"
 # Compatibilidade com clientes antigos no LiveUpdate: Invoke-TaskBackup
 
 try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
@@ -625,6 +625,16 @@ function Get-FailureDiagnosis {
            Titulo = "Motor desatualizado para o PowerShell deste servidor"
            Causa  = "O servidor tem um PowerShell antigo (ex.: Windows Server 2012) e esta vers&atilde;o do motor usou um recurso que ele n&atilde;o possui. O backup n&atilde;o foi gravado."
            Passos = @("Conferir a vers&atilde;o no rodap&eacute; deste e-mail e comparar com a &uacute;ltima publicada.", "Aguardar a atualiza&ccedil;&atilde;o autom&aacute;tica ou reinstalar com o Setup mais recente.", "Rodar a tarefa manualmente pelo painel e conferir se volta a gravar.") }
+        @{ Codigo = "ENERGIA_INSTAVEL"
+           Padrao = "DESLIGAMENTOS INESPERADOS"
+           Titulo = "O servidor est&aacute; desligando sozinho"
+           Causa  = "O Windows registrou v&aacute;rias vezes que o servidor foi desligado sem passar pelo desligamento normal. As causas mais comuns s&atilde;o falta de energia, fonte do computador ruim, nobreak sem bateria ou tela azul."
+           Passos = @("Ver em <b>DESLIGAMENTOS DOS &Uacute;LTIMOS 7 DIAS</b> o dia e a hora de cada desligamento e o tipo (energia, tela azul ou bot&atilde;o).", "<b>Energia:</b> perguntar ao cliente se faltou luz nesses hor&aacute;rios. Se sim, ligar o servidor num nobreak (ou trocar a bateria do nobreak). Se n&atilde;o faltou luz, trocar a fonte do servidor e conferir tomada/filtro de linha.", "<b>Tela azul:</b> testar a mem&oacute;ria (<code>mdsched</code>) fora do hor&aacute;rio de pico e atualizar os drivers.", "Nada a fazer no banco agora: o MEC Shield confere o backup toda madrugada e avisa se o banco for afetado.") }
+        @{ Codigo = "DISCO_PREVENTIVO"
+           Padrao = "ALERTA PREVENTIVO DE DISCO"
+           Titulo = "Um disco do servidor est&aacute; com a sa&uacute;de abaixo do normal"
+           Causa  = "A verifica&ccedil;&atilde;o di&aacute;ria leu o S.M.A.R.T. dos discos com o CrystalDiskInfo (o mesmo programa que o t&eacute;cnico abre na tela) e ele classificou um disco do banco ou do backup como ATEN&Ccedil;&Atilde;O ou RUIM. Nenhum backup falhou: &eacute; um aviso para trocar o disco com calma, antes que ele pare."
+           Passos = @("Ver em <b>SA&Uacute;DE DOS DISCOS</b> qual disco est&aacute; amarelo (aten&ccedil;&atilde;o) ou vermelho (cr&iacute;tico) e o que ele guarda (banco ou backup).", "Comprar um disco novo e agendar a troca com o cliente (vermelho: o quanto antes; amarelo: nas pr&oacute;ximas semanas).", "At&eacute; a troca, garantir que existe uma c&oacute;pia do backup em outro computador ou na rede.", "Se quiser conferir, abra <code>C:\Microtecs\FIBS\CrystalDiskInfo\DiskInfo64.exe</code> no servidor: ele mostra o mesmo resultado.") }
         @{ Codigo = "HARDWARE_INSTAVEL"
            Padrao = "LEITURA INSTAVEL"
            Titulo = "Disco ou mem&oacute;ria do servidor devolvendo dados diferentes"
@@ -2181,6 +2191,13 @@ function Get-BestBannerPath([string]$preferredType) {
         $candidates += Join-Path $scriptDir "mec_banner_audit.png"
         $candidates += Join-Path $assetsDir "mec_banner_alert.png"
         $candidates += Join-Path $scriptDir "mec_banner_alert.png"
+    } elseif ($preferredType -eq "AVISO" -or $preferredType -eq "DISCOS" -or $preferredType -eq "ENERGIA") {
+        # v2.2.79: faixas proprias (antes o aviso de configuracao saia com "ALERTA DE REDE")
+        $arq = "mec_banner_" + $preferredType.ToLower() + ".png"
+        $candidates += Join-Path $assetsDir $arq
+        $candidates += Join-Path $scriptDir $arq
+        $candidates += Join-Path $assetsDir "mec_banner_audit.png"
+        $candidates += Join-Path $scriptDir "mec_banner_audit.png"
     }
     
     $candidates += Join-Path $assetsDir "banner_mec_dark.png"
@@ -2340,6 +2357,28 @@ function Get-HardwareWarningDue {
     if ($dias -lt 0) { return $false }
     $prazo = if ($Sent -eq 1) { 3 } elseif ($Sent -eq 2) { 7 } else { 30 }
     return ($dias -ge $prazo)
+}
+
+# Aviso PREVENTIVO de disco (v2.2.79, auditoria diaria + CrystalDiskInfo): no maximo
+# 2 e-mails por problema (1o na hora, ultimo lembrete apos 7 dias) e depois silencio.
+# So volta a avisar se PIORAR: gravidade subiu (ATENCAO -> CRITICO) ou os setores com
+# defeito cresceram 10 ou mais desde o ultimo e-mail. Severity: 1 = atencao, 2 = critico.
+function Get-PreventiveDiskDecision {
+    param([int]$Sent, $LastWarning, [int]$Severity, [long]$Sectors = -1, [int]$LastSeverity = 0, [long]$LastSectors = -1, [datetime]$Now = (Get-Date), [long]$WorsenStep = 10)
+    $piorou = $false
+    if ($Sent -gt 0) {
+        if ($Severity -gt $LastSeverity) { $piorou = $true }
+        elseif ($Sectors -ge 0 -and $LastSectors -ge 0 -and $Sectors -ge ($LastSectors + $WorsenStep)) { $piorou = $true }
+    }
+    if ($Sent -le 0 -or $piorou) {
+        return (New-Object PSObject -Property @{ Send = $true; Order = 1; Worsened = $piorou })
+    }
+    if ($Sent -eq 1) {
+        $dias = 999
+        try { if (-not [string]::IsNullOrWhiteSpace("$LastWarning")) { $dias = ($Now - [DateTime]::Parse("$LastWarning")).TotalDays } } catch {}
+        if ($dias -ge 7) { return (New-Object PSObject -Property @{ Send = $true; Order = 2; Worsened = $false }) }
+    }
+    return (New-Object PSObject -Property @{ Send = $false; Order = 0; Worsened = $false })
 }
 
 # Escada de alertas de falha real (backup NAO salvo): 1o imediato, 2o apos o cooldown
@@ -2548,6 +2587,18 @@ function New-TaskNotificationState {
         HwLastWarning       = $null
         HwLastEvent         = $null
         HwSmartFail         = $false
+        # v2.2.79: aviso preventivo de disco (CrystalDiskInfo), no maximo 2 e-mails por problema
+        PrevDiskSent        = 0
+        PrevDiskLast        = $null
+        PrevDiskSeverity    = 0
+        PrevDiskSectors     = -1
+        PrevDiskOkSince     = $null
+        # v2.2.79: desligamentos inesperados do servidor (mesma escada: no maximo 2 e-mails)
+        PwrSent             = 0
+        PwrLast             = $null
+        PwrSeverity         = 0
+        PwrCount            = -1
+        PwrOkSince          = $null
     })
 }
 
@@ -2621,7 +2672,10 @@ function Send-BackupNotification {
         [string[]]$WarningDests = @(),
         [bool]$HardwareSmartFail = $false,
         [bool]$PreventiveAudit = $false,
-        [string]$UnverifiedCopy = ""
+        [string]$UnverifiedCopy = "",
+        [int]$AlertSeverity = 1,
+        [long]$AlertMetric = -1,
+        [string]$VisualHtml = ""
     )
     try {
         if ($null -eq $global:configData -or $null -eq $global:configData.Preferences) {
@@ -2774,7 +2828,65 @@ function Send-BackupNotification {
             $statusTitle = "ATENCAO: CONFIGURACAO PRECISA DE REVISAO"
             $assunto = "[MEC Shield] Aviso: $SubjectInfo"
             $bannerBg = "#d97706"
-            $bannerType = "WARNING"
+            $bannerType = "AVISO"
+        } elseif ($Status -eq "AVISO_ENERGIA") {
+            # v2.2.79: servidor desligando de forma inesperada varias vezes na semana.
+            # Mesma escada do aviso de disco: no maximo 2 e-mails; volta so se piorar
+            # (atencao -> critico, ou +3 desligamentos desde o ultimo aviso).
+            $sevAtual = [Math]::Max(1, [Math]::Min(2, $AlertSeverity))
+            $state.PwrOkSince = $null
+            $decisao = Get-PreventiveDiskDecision -Sent ([int]$state.PwrSent) -LastWarning $state.PwrLast -Severity $sevAtual -Sectors $AlertMetric -LastSeverity ([int]$state.PwrSeverity) -LastSectors ([long]$state.PwrCount) -Now $agora -WorsenStep 3
+            Save-TaskNotificationState -TaskName $TaskName -State $state
+            if ($pref.NotifyOnFailure -ne $true) { return }
+            if (-not $decisao.Send) {
+                Log-Message "Aviso de desligamentos inesperados suprimido (Zero Spam): $([int]$state.PwrSent) de 2 e-mail(s) ja enviado(s). So volta a avisar se piorar."
+                return
+            }
+            $hwOrdem = [int]$decisao.Order
+            $shouldSend = $true
+            $subjectTag = "[MEC AVISO ENERGIA]"
+            $bannerBg = if ($sevAtual -ge 2) { "#dc2626" } else { "#d97706" }
+            $bannerType = if ($sevAtual -ge 2) { "ALERT" } else { "ENERGIA" }
+            if ($hwOrdem -eq 1 -and $decisao.Worsened) {
+                $statusTitle = "PIOROU: O SERVIDOR CONTINUA DESLIGANDO SOZINHO ($AlertMetric VEZES EM 7 DIAS)"
+                $assunto = "[MEC Shield] Piorou: servidor desligou sozinho $AlertMetric vezes em 7 dias"
+            } elseif ($hwOrdem -eq 1) {
+                $statusTitle = "AVISO: O SERVIDOR DESLIGOU SOZINHO $AlertMetric VEZES EM 7 DIAS"
+                $assunto = "[MEC Shield] Aviso: servidor desligou sozinho $AlertMetric vezes em 7 dias"
+            } else {
+                $statusTitle = "ULTIMO LEMBRETE: O SERVIDOR CONTINUA DESLIGANDO SOZINHO"
+                $assunto = "[MEC Shield] Ultimo lembrete: servidor continua desligando sozinho - nao vamos repetir"
+            }
+        } elseif ($Status -eq "AVISO_HARDWARE" -and $PreventiveAudit) {
+            # v2.2.79: aviso preventivo de disco (auditoria + CrystalDiskInfo). Escada propria:
+            # no maximo 2 e-mails por problema; so volta a avisar se piorar.
+            $sevAtual = [Math]::Max(1, [Math]::Min(2, $AlertSeverity))
+            $state.PrevDiskOkSince = $null
+            $decisao = Get-PreventiveDiskDecision -Sent ([int]$state.PrevDiskSent) -LastWarning $state.PrevDiskLast -Severity $sevAtual -Sectors $AlertMetric -LastSeverity ([int]$state.PrevDiskSeverity) -LastSectors ([long]$state.PrevDiskSectors) -Now $agora
+            Save-TaskNotificationState -TaskName $TaskName -State $state
+            if ($pref.NotifyOnFailure -ne $true) { return }
+            if (-not $decisao.Send) {
+                Log-Message "Aviso preventivo de disco suprimido (Zero Spam): $([int]$state.PrevDiskSent) de 2 e-mail(s) ja enviado(s) para este problema. So volta a avisar se o disco piorar."
+                return
+            }
+            if ($decisao.Worsened) { Log-Message "PIOROU: o disco ficou mais grave desde o ultimo aviso (CrystalDiskInfo). Novo aviso preventivo liberado." }
+            $hwOrdem = [int]$decisao.Order
+            $shouldSend = $true
+            $subjectTag = "[MEC AVISO DISCO]"
+            $bannerBg = if ($sevAtual -ge 2) { "#dc2626" } else { "#d97706" }
+            $bannerType = if ($sevAtual -ge 2) { "ALERT" } else { "DISCOS" }
+            $gravTxt = if ($sevAtual -ge 2) { "EM ESTADO CRITICO" } else { "PRECISA DE ATENCAO" }
+            $gravAssunto = if ($sevAtual -ge 2) { "em estado critico" } else { "precisa de atencao" }
+            if ($hwOrdem -eq 1 -and $decisao.Worsened) {
+                $statusTitle = "PIOROU: UM DISCO DO SERVIDOR $gravTxt"
+                $assunto = "[MEC Shield] Piorou: um disco do servidor $gravAssunto"
+            } elseif ($hwOrdem -eq 1) {
+                $statusTitle = "AVISO PREVENTIVO: UM DISCO DO SERVIDOR $gravTxt"
+                $assunto = "[MEC Shield] Aviso preventivo: um disco do servidor $gravAssunto"
+            } else {
+                $statusTitle = "ULTIMO LEMBRETE: O DISCO DO SERVIDOR CONTINUA $gravTxt"
+                $assunto = "[MEC Shield] Ultimo lembrete: disco do servidor continua $gravAssunto - nao vamos repetir"
+            }
         } elseif ($Status -eq "AVISO_HARDWARE") {
             # Backup SALVO (2a rodada), mas o servidor deu leitura instavel de disco ou
             # memoria. Escada (v2.2.61): 1o agora, 2o apos 3 dias, 3o apos mais 7 dias,
@@ -2811,22 +2923,21 @@ function Send-BackupNotification {
             $shouldSend = $true
             $subjectTag = "[MEC AVISO HARDWARE]"
             $bannerBg = "#d97706"
-            $bannerType = "WARNING"
-            if ($hwOrdem -eq 1 -and $PreventiveAudit) {
-                $statusTitle = "AVISO PREVENTIVO: UM DISCO DO SERVIDOR MOSTRA SINAIS DE FALHA"
-                $assunto = "[MEC Shield] Aviso preventivo: um disco do servidor mostra sinais de falha"
-            } elseif ($hwOrdem -eq 1) {
+            $bannerType = "DISCOS"
+            $hwAlvo = "DISCO/MEMORIA DO SERVIDOR CONTINUA INSTAVEL"
+            $hwAlvoAssunto = "disco/memoria do servidor continua instavel"
+            if ($hwOrdem -eq 1) {
                 $statusTitle = "BACKUP SALVO, MAS O SERVIDOR TEM DISCO/MEMORIA INSTAVEL"
                 $assunto = "[MEC Shield] Aviso: backup salvo, mas o disco/memoria do servidor esta instavel"
             } elseif ($hwOrdem -eq 2) {
-                $statusTitle = "LEMBRETE (2 DE 3): DISCO/MEMORIA DO SERVIDOR CONTINUA INSTAVEL"
-                $assunto = "[MEC Shield] Lembrete (2 de 3): disco/memoria do servidor continua instavel"
+                $statusTitle = "LEMBRETE (2 DE 3): $hwAlvo"
+                $assunto = "[MEC Shield] Lembrete (2 de 3): $hwAlvoAssunto"
             } elseif ($hwOrdem -eq 3) {
-                $statusTitle = "ULTIMO AVISO (3 DE 3): DISCO/MEMORIA DO SERVIDOR INSTAVEL"
-                $assunto = "[MEC Shield] Ultimo aviso (3 de 3): disco/memoria instavel - nao vamos repetir este alerta"
+                $statusTitle = "ULTIMO AVISO (3 DE 3): $hwAlvo"
+                $assunto = "[MEC Shield] Ultimo aviso (3 de 3): $hwAlvoAssunto - nao vamos repetir este alerta"
             } else {
-                $statusTitle = "LEMBRETE MENSAL: DISCO/MEMORIA DO SERVIDOR CONTINUA INSTAVEL"
-                $assunto = "[MEC Shield] Lembrete mensal: disco/memoria do servidor continua instavel"
+                $statusTitle = "LEMBRETE MENSAL: $hwAlvo"
+                $assunto = "[MEC Shield] Lembrete mensal: $hwAlvoAssunto"
             }
         }
 
@@ -2834,7 +2945,7 @@ function Send-BackupNotification {
 
         # Tudo que vem de mensagens de erro, caminhos e config entra no HTML escapado.
         $clientNameHtml = ConvertTo-HtmlSafe $clientName
-        $diag = if ($Status -eq "FALHA" -or $Status -eq "AVISO" -or $Status -eq "AVISO_HARDWARE") { Get-FailureDiagnosis -Text $BodyDetails -SubjectInfo $SubjectInfo } else { $null }
+        $diag = if ($Status -eq "FALHA" -or $Status -eq "AVISO" -or $Status -eq "AVISO_HARDWARE" -or $Status -eq "AVISO_ENERGIA") { Get-FailureDiagnosis -Text $BodyDetails -SubjectInfo $SubjectInfo } else { $null }
         $bodyDetailsRaw = "$BodyDetails"
 
         # ---- TOPO (v2.2.61): 3 respostas antes de qualquer detalhe tecnico ----
@@ -2869,18 +2980,34 @@ function Send-BackupNotification {
             if ([int]$state.FailureAlertsSent -gt 0) { $topoNota = "Lembrete de uma falha que continua. Enquanto n&atilde;o for resolvida, o MEC Shield avisa no m&aacute;ximo 1 vez por dia." }
         } elseif ($Status -eq "AVISO_HARDWARE") {
             if ($PreventiveAudit) {
-                # Alerta da auditoria diaria: nenhum backup foi refeito, so ha sinal de risco no disco.
-                $topoAconteceu = "A verifica&ccedil;&atilde;o di&aacute;ria encontrou sinais de que um disco do servidor pode falhar. Nenhuma falha de backup foi detectada."
-                $topoSeguro = "<strong>SIM, at&eacute; agora.</strong> Os backups continuam sendo salvos e conferidos."
+                # Alerta da auditoria diaria: nenhum backup falhou, so ha risco no disco (CrystalDiskInfo).
+                if ($AlertSeverity -ge 2) {
+                    $topoCor = "#dc2626"
+                    $topoAconteceu = "A verifica&ccedil;&atilde;o autom&aacute;tica de hoje encontrou um disco do servidor em estado <strong>CR&Iacute;TICO</strong>. Ele pode parar de funcionar a qualquer momento."
+                    $topoFazer = "<strong>Trocar o disco marcado em vermelho</strong> (veja SA&Uacute;DE DOS DISCOS abaixo) o quanto antes e manter uma c&oacute;pia do backup em outro computador ou na rede."
+                } else {
+                    $topoAconteceu = "A verifica&ccedil;&atilde;o autom&aacute;tica de hoje encontrou um disco do servidor com <strong>sinais de desgaste</strong>. Ele ainda funciona, mas tende a piorar com o tempo."
+                    $topoFazer = "<strong>Programar a troca do disco marcado em amarelo</strong> (veja SA&Uacute;DE DOS DISCOS abaixo). N&atilde;o &eacute; urgente hoje, mas n&atilde;o deixe para depois."
+                }
+                $topoSeguro = "<strong>SIM.</strong> Nenhum backup falhou: as c&oacute;pias continuam sendo salvas e conferidas."
                 if ($ultimoBomHtml) { $topoSeguro += " &Uacute;ltimo backup v&aacute;lido: $ultimoBomHtml." }
-                $topoFazer = "Conferir o disco indicado em SA&Uacute;DE DO ARMAZENAMENTO (abaixo) no CrystalDiskInfo e programar a troca. Manter a c&oacute;pia em outro disco ou na rede."
             } else {
                 $topoAconteceu = "O disco ou a mem&oacute;ria do servidor deu leitura inst&aacute;vel. O MEC Shield percebeu, descartou a c&oacute;pia duvidosa e refez o backup em outra pasta."
                 $topoSeguro = "<strong>SIM.</strong> O backup foi salvo e conferido (SHA-256 id&ecirc;ntico ao banco)."
                 if ($ultimoBomHtml) { $topoSeguro += " &Uacute;ltimo backup v&aacute;lido: $ultimoBomHtml." }
                 $topoFazer = "Trocar o disco indicado em SA&Uacute;DE DO ARMAZENAMENTO (abaixo) ou testar a mem&oacute;ria (mdsched). N&atilde;o &eacute; urgente hoje: o MEC Shield est&aacute; contornando sozinho."
             }
-            $topoNota = if ($hwOrdem -le 3) { "Aviso $hwOrdem de 3. Depois do 3&ordm; o MEC Shield para de repetir este alerta e s&oacute; volta a avisar se piorar." } else { "Lembrete mensal: o problema continua. O MEC Shield segue contornando sozinho." }
+            $topoNota = if ($PreventiveAudit) {
+                if ($hwOrdem -le 1) { "Aviso 1 de no m&aacute;ximo 2. Se nada mudar, mandamos s&oacute; mais um lembrete daqui a 7 dias e depois paramos. Voltamos a avisar apenas se o disco piorar." }
+                else { "&Uacute;ltimo lembrete sobre este disco. N&atilde;o vamos repetir este e-mail; voltamos a avisar apenas se o disco piorar." }
+            } elseif ($hwOrdem -le 3) { "Aviso $hwOrdem de 3. Depois do 3&ordm; o MEC Shield para de repetir este alerta e s&oacute; volta a avisar se piorar." } else { "Lembrete mensal: o problema continua. O MEC Shield segue contornando sozinho." }
+        } elseif ($Status -eq "AVISO_ENERGIA") {
+            $topoCor = if ($AlertSeverity -ge 2) { "#dc2626" } else { "#d97706" }
+            $topoAconteceu = "Nos &uacute;ltimos 7 dias o servidor <strong>desligou sozinho $AlertMetric vezes</strong>, sem ningu&eacute;m mandar desligar. Isso costuma ser <strong>falta de energia</strong>, <strong>fonte do computador ruim</strong> ou <strong>nobreak com bateria fraca</strong>."
+            $topoSeguro = "<strong>SIM, por enquanto.</strong> Os backups continuam sendo salvos e conferidos. Mas cada desligamento brusco pode estragar o banco do Sismotel."
+            if ($ultimoBomHtml) { $topoSeguro += " &Uacute;ltimo backup v&aacute;lido: $ultimoBomHtml." }
+            $topoFazer = "<strong>Ligar o servidor num nobreak</strong> (ou testar a bateria do que j&aacute; existe). Se n&atilde;o falta energia no local, <strong>trocar a fonte do servidor</strong>."
+            $topoNota = if ($hwOrdem -le 1) { "Aviso 1 de no m&aacute;ximo 2. Se continuar, mandamos s&oacute; mais um lembrete daqui a 7 dias e depois paramos. Voltamos a avisar apenas se piorar." } else { "&Uacute;ltimo lembrete sobre este problema. N&atilde;o vamos repetir este e-mail; voltamos a avisar apenas se piorar." }
         } elseif ($Status -eq "AVISO") {
             $topoAconteceu = if ($null -ne $diag) { $diag.Titulo } else { ConvertTo-HtmlSafe $SubjectInfo }
             $topoSeguro = "<strong>SIM.</strong> Este aviso n&atilde;o impede o backup: a rotina continua normalmente."
@@ -2962,7 +3089,7 @@ function Send-BackupNotification {
 
         $isNetFailure = ($isOddTask -or $SubjectInfo -match "Externo|Rede|Terminal" -or $BodyDetails -match "CONECTIVIDADE|REDE EXTERNA")
         $recActionsHtml = if ($null -ne $diag) {
-            $passosHtml = "<div style='margin-bottom:8px;'><strong>1.</strong> Conectar no servidor via AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).</div>"
+            $passosHtml = "<div style='margin-bottom:8px;'><strong>1.</strong> Conectar no servidor (AnyDesk <strong>$anyDeskId</strong> ou TeamViewer <strong>$teamViewerId</strong>).</div>"
             $n = 2
             foreach ($passo in $diag.Passos) {
                 $passosHtml += "<div style='margin-bottom:8px;'><strong>$n.</strong> $passo</div>"
@@ -2988,7 +3115,7 @@ function Send-BackupNotification {
         } else {
             @"
             <div style='margin-bottom:8px;'>
-              <strong>1. Acesso Remoto:</strong> Conectar no servidor via AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).
+              <strong>1. Acesso Remoto:</strong> Conectar no servidor (AnyDesk <strong>$anyDeskId</strong> ou TeamViewer <strong>$teamViewerId</strong>).
             </div>
             <div style='margin-bottom:8px;'>
               <strong>2. Servi&ccedil;o Firebird:</strong> Abrir o <code>services.msc</code> e confirmar se o servi&ccedil;o <code>Firebird Server</code> est&aacute; em execu&ccedil;&atilde;o.
@@ -3011,6 +3138,84 @@ function Send-BackupNotification {
                         <td bgcolor='#1e293b' style='background-color:#1e293b; padding:6px 0; color:#cbd5e1; font-size:14px;'>$($durParts -join ' &bull; ')</td>
                       </tr>"
         } else { "" }
+
+        # v2.2.79: falha/aviso comum tambem didatico: POR QUE ACONTECEU (frase simples),
+        # COMO RESOLVER (passos) e o detalhe tecnico pequeno no fim (antes: bloco vermelho
+        # "MOTIVO IDENTIFICADO" com o texto tecnico no meio do e-mail).
+        $erroHtml = ""
+        if ($Status -eq "FALHA" -or $Status -eq "AVISO" -or $Status -eq "AVISO_HARDWARE") {
+            $corCausa = if ($Status -eq "FALHA") { "#ef4444" } else { "#f59e0b" }
+            $causaTitulo = if ($null -ne $diag) { $diag.Titulo } else { "Erro n&atilde;o reconhecido automaticamente" }
+            $causaTexto = if ($null -ne $diag) { $diag.Causa } else { "O MEC Shield n&atilde;o reconheceu este erro. Siga os passos abaixo e, se n&atilde;o resolver, envie ao suporte os detalhes t&eacute;cnicos do fim deste e-mail." }
+            if ($Status -eq "AVISO" -and $null -eq $diag) {
+                # Aviso de configuracao sem regra conhecida: texto e passos de configuracao (nao de Firebird).
+                $causaTitulo = "A configura&ccedil;&atilde;o da tarefa precisa de uma revis&atilde;o"
+                $causaTexto = "O backup continua funcionando, mas algo na configura&ccedil;&atilde;o da tarefa <strong>$TaskNameHtml</strong> est&aacute; diferente do esperado: <em>$(ConvertTo-HtmlSafe $SubjectInfo)</em>."
+                $recActionsHtml = "<div style='margin-bottom:8px;'><strong>1.</strong> Conectar no servidor (AnyDesk <strong>$anyDeskId</strong> ou TeamViewer <strong>$teamViewerId</strong>).</div><div style='margin-bottom:8px;'><strong>2.</strong> Abrir o painel do <strong>MEC Shield</strong> e clicar em <em>Editar Tarefa</em> ($TaskNameHtml).</div><div style='margin-bottom:8px;'><strong>3.</strong> Conferir o caminho do banco do Sismotel e as pastas de destino, salvar e usar <em>Testar Conex&atilde;o</em>.</div><div><strong>4.</strong> Rodar a tarefa manualmente pelo painel para confirmar.</div>"
+            }
+            $erroHtml = @"
+          <tr>
+            <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
+              <table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' bgcolor='#1e293b' style='background-color:#1e293b; border:1px solid #334155; border-left:6px solid $corCausa; border-radius:8px; overflow:hidden;'>
+                <tr><td bgcolor='#0f172a' style='background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;'><span style='color:#38bdf8; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;'>[ 3. POR QUE ACONTECEU ]</span></td></tr>
+                <tr><td bgcolor='#1e293b' style='background-color:#1e293b; padding:16px 18px;'>
+                  <div style='font-size:16px; font-weight:800; color:#ffffff;'>$causaTitulo</div>
+                  <div style='margin-top:6px; font-size:14.5px; color:#e2e8f0; line-height:1.6;'>$causaTexto</div>
+                </td></tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
+              <table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' bgcolor='#1e293b' style='background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;'>
+                <tr><td bgcolor='#0f172a' style='background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;'><span style='color:#fbbf24; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;'>[ 4. COMO RESOLVER ]</span></td></tr>
+                <tr><td bgcolor='#1e293b' style='background-color:#1e293b; padding:16px 18px; font-size:14px; color:#e2e8f0; line-height:1.7;'>$recActionsHtml</td></tr>
+              </table>
+            </td>
+          </tr>
+          $(if ($BodyDetails) { "<tr><td bgcolor='#111827' style='background-color:#111827; padding:8px 28px 14px 28px;'><div style='font-size:11px; color:#64748b; text-transform:uppercase; letter-spacing:0.5px;'>Detalhe t&eacute;cnico (para o suporte)</div><div style='margin-top:4px; font-family:Consolas,monospace; white-space:pre-wrap; word-break:break-all; font-size:11px; color:#64748b; line-height:1.5;'>$BodyDetails</div></td></tr>" })
+"@
+        }
+
+        # v2.2.79: aviso preventivo de disco = e-mail didatico. Cartoes coloridos por disco
+        # (estilo CrystalDiskInfo), passos curtos e o detalhe tecnico pequeno no fim.
+        $preventivoHtml = ""
+        if (($Status -eq "AVISO_HARDWARE" -and $PreventiveAudit) -or $Status -eq "AVISO_ENERGIA") {
+            $ehEnergia = ($Status -eq "AVISO_ENERGIA")
+            $secTitulo = if ($ehEnergia) { "[ 3. DESLIGAMENTOS DOS &Uacute;LTIMOS 7 DIAS ]" } else { "[ 3. SA&Uacute;DE DOS DISCOS ]" }
+            $secLegenda = if ($ehEnergia) { "Lido do registro de eventos do Windows. Hist&oacute;rico completo no servidor: <code>C:\Microtecs\FIBS\logs\desligamentos.log</code>" } else { "Leitura autom&aacute;tica do CrystalDiskInfo (o mesmo resultado que aparece na tela do programa). <span style='color:#4ade80;'>&#9632;</span> Saud&aacute;vel &nbsp; <span style='color:#fbbf24;'>&#9632;</span> Aten&ccedil;&atilde;o &nbsp; <span style='color:#f87171;'>&#9632;</span> Cr&iacute;tico. Hist&oacute;rico: <code>C:\Microtecs\FIBS\logs\saude_discos.log</code>" }
+            $cardsBloco = if (-not [string]::IsNullOrWhiteSpace($VisualHtml)) { $VisualHtml } else { "<div style='color:#cbd5e1; font-size:14px;'>O CrystalDiskInfo n&atilde;o conseguiu ler os discos deste servidor. Veja os detalhes para o suporte abaixo.</div>" }
+            $passosPrev = "<div style='margin-bottom:8px;'><strong>1.</strong> Conectar no servidor (AnyDesk <strong>$anyDeskId</strong> ou TeamViewer <strong>$teamViewerId</strong>).</div>"
+            $np = 2
+            if ($null -ne $diag) { foreach ($passo in $diag.Passos) { $passosPrev += "<div style='margin-bottom:8px;'><strong>$np.</strong> $passo</div>"; $np++ } }
+            $preventivoHtml = @"
+          <tr>
+            <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
+              <table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' bgcolor='#1e293b' style='background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;'>
+                <tr><td bgcolor='#0f172a' style='background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;'><span style='color:#38bdf8; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;'>$secTitulo</span></td></tr>
+                <tr><td bgcolor='#1e293b' style='background-color:#1e293b; padding:16px 18px;'>
+                  $cardsBloco
+                  <div style='margin-top:6px; font-size:12px; color:#94a3b8;'>$secLegenda</div>
+                </td></tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
+              <table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' bgcolor='#1e293b' style='background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;'>
+                <tr><td bgcolor='#0f172a' style='background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;'><span style='color:#fbbf24; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;'>[ 4. O QUE FAZER ]</span></td></tr>
+                <tr><td bgcolor='#1e293b' style='background-color:#1e293b; padding:16px 18px; font-size:14px; color:#e2e8f0; line-height:1.7;'>$passosPrev</td></tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px 14px 28px;'>
+              <div style='font-size:11px; color:#64748b; text-transform:uppercase; letter-spacing:0.5px;'>Detalhe t&eacute;cnico (para o suporte, pode ignorar)</div>
+              <div style='margin-top:4px; font-family:Consolas,monospace; white-space:pre-wrap; word-break:break-all; font-size:11px; color:#64748b; line-height:1.5;'>$BodyDetails</div>
+            </td>
+          </tr>
+"@
+        }
 
         $htmlBody = @"
 <!DOCTYPE html>
@@ -3162,39 +3367,10 @@ function Send-BackupNotification {
           </tr>
 
           <!-- CARD 3: DETALHES DE ERRO & CHECKLIST DO SUPORTE (SE FALHA CRITICA) -->
-          $(if (($Status -eq "FALHA" -or $Status -eq "AVISO" -or $Status -eq "AVISO_HARDWARE") -and $BodyDetails) {
-          "<tr>
-            <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
-              <div style='background-color:#450a0a; border:1px solid #7f1d1d; border-left:4px solid #ef4444; border-radius:8px; padding:16px; font-size:13.5px; color:#fca5a5; line-height:1.6;'>
-                <strong style='color:#f87171; font-size:14.5px;'>MOTIVO IDENTIFICADO:</strong><br/>
-                $(if ($null -ne $diag) {
-                "<div style='margin-top:8px; font-size:16px; font-weight:800; color:#fecaca;'>$($diag.Titulo)</div>
-                <div style='margin-top:6px; font-size:14px; color:#fde2e2;'><strong>Explica&ccedil;&atilde;o simples:</strong> $($diag.Causa)</div>
-                <div style='margin-top:12px; font-size:11.5px; color:#fca5a5; text-transform:uppercase; letter-spacing:0.5px;'>Detalhe t&eacute;cnico (para o suporte):</div>
-                <div style='margin-top:4px; font-family:Consolas,monospace; white-space:pre-wrap; word-break:break-all; font-size:12px; opacity:0.85;'>$BodyDetails</div>"
-                } else {
-                "<div style='margin-top:8px; font-size:11.5px; color:#fca5a5; text-transform:uppercase; letter-spacing:0.5px;'>Detalhe t&eacute;cnico (para o suporte):</div>
-                <div style='margin-top:4px; font-family:Consolas,monospace; white-space:pre-wrap; word-break:break-all; font-size:13px;'>$BodyDetails</div>"
-                })
-              </div>
-            </td>
-          </tr>
-          <tr>
-            <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px;'>
-              <table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' bgcolor='#1e293b' style='background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;'>
-                <tr>
-                  <td bgcolor='#0f172a' style='background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;'>
-                    <span style='color:#fbbf24; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;'>[ 3. COMO RESOLVER PASSO A PASSO ]</span>
-                  </td>
-                </tr>
-                <tr>
-                  <td bgcolor='#1e293b' style='background-color:#1e293b; padding:16px 18px; font-size:13.5px; color:#cbd5e1; line-height:1.7;'>
-                    $recActionsHtml
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>"
+          $(if (($Status -eq "AVISO_HARDWARE" -and $PreventiveAudit) -or $Status -eq "AVISO_ENERGIA") {
+          $preventivoHtml
+          } elseif (($Status -eq "FALHA" -or $Status -eq "AVISO" -or $Status -eq "AVISO_HARDWARE") -and $BodyDetails) {
+          $erroHtml
           })
 
           <!-- CARD 4: AVISO DE DESTINO EXTERNO / TERMINAL EM REDE NAO LOCALIZADO -->
@@ -3327,6 +3503,21 @@ function Send-BackupNotification {
             } elseif ($Status -eq "AVISO") {
                 $state.LastConfigWarning = (Get-Date).ToString("o")
                 Save-TaskNotificationState -TaskName $TaskName -State $state
+            } elseif ($Status -eq "AVISO_ENERGIA") {
+                $state.PwrSent = $hwOrdem
+                $state.PwrLast = (Get-Date).ToString("o")
+                $state.PwrSeverity = [Math]::Max(1, [Math]::Min(2, $AlertSeverity))
+                $state.PwrCount = $AlertMetric
+                Save-TaskNotificationState -TaskName $TaskName -State $state
+                Log-Message "Aviso de desligamentos inesperados $hwOrdem de 2 enviado (no maximo 2 por problema; so volta se piorar)."
+            } elseif ($Status -eq "AVISO_HARDWARE" -and $PreventiveAudit) {
+                $state.PrevDiskSent = $hwOrdem
+                $state.PrevDiskLast = (Get-Date).ToString("o")
+                $state.PrevDiskSeverity = [Math]::Max(1, [Math]::Min(2, $AlertSeverity))
+                $state.PrevDiskSectors = $AlertMetric
+                Save-TaskNotificationState -TaskName $TaskName -State $state
+                $proxTxt = if ($hwOrdem -le 1) { "ultimo lembrete em 7 dias se nada mudar" } else { "nao repete mais; so avisa de novo se piorar" }
+                Log-Message "Aviso preventivo de disco $hwOrdem de 2 enviado ($proxTxt)."
             } elseif ($Status -eq "AVISO_HARDWARE") {
                 $state.LastHardwareWarning = (Get-Date).ToString("o")
                 $state.HwLastWarning = $state.LastHardwareWarning
@@ -3482,6 +3673,37 @@ function Send-WelcomeEmail {
         $srvInventory = Get-ServerStorageSummaryForEmail
         $retentionCount = if ($pref.MaxBackupsToKeep -gt 0) { [int]$pref.MaxBackupsToKeep } else { 30 }
 
+        # v2.2.79: check-up do servidor na instalacao (discos, temperatura, desligamentos,
+        # espaco, memoria) + historicos iniciais em logs\ para acompanhar dali em diante.
+        $checkupHtml = ""
+        try {
+            $tk1 = @($global:configData.Tasks) | Where-Object { $null -ne $_ } | Select-Object -First 1
+            $dbChk = if ($null -ne $tk1) { "$($tk1.DatabasePath)" } else { "" }
+            $destChk = @()
+            foreach ($tk in @($global:configData.Tasks)) { if ($null -ne $tk -and $null -ne $tk.Destinations) { $destChk += @($tk.Destinations) } }
+            $cdiChk = @(Get-CrystalDiskInfoReport | Where-Object { $null -ne $_ })
+            $deslChk = @(Get-ShutdownHistory -Days 30)
+            Write-DiskHealthHistory -Disks $cdiChk
+            Write-ShutdownHistory -Records $deslChk
+            $checkupHtml = Get-ServerCheckupHtml -DbPath $dbChk -Destinations $destChk -CdiDisks $cdiChk -ShutdownRecords $deslChk
+        } catch {}
+        if ([string]::IsNullOrWhiteSpace($checkupHtml)) { $checkupHtml = "<div style='color:#94a3b8;'>Check-up indispon&iacute;vel agora. O MEC Shield analisa o servidor toda madrugada.</div>" }
+        $benef = @(
+            @("&#128190;", "Backup autom&aacute;tico sem travar a recep&ccedil;&atilde;o", "Roda como servi&ccedil;o do Windows, em modo leve, mesmo sem ningu&eacute;m logado."),
+            @("&#9989;", "Cada c&oacute;pia &eacute; conferida", "O arquivo salvo &eacute; comparado com o banco original. C&oacute;pia com diferen&ccedil;a &eacute; descartada e refeita."),
+            @("&#128269;", "Teste de restaura&ccedil;&atilde;o toda madrugada (03:30)", "Restaura o &uacute;ltimo backup numa pasta separada para provar que ele abre sem erro."),
+            @("&#128737;", "Vigia a sa&uacute;de do servidor", "Discos (CrystalDiskInfo: sa&uacute;de, temperatura, setores com defeito) e desligamentos inesperados (falta de energia, fonte, tela azul)."),
+            @("&#128200;", "Espa&ccedil;o sempre controlado", "Apaga os backups mais antigos sozinho e nunca deixa o disco do Sismotel com menos de 8 GB livres."),
+            @("&#127760;", "C&oacute;pia extra em outro lugar", "Outro computador da rede ou Google Drive, com 3 formas de acesso e c&oacute;pia reserva se o destino estiver desligado."),
+            @("&#128276;", "S&oacute; avisa quando precisa", "E-mail claro com a causa e o passo a passo. Cada problema gera no m&aacute;ximo 2 avisos, sem repeti&ccedil;&atilde;o."),
+            @("&#11014;", "Atualiza&ccedil;&atilde;o autom&aacute;tica e segura", "Recebe melhorias sozinho, com atualiza&ccedil;&otilde;es assinadas digitalmente pela MEC.")
+        )
+        $beneficiosHtml = "<table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%'>"
+        foreach ($b in $benef) {
+            $beneficiosHtml += "<tr><td width='40' valign='top' style='padding:8px 0; font-size:22px; line-height:1;'>$($b[0])</td><td valign='top' style='padding:8px 0; border-bottom:1px solid #334155;'><div style='color:#ffffff; font-weight:800; font-size:14px;'>$($b[1])</div><div style='color:#cbd5e1; font-size:13px; line-height:1.5;'>$($b[2])</div></td></tr>"
+        }
+        $beneficiosHtml += "</table>"
+
         $tasksHtml = ""
         $tasksArr = @()
         if ($null -ne $global:configData.Tasks) { $tasksArr = @($global:configData.Tasks) }
@@ -3567,7 +3789,7 @@ function Send-WelcomeEmail {
                 <tr><td style="padding:2px 18px 2px 18px; color:#38bdf8; font-size:12px; font-weight:800; letter-spacing:0.6px;">COMO FUNCIONA NO DIA A DIA</td></tr>
                 <tr><td style="padding:0 18px 12px 18px; color:#e2e8f0; font-size:14.5px; line-height:1.5;">O backup roda sozinho em segundo plano (mesmo sem ningu&eacute;m logado no Windows) e <strong>n&atilde;o trava o Sismotel na recep&ccedil;&atilde;o</strong>. Tamb&eacute;m controla o espa&ccedil;o livre do HD apagando os arquivos mais antigos automaticamente.</td></tr>
                 <tr><td style="padding:2px 18px 2px 18px; color:#fbbf24; font-size:12px; font-weight:800; letter-spacing:0.6px;">QUANDO VOC&Ecirc; RECEBER&Aacute; NOVOS E-MAILS?</td></tr>
-                <tr><td style="padding:0 18px 14px 18px; color:#e2e8f0; font-size:14.5px; line-height:1.5;"><strong>Somente se acontecer algum problema</strong> (ex.: falha ao salvar o backup, HD ficando cheio ou computador externo desligado h&aacute; mais de 24 horas). Quando tudo est&aacute; funcionando bem, o sistema trabalha em sil&ecirc;ncio para n&atilde;o lotar sua caixa de entrada.</td></tr>
+                <tr><td style="padding:0 18px 14px 18px; color:#e2e8f0; font-size:14.5px; line-height:1.5;"><strong>Somente se acontecer algum problema</strong> (ex.: falha ao salvar o backup, HD ficando cheio ou com defeito, servidor desligando sozinho, computador externo desligado h&aacute; mais de 24 horas). Cada problema gera no m&aacute;ximo 2 avisos. Quando tudo est&aacute; bem, o sistema trabalha em sil&ecirc;ncio.</td></tr>
               </table>
             </td>
           </tr>
@@ -3615,13 +3837,31 @@ function Send-WelcomeEmail {
             </td>
           </tr>
 
-          <!-- CARD 2: BANCO DE DADOS E HDs DETECTADOS NO SERVIDOR -->
+          <!-- CARD 2 (v2.2.79): CHECK-UP DO SERVIDOR NA INSTALACAO -->
           <tr>
             <td bgcolor="#111827" style="background-color:#111827; padding:8px 28px;">
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#a78bfa; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 2. HDs, ESPA&Ccedil;O LIVRE E BANCO DE DADOS DETECTADOS ]</span>
+                    <span style="color:#38bdf8; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 2. CHECK-UP DO SERVIDOR ]</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td bgcolor="#1e293b" style="background-color:#1e293b; padding:16px 18px;">
+                    $checkupHtml
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- CARD 3: BANCO DE DADOS E HDs DETECTADOS NO SERVIDOR -->
+          <tr>
+            <td bgcolor="#111827" style="background-color:#111827; padding:8px 28px;">
+              <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
+                <tr>
+                  <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
+                    <span style="color:#a78bfa; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 3. HDs, ESPA&Ccedil;O LIVRE E BANCO DE DADOS DETECTADOS ]</span>
                   </td>
                 </tr>
                 <tr>
@@ -3646,7 +3886,7 @@ function Send-WelcomeEmail {
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:11px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#34d399; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 3. ROTINAS DE BACKUP CONFIGURADAS NESTE SERVIDOR ]</span>
+                    <span style="color:#34d399; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 4. ROTINAS DE BACKUP CONFIGURADAS NESTE SERVIDOR ]</span>
                   </td>
                 </tr>
                 $tasksHtml
@@ -3654,94 +3894,18 @@ function Send-WelcomeEmail {
             </td>
           </tr>
 
-          <!-- CARD 4: BENEFICIOS REAIS (O QUE MUDOU DO FIBS ANTIGO PARA O NOVO) -->
+          <!-- CARD 5 (v2.2.79): O QUE O MEC SHIELD FAZ POR VOCE -->
           <tr>
             <td bgcolor="#111827" style="background-color:#111827; padding:8px 28px 20px 28px;">
               <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="background-color:#1e293b; border:1px solid #334155; border-radius:8px; overflow:hidden;">
                 <tr>
                   <td bgcolor="#0f172a" style="background-color:#0f172a; padding:12px 16px; border-bottom:1px solid #334155;">
-                    <span style="color:#fbbf24; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 4. O QUE MUDOU NA PR&Aacute;TICA: FIBS ANTIGO vs. MEC SHIELD ]</span>
+                    <span style="color:#fbbf24; font-size:12.5px; font-weight:800; text-transform:uppercase; letter-spacing:0.5px;">[ 5. O QUE O MEC SHIELD FAZ POR VOC&Ecirc; ]</span>
                   </td>
                 </tr>
                 <tr>
-                  <td bgcolor="#1e293b" style="background-color:#1e293b; padding:14px 16px 14px 16px;">
-                    <p style="margin:0 0 12px 0; color:#cbd5e1; font-size:13.5px; line-height:1.55;">
-                      Veja de forma simples as fun&ccedil;&otilde;es reais que foram adicionadas em rela&ccedil;&atilde;o ao FIBS antigo:
-                    </p>
-                    
-                    <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse; margin-bottom:4px;">
-                      <tr bgcolor="#0f172a">
-                        <td width="26%" style="padding:8px 10px; border:1px solid #334155; color:#94a3b8; font-size:11px; font-weight:800; text-transform:uppercase;">Fun&ccedil;&atilde;o</td>
-                        <td width="35%" style="padding:8px 10px; border:1px solid #334155; color:#f87171; font-size:11px; font-weight:800; text-transform:uppercase;">Como era no FIBS Antigo</td>
-                        <td width="39%" style="padding:8px 10px; border:1px solid #334155; color:#34d399; font-size:11px; font-weight:800; text-transform:uppercase;">Como funciona agora</td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
-                          Funcionamento sem usu&aacute;rio logado
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
-                          Dependia do programa aberto na tela. Se o PC reiniciasse e ficasse na tela de senha, o backup parava.
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
-                          <span style="color:#34d399; font-weight:bold;">&#10004; Roda como Servi&ccedil;o do Windows:</span> Funciona sozinho em segundo plano, mesmo que o servidor reinicie de madrugada.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
-                          Desempenho na Recep&ccedil;&atilde;o
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
-                          Usava prioridade normal do processador, podendo deixar o Sismotel lento na hora de compactar.
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
-                          <span style="color:#34d399; font-weight:bold;">&#10004; Prioridade Leve:</span> Roda em modo leve para n&atilde;o pesar no Sismotel durante o fechamento de contas.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
-                          Controle de HD e Espa&ccedil;o Livre
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
-                          N&atilde;o verificava a sa&uacute;de do HD nem o espa&ccedil;o livre antes de iniciar o backup.
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
-                          <span style="color:#34d399; font-weight:bold;">&#10004; Monitora HD, Espa&ccedil;o e Google Drive:</span> Apaga backups antigos sozinho, avisa se o HD apresentar defeito f&iacute;sico e gerencia o limite de 15 GB do Google Drive.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
-                          C&oacute;pia em Outro PC da Rede
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
-                          Fazia apenas uma tentativa simples; se o outro PC estivesse desligado ou pedisse senha, falhava sem plano reserva.
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
-                          <span style="color:#34d399; font-weight:bold;">&#10004; 3 Tentativas de Rede + Reserva Local:</span> Tenta pelo sistema, pela senha configurada e pelo usu&aacute;rio logado. Se o outro PC estiver desligado, guarda c&oacute;pia de seguran&ccedil;a e avisa ap&oacute;s 24h.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
-                          Teste se o Backup Abre de Verdade
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
-                          Apenas criava o arquivo compactado, sem testar se o banco dentro dele estava corrompido.
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
-                          <span style="color:#34d399; font-weight:bold;">&#10004; Teste Di&aacute;rio de Restaura&ccedil;&atilde;o (03:30):</span> Confere cada arquivo salvo e toda madrugada faz uma restaura&ccedil;&atilde;o de teste em pasta separada para garantir que o backup abre sem erro.
-                        </td>
-                      </tr>
-                      <tr>
-                        <td style="padding:10px; border:1px solid #334155; color:#f1f5f9; font-weight:700; font-size:12px; vertical-align:top; background-color:#1e293b;">
-                          Envio de E-mails e Atualiza&ccedil;&atilde;o
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#cbd5e1; font-size:12px; line-height:1.5; vertical-align:top; background-color:#1e293b;">
-                          Exigia atualiza&ccedil;&atilde;o manual computador por computador e mandava mensagens pouco claras.
-                        </td>
-                        <td style="padding:10px; border:1px solid #334155; color:#f8fafc; font-size:12px; line-height:1.5; vertical-align:top; background-color:#132338;">
-                          <span style="color:#34d399; font-weight:bold;">&#10004; Avisos Claros e Atualiza&ccedil;&atilde;o Autom&aacute;tica:</span> S&oacute; envia e-mail quando precisa de aten&ccedil;&atilde;o (explicando a causa e o que fazer) e recebe melhorias automaticamente.
-                        </td>
-                      </tr>
-                    </table>
+                  <td bgcolor="#1e293b" style="background-color:#1e293b; padding:14px 16px;">
+                    $beneficiosHtml
                   </td>
                 </tr>
               </table>
@@ -4024,6 +4188,27 @@ function Send-NetworkFailureAlert {
             </td>
           </tr>
 
+          <!-- v2.2.79: MAPA VISUAL (servidor OK -> computador externo sem resposta) -->
+          <tr>
+            <td bgcolor="#111827" style="background-color:#111827; padding:4px 28px 8px 28px;">
+              <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #334155; border-radius:8px; background-color:#0f172a;">
+                <tr>
+                  <td width="40%" align="center" valign="middle" style="padding:14px 8px;">
+                    <div style="display:inline-block; background-color:#16a34a; color:#ffffff; border-radius:8px; padding:10px 14px; font-weight:800; font-size:13px;">&#10004; SERVIDOR</div>
+                    <div style="margin-top:6px; font-size:12px; color:#94a3b8;">$hostName</div>
+                    <div style="font-size:12px; color:#4ade80;">backup salvo normalmente</div>
+                  </td>
+                  <td width="20%" align="center" valign="middle" style="padding:14px 0; color:#f87171; font-size:26px; font-weight:800;">&#8212;&#10006;&#8212;&gt;</td>
+                  <td width="40%" align="center" valign="middle" style="padding:14px 8px;">
+                    <div style="display:inline-block; background-color:#dc2626; color:#ffffff; border-radius:8px; padding:10px 14px; font-weight:800; font-size:13px;">&#10006; $TerminalNameHtml</div>
+                    <div style="margin-top:6px; font-size:12px; color:#94a3b8;">computador da c&oacute;pia extra</div>
+                    <div style="font-size:12px; color:#f87171;">n&atilde;o recebe a c&oacute;pia</div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
           <!-- CARD 1: DADOS DO CLIENTE, ACESSO REMOTO E DIAGNOSTICO -->
           <tr>
             <td bgcolor="#111827" style="padding:8px 28px;">
@@ -4115,7 +4300,7 @@ function Send-NetworkFailureAlert {
                     $(if ($isLocalServerDest) {
                     @"
                     <div style="margin-bottom:10px;">
-                      <strong style="color:#fbbf24;">1. Acessar o Servidor:</strong> Conecte no servidor <strong>$hostName</strong> pelo AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).
+                      <strong style="color:#fbbf24;">1. Acessar o Servidor:</strong> Conecte no servidor <strong>$hostName</strong> (AnyDesk <strong>$anyDeskId</strong> ou TeamViewer <strong>$teamViewerId</strong>).
                     </div>
                     <div style="margin-bottom:10px;">
                       <strong style="color:#fbbf24;">2. Verificar a Pasta e o Espa&ccedil;o em Disco:</strong> Confira se a pasta <code>$Destination</code> existe e se o disco tem espa&ccedil;o livre.
@@ -4622,6 +4807,18 @@ function Send-AuditAlertNotification {
         $gapText = if ($TransactionGap -lt 0) { "n&atilde;o verificado" } else { "$TransactionGap" }
         $limitText = if ($NextTransaction -le 0) { "n&atilde;o verificado" } else { "$NextTransaction" }
 
+        # v2.2.79: veredito visual (mesmo estilo dos cartoes de disco) antes dos numeros.
+        $vCor = "#d97706"; $vIcone = "&#9888;"; $vRotulo = "ATEN&Ccedil;&Atilde;O"
+        $vTexto = "O teste de restaura&ccedil;&atilde;o do backup n&atilde;o passou. O suporte precisa avaliar o banco."
+        if ($PageErrors -gt 0 -or $RecordErrors -gt 0) {
+            $vCor = "#dc2626"; $vIcone = "&#10006;"; $vRotulo = "BANCO COM DEFEITO"
+            $vTexto = "Partes do banco do Sismotel est&atilde;o danificadas. Ele ainda abre, mas pode perder dados ou travar. O reparo deve ser feito pelo suporte, fora do hor&aacute;rio de movimento."
+        } elseif ($NextTransaction -ge 1500000000) {
+            $vCor = "#dc2626"; $vIcone = "&#10006;"; $vRotulo = "LIMITE DO BANCO"
+            $vTexto = "O banco est&aacute; perto do limite de opera&ccedil;&otilde;es do Firebird. Precisa de manuten&ccedil;&atilde;o (backup e restaura&ccedil;&atilde;o) logo, antes que pare."
+        }
+        $vereditoHtml = "<table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' style='margin:0 0 12px 0; border:1px solid #334155; border-radius:8px; background-color:#0f172a;'><tr><td width='118' align='center' valign='middle' bgcolor='$vCor' style='background-color:$vCor; color:#ffffff; padding:14px 6px; border-radius:7px 0 0 7px;'><div style='font-size:30px; line-height:1;'>$vIcone</div><div style='font-size:12.5px; font-weight:800; margin-top:6px;'>$vRotulo</div></td><td valign='middle' style='padding:12px 16px; color:#e2e8f0; font-size:14px; line-height:1.55;'>$vTexto</td></tr></table>"
+
         $auditAconteceu = if ($diagnosisHtml) {
             "No teste di&aacute;rio autom&aacute;tico do backup (03:30), o sistema identificou um aviso interno no banco de dados: <strong>$diagnosisHtml</strong>"
         } else {
@@ -4732,6 +4929,7 @@ function Send-AuditAlertNotification {
                 </tr>
                 <tr>
                   <td bgcolor="#1e293b" style="background-color:#1e293b; padding:16px 18px;">
+                    $vereditoHtml
                     <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" bgcolor="#1e293b" style="font-size:14px; color:#e2e8f0;">
                       <tr>
                         <td width="58%" bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; color:#cbd5e1;">Registros que precisam de reparo (Record Errors):</td>
@@ -4750,6 +4948,7 @@ function Send-AuditAlertNotification {
                         <td bgcolor="#1e293b" style="background-color:#1e293b; padding:7px 0; font-family:Consolas,monospace; font-weight:700; font-size:14.5px; color:$limitColor;">$limitText</td>
                       </tr>
                     </table>
+                    <div style="margin-top:8px; font-size:12.5px; color:#94a3b8; line-height:1.5;">Como ler: <strong>Registros</strong> e <strong>P&aacute;ginas com falha</strong> devem ser 0 (acima de 0 = parte do banco danificada). Opera&ccedil;&otilde;es pendentes altas s&oacute; deixam o banco mais lento. O contador total s&oacute; preocupa perto de 2 bilh&otilde;es.</div>
                   </td>
                 </tr>
               </table>
@@ -4768,7 +4967,7 @@ function Send-AuditAlertNotification {
                 <tr>
                   <td bgcolor="#1e293b" style="background-color:#1e293b; padding:16px 18px; font-size:13.5px; color:#cbd5e1; line-height:1.7;">
                     <div style="margin-bottom:8px;">
-                      <strong style="color:#fbbf24;">1. Acessar o Servidor:</strong> Conecte pelo AnyDesk ($($remoteBadges.AnyDesk)) ou TeamViewer ($($remoteBadges.TeamViewer)).
+                      <strong style="color:#fbbf24;">1. Acessar o Servidor:</strong> Conecte no servidor (AnyDesk <strong>$AnyDeskId</strong> ou TeamViewer <strong>$TeamViewerId</strong>).
                     </div>
                     <div style="margin-bottom:8px;">
                       <strong style="color:#fbbf24;">2. Se houver Registros ou P&aacute;ginas com falha:</strong> Agende um hor&aacute;rio de pouco movimento no motel e execute o utilit&aacute;rio <code>ReparadorFB.exe</code> para corrigir o banco.
@@ -4786,7 +4985,8 @@ function Send-AuditAlertNotification {
           $(if (-not [string]::IsNullOrWhiteSpace($AuditLogSnippet)) {
           "<tr>
             <td bgcolor='#111827' style='background-color:#111827; padding:8px 28px 20px 28px;'>
-              <div style='background-color:#020617; border:1px solid #1e293b; border-radius:6px; padding:14px; font-family:Consolas,monospace; font-size:12px; color:#94a3b8; max-height:180px; overflow:hidden; white-space:pre-wrap;'>$AuditLogSnippet</div>
+              <div style='font-size:11px; color:#64748b; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px;'>Detalhe t&eacute;cnico (para o suporte)</div>
+              <div style='font-family:Consolas,monospace; font-size:11px; color:#64748b; line-height:1.5; white-space:pre-wrap; word-break:break-all;'>$AuditLogSnippet</div>
             </td>
           </tr>"
           })
@@ -5344,12 +5544,58 @@ function Invoke-DatabaseHealthAudit {
         $hwPaths = @($liveDb)
         if ($null -ne $task.Destinations) { $hwPaths += @($task.Destinations) }
         $hwCheck = Test-ProactiveDiskDanger -Paths $hwPaths
+        if ($null -ne $hwCheck) {
+            Log-Message "[AUDITORIA DISCOS] $($hwCheck.CrystalReport)"
+            Write-DiskHealthHistory -Disks $hwCheck.CrystalDisks
+        }
         if ($null -ne $hwCheck -and $hwCheck.HasDanger) {
             Log-Message "[AUDITORIA ALERTA HARDWARE] $($hwCheck.Summary)"
             $saudeAud = Get-StorageHealthReport -Paths $hwPaths -Days 7
-            $relHw = "LEITURA INSTAVEL DO DISCO/MEMORIA DO SERVIDOR. Alerta preventivo na auditoria: $($hwCheck.Summary)`n`nSAUDE DO ARMAZENAMENTO:`n$saudeAud"
+            # v2.2.79: texto proprio (antes comecava com "LEITURA INSTAVEL" e o e-mail
+            # mostrava o diagnostico de backup refeito, que nao aconteceu).
+            $relHw = "ALERTA PREVENTIVO DE DISCO na auditoria diaria: $($hwCheck.Summary)`n`nSAUDE DO ARMAZENAMENTO:`n$saudeAud"
             $auditTaskName = if (-not [string]::IsNullOrWhiteSpace($task.TaskName)) { $task.TaskName } else { $TaskName }
-            Send-BackupNotification -Status "AVISO_HARDWARE" -SubjectInfo "Alerta Preventivo de Disco ($auditTaskName)" -BodyDetails $relHw -DbPath $liveDb -DbSize "$dbSizeMB" -HardwareSmartFail ([bool]$hwCheck.SmartFail) -PreventiveAudit $true
+            $cardsHw = ""
+            try { $cardsHw = Get-DiskHealthCardsHtml -Disks $hwCheck.CrystalDisks -DbPath $liveDb -Destinations @($task.Destinations) } catch {}
+            Send-BackupNotification -Status "AVISO_HARDWARE" -SubjectInfo "Alerta Preventivo de Disco ($auditTaskName)" -BodyDetails $relHw -DbPath $liveDb -DbSize "$dbSizeMB" -HardwareSmartFail ([bool]$hwCheck.SmartFail) -PreventiveAudit $true -AlertSeverity ([int]$hwCheck.Severity) -AlertMetric ([long]$hwCheck.BadSectors) -VisualHtml $cardsHw
+        } elseif ($null -ne $hwCheck) {
+            # Discos bons de novo: depois de 7 dias seguidos sem problema (ex.: disco trocado)
+            # a escada do aviso preventivo zera, e um problema novo volta a avisar do 1o e-mail.
+            try {
+                $stOk = Get-TaskNotificationState -TaskName $TaskName
+                if ([int]$stOk.PrevDiskSent -gt 0) {
+                    if ([string]::IsNullOrWhiteSpace("$($stOk.PrevDiskOkSince)")) {
+                        $stOk.PrevDiskOkSince = (Get-Date).ToString("o")
+                    } elseif (((Get-Date) - [DateTime]::Parse("$($stOk.PrevDiskOkSince)")).TotalDays -ge 7) {
+                        $stOk.PrevDiskSent = 0; $stOk.PrevDiskLast = $null; $stOk.PrevDiskSeverity = 0; $stOk.PrevDiskSectors = -1; $stOk.PrevDiskOkSince = $null
+                        Log-Message "[AUDITORIA DISCOS] Discos saudaveis ha 7 dias: aviso preventivo de disco encerrado (sem e-mail)."
+                    }
+                    Save-TaskNotificationState -TaskName $TaskName -State $stOk
+                }
+            } catch {}
+        }
+    } catch {}
+    # v2.2.79: desligamentos inesperados do servidor (energia/fonte/tela azul) nos ultimos 7 dias.
+    try {
+        $desl = @(Get-ShutdownHistory -Days 7)
+        Write-ShutdownHistory -Records $desl
+        $pwr = Test-UnexpectedShutdownDanger -Records $desl
+        Log-Message "[AUDITORIA ENERGIA] Desligamentos inesperados em 7 dias: $($pwr.Count) (energia $($pwr.Energia), tela azul $($pwr.TelaAzul), botao $($pwr.Botao)); programados: $($pwr.Programados)."
+        if ($pwr.HasDanger) {
+            $detPwr = @("DESLIGAMENTOS INESPERADOS: $($pwr.Count) em 7 dias.")
+            foreach ($r in @($pwr.Records)) { $detPwr += "$(([datetime]$r.When).ToString('dd/MM/yyyy HH:mm:ss')) | $($r.Kind) | $($r.Cause) | $($r.Source)" }
+            Send-BackupNotification -Status "AVISO_ENERGIA" -SubjectInfo "Desligamentos inesperados do servidor" -BodyDetails ($detPwr -join "`n") -DbPath $liveDb -DbSize "$dbSizeMB" -AlertSeverity ([int]$pwr.Severity) -AlertMetric ([long]$pwr.Count) -VisualHtml (Get-ShutdownTimelineHtml -Check $pwr)
+        } else {
+            $stPwr = Get-TaskNotificationState -TaskName $TaskName
+            if ([int]$stPwr.PwrSent -gt 0) {
+                if ([string]::IsNullOrWhiteSpace("$($stPwr.PwrOkSince)")) {
+                    $stPwr.PwrOkSince = (Get-Date).ToString("o")
+                } elseif (((Get-Date) - [DateTime]::Parse("$($stPwr.PwrOkSince)")).TotalDays -ge 7) {
+                    $stPwr.PwrSent = 0; $stPwr.PwrLast = $null; $stPwr.PwrSeverity = 0; $stPwr.PwrCount = -1; $stPwr.PwrOkSince = $null
+                    Log-Message "[AUDITORIA ENERGIA] 7 dias sem desligamentos fora do normal: aviso encerrado (sem e-mail)."
+                }
+                Save-TaskNotificationState -TaskName $TaskName -State $stPwr
+            }
         }
     } catch {}
     Save-AuditState -State $auditState
@@ -6001,6 +6247,547 @@ function Get-DiskErrorEventSummary {
     return $res
 }
 
+# ------------------------------------------------------------------------------
+# CRYSTALDISKINFO (v2.2.79)
+# 21/11/2026: 13 e-mails de 3 clientes, so 1 real. O alerta preventivo disparava
+# por eventos do Windows (ex.: Ntfs 55 x91 de um HD desativado/externo) com o SMART
+# ok. Agora quem decide e o CrystalDiskInfo (MIT, pasta CrystalDiskInfo\ ao lado do
+# motor): le o S.M.A.R.T. de verdade (setores realocados/pendentes, vida do SSD) e
+# da o mesmo veredito que o tecnico ve na tela: Good / Caution / Bad.
+# Sem leitura (pasta ausente, disco em RAID/USB sem SMART) = regra antiga.
+# ------------------------------------------------------------------------------
+function ConvertFrom-CrystalDiskInfoText {
+    param([string]$Text)
+    $disks = @()
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $disks }
+    $cur = $null
+    $modo = ""
+    foreach ($raw in ($Text -split "`r?`n")) {
+        $line = "$raw"
+        if ($line -match '^\s*Model\s*:\s*(.+?)\s*$') {
+            if ($null -ne $cur) { $disks += $cur }
+            $cur = New-Object PSObject -Property @{
+                Model = $matches[1]; Serial = ""; Interface = ""; SizeText = ""; Letters = @()
+                Health = "Unknown"; HealthPct = -1; TemperatureC = -1; PowerOnHours = -1
+                Reallocated = [long]-1; Pending = [long]-1; Uncorrectable = [long]-1; MediaErrors = [long]-1
+            }
+            $modo = ""
+            continue
+        }
+        if ($null -eq $cur) { continue }
+        if ($line -match '^\s*Serial Number\s*:\s*(.+?)\s*$') { $cur.Serial = $matches[1]; continue }
+        if ($line -match '^\s*Interface\s*:\s*(.+?)\s*$') { $cur.Interface = $matches[1]; continue }
+        if ($line -match '^\s*Disk Size\s*:\s*(.+?)\s*$') { $cur.SizeText = $matches[1]; continue }
+        if ($line -match '^\s*Health Status\s*:\s*(.+?)\s*$') {
+            $h = $matches[1]
+            if ($h -match '(?i)^Good') { $cur.Health = "Good" }
+            elseif ($h -match '(?i)^Caution') { $cur.Health = "Caution" }
+            elseif ($h -match '(?i)^Bad') { $cur.Health = "Bad" }
+            else { $cur.Health = "Unknown" }
+            if ($h -match '\((\d+)\s*%\)') { $cur.HealthPct = [int]$matches[1] }
+            continue
+        }
+        if ($line -match '^\s*Temperature\s*:\s*(\d+)\s*C') { $cur.TemperatureC = [int]$matches[1]; continue }
+        if ($line -match '^\s*Power On Hours\s*:\s*(\d+)') { $cur.PowerOnHours = [int]$matches[1]; continue }
+        if ($line -match '^\s*Drive Letter\s*:\s*(.*)$') {
+            $ls = @()
+            foreach ($m in [regex]::Matches($matches[1], '[A-Za-z]:')) { $ls += $m.Value.ToUpper() }
+            $cur.Letters = $ls
+            continue
+        }
+        if ($line -match '^ID\s+Cur\s+Wor\s+Thr') { $modo = "ATA"; continue }
+        if ($line -match '^ID\s+RawValues') { $modo = "NVME"; continue }
+        if ($line -match '^--') { $modo = ""; continue }
+        if ($modo -eq "ATA" -and $line -match '^([0-9A-Fa-f]{2})\s+\S+\s+\S+\s+\S+\s+([0-9A-Fa-f]{12})\s') {
+            $id = $matches[1].ToUpper()
+            $val = [Convert]::ToInt64($matches[2], 16)
+            if ($id -eq "05") { $cur.Reallocated = $val }
+            elseif ($id -eq "C5") { $cur.Pending = $val }
+            elseif ($id -eq "C6") { $cur.Uncorrectable = $val }
+            continue
+        }
+        if ($modo -eq "NVME" -and $line -match '^([0-9A-Fa-f]{2})\s+([0-9A-Fa-f]{12})\s') {
+            if ($matches[1].ToUpper() -eq "0E") { $cur.MediaErrors = [Convert]::ToInt64($matches[2], 16) }
+            continue
+        }
+    }
+    if ($null -ne $cur) { $disks += $cur }
+    return $disks
+}
+
+# Roda o CrystalDiskInfo (/CopyExit gera DiskInfo.txt) e devolve os discos lidos, ou
+# $null sem leitura (motivo em $script:CdiLastError). Reaproveita a leitura feita ha
+# menos de $MaxAgeMinutes. Precisa de administrador (o servico roda como SYSTEM):
+# sem isso devolve $null na hora, sem abrir UAC. Travou = processo encerrado.
+function Get-CrystalDiskInfoReport {
+    param([int]$MaxAgeMinutes = 60, [int]$TimeoutSeconds = 90, [string]$Dir = "")
+    $script:CdiLastError = ""
+    try {
+        if ([string]::IsNullOrWhiteSpace($Dir)) {
+            $base = Get-Variable -Name scriptDir -ValueOnly -ErrorAction SilentlyContinue
+            if ([string]::IsNullOrWhiteSpace("$base")) { $script:CdiLastError = "pasta do motor desconhecida"; return $null }
+            $Dir = Join-Path "$base" "CrystalDiskInfo"
+        }
+        $exe64 = Join-Path $Dir "DiskInfo64.exe"
+        $exe32 = Join-Path $Dir "DiskInfo32.exe"
+        $os64 = ([IntPtr]::Size -eq 8) -or (-not [string]::IsNullOrEmpty($env:PROCESSOR_ARCHITEW6432))
+        $exe = $null
+        if ($os64 -and (Test-Path $exe64)) { $exe = $exe64 } elseif (Test-Path $exe32) { $exe = $exe32 }
+        if ($null -eq $exe) { $script:CdiLastError = "CrystalDiskInfo nao encontrado em $Dir"; return $null }
+        $txt = Join-Path $Dir "DiskInfo.txt"
+        if ($MaxAgeMinutes -gt 0 -and (Test-Path $txt)) {
+            $idade = ((Get-Date) - (Get-Item $txt).LastWriteTime).TotalMinutes
+            if ($idade -ge 0 -and $idade -lt $MaxAgeMinutes) {
+                $cache = @(ConvertFrom-CrystalDiskInfoText -Text ([System.IO.File]::ReadAllText($txt)) | Where-Object { $null -ne $_ })
+                if ($cache.Count -gt 0) { return $cache }
+            }
+        }
+        $isAdmin = $false
+        try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch {}
+        if (-not $isAdmin) { $script:CdiLastError = "sem privilegio de administrador"; return $null }
+        # Idioma fixo em ingles: o texto (Good/Caution/Bad) nao muda com o Windows do cliente.
+        try { [System.IO.File]::WriteAllText((Join-Path $Dir "DiskInfo.ini"), "[Setting]`r`nLanguage=English`r`n") } catch {}
+        if (Test-Path $txt) { Remove-Item $txt -Force -ErrorAction SilentlyContinue }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $exe
+        $psi.Arguments = "/CopyExit"
+        $psi.WorkingDirectory = $Dir
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        try { $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch {}
+        if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $proc.Kill() } catch {}
+            $script:CdiLastError = "CrystalDiskInfo nao respondeu em $TimeoutSeconds s (processo encerrado)"
+            Log-Message "AVISO: $($script:CdiLastError)."
+            return $null
+        }
+        if (-not (Test-Path $txt)) { $script:CdiLastError = "CrystalDiskInfo terminou sem gerar DiskInfo.txt"; return $null }
+        $lidos = @(ConvertFrom-CrystalDiskInfoText -Text ([System.IO.File]::ReadAllText($txt)) | Where-Object { $null -ne $_ })
+        if ($lidos.Count -eq 0) { $script:CdiLastError = "nenhum disco lido pelo CrystalDiskInfo"; return $null }
+        return $lidos
+    } catch {
+        $script:CdiLastError = "$($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Find-CrystalDiskForLetter {
+    param($Disks, [string]$Letter)
+    if ([string]::IsNullOrWhiteSpace($Letter) -or $Letter.Length -lt 2) { return $null }
+    $alvo = $Letter.Substring(0, 2).ToUpper()
+    foreach ($c in @($Disks)) {
+        if ($null -ne $c -and @($c.Letters) -contains $alvo) { return $c }
+    }
+    return $null
+}
+
+function Format-CrystalDiskLine {
+    param($Disk)
+    if ($null -eq $Disk) { return "" }
+    $saude = "DESCONHECIDO"
+    if ("$($Disk.Health)" -eq "Good") { $saude = "BOM" }
+    elseif ("$($Disk.Health)" -eq "Caution") { $saude = "ATENCAO" }
+    elseif ("$($Disk.Health)" -eq "Bad") { $saude = "RUIM" }
+    $t = "$($Disk.Model)"
+    if (@($Disk.Letters).Count -gt 0) { $t += " [$(@($Disk.Letters) -join ' ')]" }
+    $t += ": $saude"
+    if ([int]$Disk.HealthPct -ge 0) { $t += " ($($Disk.HealthPct)%)" }
+    if ([int]$Disk.TemperatureC -ge 0) { $t += " | $($Disk.TemperatureC) C" }
+    if ([long]$Disk.Reallocated -ge 0) { $t += " | realocados $($Disk.Reallocated)" }
+    if ([long]$Disk.Pending -ge 0) { $t += " | pendentes $($Disk.Pending)" }
+    if ([long]$Disk.Uncorrectable -ge 0) { $t += " | incorrigiveis $($Disk.Uncorrectable)" }
+    if ([long]$Disk.MediaErrors -ge 0) { $t += " | erros de midia $($Disk.MediaErrors)" }
+    return $t
+}
+
+# Setores com defeito (realocados + pendentes + incorrigiveis + erros de midia NVMe).
+# -1 = o disco nao informa esses contadores.
+function Get-CrystalBadSectorCount {
+    param($Disk)
+    if ($null -eq $Disk) { return [long]-1 }
+    $soma = [long]0
+    $temAlgum = $false
+    foreach ($v in @([long]$Disk.Reallocated, [long]$Disk.Pending, [long]$Disk.Uncorrectable, [long]$Disk.MediaErrors)) {
+        if ($v -ge 0) { $soma += $v; $temAlgum = $true }
+    }
+    if (-not $temAlgum) { return [long]-1 }
+    return $soma
+}
+
+# ATENCAO do CrystalDiskInfo que merece e-mail (sinal forte): setor pendente ou
+# incorrigivel, erro de midia (NVMe), 50+ setores realocados, ou disco que nao informa
+# contadores (ex.: NVMe com pouca reserva/vida - ai o proprio veredito ja e forte).
+function Test-CrystalCautionIsSerious {
+    param($Disk)
+    if ($null -eq $Disk) { return $false }
+    if ([long]$Disk.Pending -gt 0 -or [long]$Disk.Uncorrectable -gt 0 -or [long]$Disk.MediaErrors -gt 0) { return $true }
+    if ([long]$Disk.Reallocated -ge 50) { return $true }
+    if ((Get-CrystalBadSectorCount -Disk $Disk) -lt 0) { return $true }
+    return $false
+}
+
+# Cartoes coloridos (HTML de e-mail, so tabelas: abre igual no Outlook, Gmail e celular)
+# com a saude de cada disco no estilo do CrystalDiskInfo. $DbPath/$Destinations dizem o
+# que cada disco guarda (banco do Sismotel / backup).
+function Get-DiskHealthCardsHtml {
+    param($Disks, [string]$DbPath = "", [string[]]$Destinations = @())
+    $html = ""
+    $dbLetra = ""
+    try { if (-not [string]::IsNullOrWhiteSpace($DbPath) -and -not $DbPath.StartsWith("\")) { $dbLetra = $DbPath.Substring(0, 2).ToUpper() } } catch {}
+    $destLetras = @()
+    foreach ($d in @($Destinations)) {
+        try { if (-not [string]::IsNullOrWhiteSpace($d) -and -not $d.StartsWith("\") -and $d.Length -ge 2) { $destLetras += $d.Substring(0, 2).ToUpper() } } catch {}
+    }
+    # Pior disco primeiro: o tecnico ve logo o que importa.
+    $ordem = @{ "Bad" = 0; "Caution" = 1; "Unknown" = 2; "Good" = 3 }
+    $lista = @(@($Disks) | Where-Object { $null -ne $_ } | Sort-Object { $o = $ordem["$($_.Health)"]; if ($null -eq $o) { 2 } else { $o } })
+    foreach ($c in $lista) {
+        $h = "$($c.Health)"
+        $cor = "#475569"; $icone = "&#63;"; $rotulo = "SEM LEITURA"
+        $explica = "O programa n&atilde;o conseguiu ler a sa&uacute;de deste disco (comum em HD externo ou RAID)."
+        if ($h -eq "Good") {
+            $cor = "#16a34a"; $icone = "&#10004;"; $rotulo = "SAUD&Aacute;VEL"
+            $explica = "Disco em bom estado. Nada a fazer."
+        } elseif ($h -eq "Caution") {
+            $cor = "#d97706"; $icone = "&#9888;"; $rotulo = "ATEN&Ccedil;&Atilde;O"
+            $explica = "O disco come&ccedil;ou a ter setores com defeito. Ainda funciona, mas tende a piorar: programe a troca."
+        } elseif ($h -eq "Bad") {
+            $cor = "#dc2626"; $icone = "&#10006;"; $rotulo = "CR&Iacute;TICO"
+            $explica = "O disco est&aacute; falhando e pode parar a qualquer momento. Troque o quanto antes."
+        }
+        $pctTxt = if ([int]$c.HealthPct -ge 0) { "<div style='font-size:13px; margin-top:2px;'>$([int]$c.HealthPct) %</div>" } else { "" }
+        $letras = @($c.Letters)
+        $titulo = if ($letras.Count -gt 0) { "Disco $($letras -join ' ')" } else { "Disco sem letra" }
+        $papeis = @()
+        foreach ($l in $letras) {
+            if ($dbLetra -and $l -eq $dbLetra -and $papeis -notcontains "banco do Sismotel") { $papeis += "banco do Sismotel" }
+            if ($destLetras -contains $l -and $papeis -notcontains "backup") { $papeis += "backup" }
+        }
+        if ($papeis.Count -gt 0) { $titulo += " &nbsp;<span style='font-size:12px; color:#93c5fd; font-weight:700;'>(guarda: $($papeis -join ' e '))</span>" }
+        $linhas = @()
+        if ([int]$c.TemperatureC -ge 0) {
+            $tq = if ([int]$c.TemperatureC -ge 55) { "<span style='color:#f87171;'>alta</span>" } else { "normal" }
+            $linhas += "Temperatura: <strong>$([int]$c.TemperatureC) &deg;C</strong> ($tq)"
+        }
+        $ruins = Get-CrystalBadSectorCount -Disk $c
+        if ($ruins -ge 0) {
+            $rq = if ($ruins -eq 0) { "<span style='color:#4ade80;'>&oacute;timo</span>" } else { "<span style='color:#fbbf24;'>quanto mais sobe, pior</span>" }
+            $linhas += "Setores com defeito: <strong>$ruins</strong> ($rq)"
+        }
+        if ([int]$c.PowerOnHours -ge 0) { $linhas += "Tempo ligado: $([math]::Round([int]$c.PowerOnHours / 24 / 365, 1)) anos ($([int]$c.PowerOnHours) h)" }
+        $modelo = ConvertTo-HtmlSafe "$($c.Model)"
+        $html += @"
+<table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' style='margin:0 0 10px 0; border:1px solid #334155; border-radius:8px; background-color:#0f172a;'>
+  <tr>
+    <td width='118' align='center' valign='middle' bgcolor='$cor' style='background-color:$cor; color:#ffffff; padding:14px 6px; border-radius:7px 0 0 7px;'>
+      <div style='font-size:30px; line-height:1;'>$icone</div>
+      <div style='font-size:14px; font-weight:800; margin-top:6px; letter-spacing:0.4px;'>$rotulo</div>
+      $pctTxt
+    </td>
+    <td valign='top' style='padding:12px 16px; color:#e2e8f0; font-size:14px; line-height:1.55;'>
+      <div style='font-weight:800; font-size:15px; color:#ffffff;'>$titulo</div>
+      <div style='font-size:12px; color:#94a3b8; margin-bottom:6px;'>$modelo</div>
+      <div>$($linhas -join '<br/>')</div>
+      <div style='margin-top:6px; color:#cbd5e1;'>$explica</div>
+    </td>
+  </tr>
+</table>
+"@
+    }
+    return $html
+}
+
+# Historico diario da saude dos discos (para acompanhar a evolucao):
+# logs\saude_discos.log, uma linha por disco a cada auditoria. Guarda ~2 anos.
+function Write-DiskHealthHistory {
+    param($Disks, [string]$Path = "")
+    try {
+        $lista = @(@($Disks) | Where-Object { $null -ne $_ })
+        if ($lista.Count -eq 0) { return }
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            $base = Get-Variable -Name scriptDir -ValueOnly -ErrorAction SilentlyContinue
+            if ([string]::IsNullOrWhiteSpace("$base")) { return }
+            $logDir = Join-Path "$base" "logs"
+            if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null }
+            $Path = Join-Path $logDir "saude_discos.log"
+        }
+        $agora = (Get-Date).ToString("yyyy-MM-dd HH:mm")
+        $novas = @()
+        foreach ($c in $lista) { $novas += "$agora | $(Format-CrystalDiskLine -Disk $c)" }
+        $antigas = @()
+        if (Test-Path $Path) { $antigas = @([System.IO.File]::ReadAllLines($Path)) }
+        $todas = @($antigas) + @($novas)
+        if ($todas.Count -gt 3000) { $todas = $todas[($todas.Count - 2500)..($todas.Count - 1)] }
+        [System.IO.File]::WriteAllText($Path, (($todas -join "`r`n") + "`r`n"), [System.Text.Encoding]::ASCII)
+    } catch {}
+}
+
+# ------------------------------------------------------------------------------
+# DESLIGAMENTOS INESPERADOS (v2.2.79)
+# Servidor que desliga "do nada" varias vezes na semana (falta de energia, fonte ruim,
+# nobreak com bateria fraca, tela azul) corrompe o banco do Sismotel. O Windows registra:
+#   Kernel-Power 41 = religou sem desligar direito (BugcheckCode<>0 = tela azul;
+#                     PowerButtonTimestamp<>0 = botao segurado; senao energia/fonte)
+#   EventLog 6008   = "o desligamento anterior foi inesperado" (mesmo fato do 41)
+#   User32 1074     = desligamento/reinicio PROGRAMADO (usuario, Windows Update): nao alerta
+# Avisa (escada Zero-Spam) com 4+ inesperados em 7 dias; 8+ = critico. Botao segurado nao conta.
+# ------------------------------------------------------------------------------
+function Get-ShutdownEventData {
+    param($Event, [string]$Name)
+    try {
+        $x = [xml]$Event.ToXml()
+        foreach ($d in @($x.Event.EventData.Data)) {
+            if ("$($d.Name)" -eq $Name) { return "$($d.'#text')".Trim() }
+        }
+    } catch {}
+    return ""
+}
+
+function Get-ShutdownCauseInfo {
+    param([string]$BugcheckCode = "", [string]$PowerButton = "")
+    if (-not [string]::IsNullOrWhiteSpace($BugcheckCode) -and $BugcheckCode -ne "0") {
+        $cod = $BugcheckCode
+        try { $cod = "0x" + ([long]$BugcheckCode).ToString("X") } catch {}
+        return (New-Object PSObject -Property @{ Type = "TELA_AZUL"; Text = "tela azul (erro do Windows, driver ou memoria) - codigo $cod" })
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PowerButton) -and $PowerButton -ne "0") {
+        return (New-Object PSObject -Property @{ Type = "BOTAO"; Text = "botao de ligar segurado (desligamento forcado)" })
+    }
+    return (New-Object PSObject -Property @{ Type = "ENERGIA"; Text = "queda de energia, fonte ruim ou desligado na tomada" })
+}
+
+# Desligamentos dos ultimos $Days dias, mais recente primeiro.
+# Cada item: When, Kind (INESPERADO/PROGRAMADO), CauseType, Cause, Source.
+function Get-ShutdownHistory {
+    param([int]$Days = 7)
+    $res = @()
+    $inicio = (Get-Date).AddDays(-$Days)
+    $k41 = @()
+    $e6008 = @()
+    $e1074 = @()
+    try { $k41 = @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Microsoft-Windows-Kernel-Power"; Id = 41; StartTime = $inicio } -MaxEvents 200 -ErrorAction Stop) } catch {}
+    try { $e6008 = @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "EventLog"; Id = 6008; StartTime = $inicio } -MaxEvents 200 -ErrorAction Stop) } catch {}
+    try { $e1074 = @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "User32"; Id = 1074; StartTime = $inicio } -MaxEvents 200 -ErrorAction Stop) } catch {}
+    foreach ($e in $k41) {
+        $ci = Get-ShutdownCauseInfo -BugcheckCode (Get-ShutdownEventData -Event $e -Name "BugcheckCode") -PowerButton (Get-ShutdownEventData -Event $e -Name "PowerButtonTimestamp")
+        $res += (New-Object PSObject -Property @{ When = $e.TimeCreated; Kind = "INESPERADO"; CauseType = $ci.Type; Cause = $ci.Text; Source = "Kernel-Power 41" })
+    }
+    foreach ($e in $e6008) {
+        # 6008 repete o mesmo desligamento do 41: so entra se nao houver 41 ate 15 min perto.
+        $dup = $false
+        foreach ($k in $k41) { if ([Math]::Abs(($k.TimeCreated - $e.TimeCreated).TotalMinutes) -le 15) { $dup = $true } }
+        if (-not $dup) { $res += (New-Object PSObject -Property @{ When = $e.TimeCreated; Kind = "INESPERADO"; CauseType = "ENERGIA"; Cause = "desligamento inesperado (Windows nao registrou o motivo)"; Source = "EventLog 6008" }) }
+    }
+    foreach ($e in $e1074) {
+        $proc = ""; $user = ""
+        try { $proc = Split-Path ("$($e.Properties[0].Value)" -replace '\s*\(.*$', '') -Leaf } catch {}
+        try { $user = "$($e.Properties[6].Value)" } catch {}
+        $txt = "desligamento/reinicio programado"
+        if ($user) { $txt += " por $user" }
+        if ($proc) { $txt += " ($proc)" }
+        $res += (New-Object PSObject -Property @{ When = $e.TimeCreated; Kind = "PROGRAMADO"; CauseType = "PROGRAMADO"; Cause = $txt; Source = "User32 1074" })
+    }
+    return @($res | Sort-Object When -Descending)
+}
+
+# Avalia a lista (testavel sem Windows real). Severity: 0 ok, 1 atencao, 2 critico.
+function Test-UnexpectedShutdownDanger {
+    param($Records, [int]$Threshold = 4)
+    $lista = @(@($Records) | Where-Object { $null -ne $_ })
+    $inesp = @($lista | Where-Object { "$($_.Kind)" -eq "INESPERADO" })
+    # Botao segurado e acao de pessoa (nao defeito): aparece na lista, mas nao conta para avisar.
+    $n = @($inesp | Where-Object { "$($_.CauseType)" -ne "BOTAO" }).Count
+    $sev = 0
+    if ($n -ge ($Threshold * 2)) { $sev = 2 } elseif ($n -ge $Threshold) { $sev = 1 }
+    return (New-Object PSObject -Property @{
+        HasDanger   = ($sev -gt 0)
+        Severity    = $sev
+        Count       = $n
+        Energia     = @($inesp | Where-Object { "$($_.CauseType)" -eq "ENERGIA" }).Count
+        TelaAzul    = @($inesp | Where-Object { "$($_.CauseType)" -eq "TELA_AZUL" }).Count
+        Botao       = @($inesp | Where-Object { "$($_.CauseType)" -eq "BOTAO" }).Count
+        Programados = @($lista | Where-Object { "$($_.Kind)" -eq "PROGRAMADO" }).Count
+        Records     = $lista
+    })
+}
+
+# Historico permanente em logs\desligamentos.log (sem repetir linhas ja gravadas).
+function Write-ShutdownHistory {
+    param($Records, [string]$Path = "")
+    try {
+        $lista = @(@($Records) | Where-Object { $null -ne $_ } | Sort-Object When)
+        if ($lista.Count -eq 0) { return }
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            $base = Get-Variable -Name scriptDir -ValueOnly -ErrorAction SilentlyContinue
+            if ([string]::IsNullOrWhiteSpace("$base")) { return }
+            $logDir = Join-Path "$base" "logs"
+            if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null }
+            $Path = Join-Path $logDir "desligamentos.log"
+        }
+        $antigas = @()
+        if (Test-Path $Path) { $antigas = @([System.IO.File]::ReadAllLines($Path)) }
+        $ja = @{}
+        foreach ($a in $antigas) { $ja[$a] = $true }
+        $novas = @()
+        foreach ($r in $lista) {
+            $linha = "$(([datetime]$r.When).ToString('yyyy-MM-dd HH:mm:ss')) | $($r.Kind) | $($r.Cause) | $($r.Source)"
+            if (-not $ja.ContainsKey($linha)) { $novas += $linha; $ja[$linha] = $true }
+        }
+        if ($novas.Count -eq 0) { return }
+        $todas = @($antigas) + @($novas)
+        if ($todas.Count -gt 3000) { $todas = $todas[($todas.Count - 2500)..($todas.Count - 1)] }
+        [System.IO.File]::WriteAllText($Path, (($todas -join "`r`n") + "`r`n"), [System.Text.Encoding]::ASCII)
+    } catch {}
+}
+
+# Linha do tempo (HTML de e-mail, so tabelas) dos desligamentos da semana.
+function Get-ShutdownTimelineHtml {
+    param($Check, [int]$Days = 7)
+    if ($null -eq $Check) { return "" }
+    $dias = @("domingo", "segunda", "ter&ccedil;a", "quarta", "quinta", "sexta", "s&aacute;bado")
+    $corResumo = if ([int]$Check.Severity -ge 2) { "#dc2626" } else { "#d97706" }
+    $html = @"
+<table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' style='margin:0 0 12px 0; border:1px solid #334155; border-radius:8px; background-color:#0f172a;'>
+  <tr>
+    <td width='118' align='center' valign='middle' bgcolor='$corResumo' style='background-color:$corResumo; color:#ffffff; padding:14px 6px; border-radius:7px 0 0 7px;'>
+      <div style='font-size:34px; font-weight:800; line-height:1;'>$([int]$Check.Count)</div>
+      <div style='font-size:12px; font-weight:800; margin-top:6px;'>EM $Days DIAS</div>
+    </td>
+    <td valign='middle' style='padding:12px 16px; color:#e2e8f0; font-size:14px; line-height:1.6;'>
+      <div style='font-weight:800; font-size:15px; color:#ffffff;'>Desligamentos inesperados do servidor</div>
+      <div>&#9889; Energia / fonte / tomada: <strong>$([int]$Check.Energia)</strong></div>
+      <div>&#9888; Tela azul (erro do Windows): <strong>$([int]$Check.TelaAzul)</strong></div>
+      <div>&#9673; Bot&atilde;o de ligar segurado: <strong>$([int]$Check.Botao)</strong></div>
+      <div style='color:#94a3b8; font-size:12.5px;'>Desligamentos normais (programados) no per&iacute;odo: $([int]$Check.Programados) &mdash; esses n&atilde;o contam.</div>
+    </td>
+  </tr>
+</table>
+"@
+    $linhas = ""
+    # So os inesperados na lista (os programados ficam so na contagem acima).
+    foreach ($r in @(@($Check.Records) | Where-Object { "$($_.Kind)" -eq "INESPERADO" } | Select-Object -First 15)) {
+        $w = [datetime]$r.When
+        $quando = "$($dias[[int]$w.DayOfWeek]) $($w.ToString('dd/MM')) &agrave;s $($w.ToString('HH:mm'))"
+        $cor = "#94a3b8"; $tag = "normal"
+        if ("$($r.Kind)" -eq "INESPERADO") {
+            if ("$($r.CauseType)" -eq "TELA_AZUL") { $cor = "#f87171"; $tag = "tela azul" }
+            elseif ("$($r.CauseType)" -eq "BOTAO") { $cor = "#fbbf24"; $tag = "for&ccedil;ado" }
+            else { $cor = "#fb923c"; $tag = "energia" }
+        }
+        $linhas += "<tr><td style='padding:6px 8px; border-bottom:1px solid #1e293b; white-space:nowrap; color:#e2e8f0; font-size:13.5px;'><span style='color:$cor; font-size:16px;'>&#9679;</span> $quando</td><td style='padding:6px 8px; border-bottom:1px solid #1e293b; color:$cor; font-size:12.5px; font-weight:700; white-space:nowrap;'>$tag</td><td style='padding:6px 8px; border-bottom:1px solid #1e293b; color:#cbd5e1; font-size:13px;'>$(ConvertTo-HtmlSafe "$($r.Cause)")</td></tr>"
+    }
+    if ($linhas) {
+        $html += "<table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' style='border:1px solid #334155; border-radius:8px; background-color:#0f172a;'>$linhas</table>"
+    }
+    return $html
+}
+
+# Dados basicos do servidor para o check-up (WMI com limite de tempo).
+function Get-ServerSystemInfo {
+    $info = New-Object PSObject -Property @{ Os = ""; Cpu = ""; RamGB = -1; RamFreeGB = -1; UptimeDays = -1 }
+    try {
+        $sc = @'
+$os = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction Stop | Select-Object -First 1
+$cpu = Get-WmiObject -Class Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+New-Object PSObject -Property @{
+    Os     = "$($os.Caption)".Trim()
+    RamKB  = [double]$os.TotalVisibleMemorySize
+    FreeKB = [double]$os.FreePhysicalMemory
+    Boot   = "$($os.LastBootUpTime)"
+    Cpu    = "$($cpu.Name)".Trim()
+}
+'@
+        $r = @(Invoke-MecScriptWithTimeout -ScriptText $sc -TimeoutMs 8000) | Select-Object -First 1
+        if ($null -ne $r) {
+            $info.Os = "$($r.Os)"
+            $info.Cpu = ("$($r.Cpu)" -replace '\s+', ' ')
+            if ([double]$r.RamKB -gt 0) { $info.RamGB = [math]::Round([double]$r.RamKB / 1MB, 1) }
+            if ([double]$r.FreeKB -ge 0) { $info.RamFreeGB = [math]::Round([double]$r.FreeKB / 1MB, 1) }
+            try { $boot = [System.Management.ManagementDateTimeConverter]::ToDateTime("$($r.Boot)"); $info.UptimeDays = [math]::Round(((Get-Date) - $boot).TotalDays, 1) } catch {}
+        }
+    } catch {}
+    return $info
+}
+
+# Check-up do servidor (e-mail de boas-vindas, v2.2.79): veredito geral em semaforo +
+# saude dos discos (CrystalDiskInfo, temperatura), desligamentos dos ultimos 30 dias,
+# espaco do disco do banco e dados do sistema. Tudo testavel com dados injetados.
+function Get-ServerCheckupHtml {
+    param([string]$DbPath = "", [string[]]$Destinations = @(), $CdiDisks = $null, $ShutdownRecords = $null, $SysInfo = $null, [double]$DbFreeGB = -1)
+    $achados = @()
+    $cdi = @()
+    if ($null -ne $CdiDisks) { $cdi = @(@($CdiDisks) | Where-Object { $null -ne $_ }) } else { $cdi = @(Get-CrystalDiskInfoReport | Where-Object { $null -ne $_ }) }
+    $recs = @()
+    if ($null -ne $ShutdownRecords) { $recs = @(@($ShutdownRecords) | Where-Object { $null -ne $_ }) } else { $recs = @(Get-ShutdownHistory -Days 30) }
+    $sys = if ($null -ne $SysInfo) { $SysInfo } else { Get-ServerSystemInfo }
+
+    # Discos
+    $problemaDisco = $false
+    foreach ($c in $cdi) {
+        $nome = "Disco $(@($c.Letters) -join ' ') ($(ConvertTo-HtmlSafe "$($c.Model)"))"
+        if ("$($c.Health)" -eq "Bad") { $achados += @{ N = 2; T = "$nome est&aacute; <strong>CR&Iacute;TICO</strong>: trocar o quanto antes." }; $problemaDisco = $true }
+        elseif ("$($c.Health)" -eq "Caution") { $achados += @{ N = 1; T = "$nome com <strong>sinais de desgaste</strong>: programar a troca." }; $problemaDisco = $true }
+        if ([int]$c.TemperatureC -ge 55) { $achados += @{ N = 1; T = "$nome est&aacute; <strong>quente ($([int]$c.TemperatureC) &deg;C)</strong>: conferir ventila&ccedil;&atilde;o e poeira." }; $problemaDisco = $true }
+    }
+    if ($cdi.Count -eq 0) { $achados += @{ N = 0; T = "Sa&uacute;de dos discos: n&atilde;o foi poss&iacute;vel ler agora (o MEC Shield tenta de novo toda madrugada)." } }
+    elseif (-not $problemaDisco) { $achados += @{ N = 0; T = "Todos os $($cdi.Count) disco(s) est&atilde;o <strong>saud&aacute;veis</strong> e com temperatura normal." } }
+
+    # Energia (30 dias)
+    # 30 dias: 5+ = atencao, 10+ = critico (o aviso semanal usa 3+ em 7 dias).
+    $pwr = Test-UnexpectedShutdownDanger -Records $recs -Threshold 5
+    $nDesl = [int]$pwr.Count
+    if ($nDesl -ge 10) { $achados += @{ N = 2; T = "O servidor <strong>desligou sozinho $nDesl vezes</strong> nos &uacute;ltimos 30 dias: verificar nobreak e fonte." } }
+    elseif ($nDesl -ge 5) { $achados += @{ N = 1; T = "O servidor desligou sozinho <strong>$nDesl vezes</strong> nos &uacute;ltimos 30 dias: vale conferir o nobreak." } }
+    elseif ($nDesl -ge 1) { $achados += @{ N = 0; T = "$nDesl desligamento(s) inesperado(s) em 30 dias (aceit&aacute;vel se faltou luz)." } }
+    else { $achados += @{ N = 0; T = "Nenhum desligamento inesperado nos &uacute;ltimos 30 dias." } }
+
+    # Espaco do disco do banco
+    if ($DbFreeGB -lt 0 -and -not [string]::IsNullOrWhiteSpace($DbPath) -and -not $DbPath.StartsWith("\")) {
+        try { $di = New-Object System.IO.DriveInfo([System.IO.Path]::GetPathRoot($DbPath)); if ($di.IsReady) { $DbFreeGB = [math]::Round($di.AvailableFreeSpace / 1GB, 1) } } catch {}
+    }
+    if ($DbFreeGB -ge 0) {
+        if ($DbFreeGB -lt 8) { $achados += @{ N = 2; T = "Disco do banco com <strong>s&oacute; $DbFreeGB GB livres</strong>: liberar espa&ccedil;o (m&iacute;nimo 8 GB)." } }
+        elseif ($DbFreeGB -lt 20) { $achados += @{ N = 1; T = "Disco do banco com $DbFreeGB GB livres: est&aacute; ficando apertado." } }
+        else { $achados += @{ N = 0; T = "Disco do banco com <strong>$DbFreeGB GB livres</strong>." } }
+    }
+
+    # Memoria
+    if ([double]$sys.RamGB -gt 0 -and [double]$sys.RamGB -lt 4) { $achados += @{ N = 1; T = "Pouca mem&oacute;ria RAM ($($sys.RamGB) GB): o Sismotel pode ficar lento." } }
+
+    $pior = 0
+    foreach ($a in $achados) { if ([int]$a.N -gt $pior) { $pior = [int]$a.N } }
+    $vCor = "#16a34a"; $vIcone = "&#10004;"; $vRotulo = "SERVIDOR SAUD&Aacute;VEL"; $vTexto = "Nada de errado encontrado na instala&ccedil;&atilde;o. O MEC Shield continua vigiando todos os dias."
+    if ($pior -eq 1) { $vCor = "#d97706"; $vIcone = "&#9888;"; $vRotulo = "PONTOS DE ATEN&Ccedil;&Atilde;O"; $vTexto = "O servidor funciona, mas tem itens que merecem cuidado (veja abaixo)." }
+    if ($pior -ge 2) { $vCor = "#dc2626"; $vIcone = "&#10006;"; $vRotulo = "PRECISA DE CUIDADO"; $vTexto = "Encontramos problema que pode derrubar o servidor ou o banco. Resolver logo." }
+
+    $lista = ""
+    foreach ($a in ($achados | Sort-Object { - [int]$_.N })) {
+        $cor = if ([int]$a.N -ge 2) { "#f87171" } elseif ([int]$a.N -eq 1) { "#fbbf24" } else { "#4ade80" }
+        $lista += "<div style='margin:3px 0;'><span style='color:$cor; font-size:15px;'>&#9679;</span> $($a.T)</div>"
+    }
+    $html = "<table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' style='margin:0 0 12px 0; border:1px solid #334155; border-radius:8px; background-color:#0f172a;'><tr><td width='118' align='center' valign='middle' bgcolor='$vCor' style='background-color:$vCor; color:#ffffff; padding:14px 6px; border-radius:7px 0 0 7px;'><div style='font-size:30px; line-height:1;'>$vIcone</div><div style='font-size:12.5px; font-weight:800; margin-top:6px;'>$vRotulo</div></td><td valign='middle' style='padding:12px 16px; color:#e2e8f0; font-size:14px; line-height:1.55;'><div style='font-weight:700; color:#ffffff; margin-bottom:4px;'>$vTexto</div>$lista</td></tr></table>"
+
+    $sub = "font-size:12px; color:#94a3b8; font-weight:800; text-transform:uppercase; letter-spacing:0.5px; margin:14px 0 6px 0;"
+    if ($cdi.Count -gt 0) {
+        $html += "<div style='$sub'>Discos (lidos pelo CrystalDiskInfo)</div>"
+        $html += Get-DiskHealthCardsHtml -Disks $cdi -DbPath $DbPath -Destinations $Destinations
+    }
+    $html += "<div style='$sub'>Energia: desligamentos dos &uacute;ltimos 30 dias</div>"
+    if ($nDesl -gt 0) { $html += Get-ShutdownTimelineHtml -Check $pwr -Days 30 }
+    else { $html += "<div style='color:#4ade80; font-size:14px;'>&#10004; Nenhum desligamento inesperado. Desligamentos normais no per&iacute;odo: $([int]$pwr.Programados).</div>" }
+
+    $linhasSys = @()
+    if ("$($sys.Os)") { $linhasSys += "<tr><td width='36%' style='padding:4px 0; color:#94a3b8;'>Windows:</td><td style='padding:4px 0; color:#e2e8f0;'>$(ConvertTo-HtmlSafe "$($sys.Os)")</td></tr>" }
+    if ("$($sys.Cpu)") { $linhasSys += "<tr><td style='padding:4px 0; color:#94a3b8;'>Processador:</td><td style='padding:4px 0; color:#e2e8f0;'>$(ConvertTo-HtmlSafe "$($sys.Cpu)")</td></tr>" }
+    if ([double]$sys.RamGB -gt 0) { $linhasSys += "<tr><td style='padding:4px 0; color:#94a3b8;'>Mem&oacute;ria RAM:</td><td style='padding:4px 0; color:#e2e8f0;'>$($sys.RamGB) GB ($($sys.RamFreeGB) GB livres agora)</td></tr>" }
+    if ([double]$sys.UptimeDays -ge 0) { $linhasSys += "<tr><td style='padding:4px 0; color:#94a3b8;'>Ligado h&aacute;:</td><td style='padding:4px 0; color:#e2e8f0;'>$($sys.UptimeDays) dia(s) sem reiniciar</td></tr>" }
+    if ($linhasSys.Count -gt 0) {
+        $html += "<div style='$sub'>Sistema</div><table role='presentation' border='0' cellpadding='0' cellspacing='0' width='100%' style='font-size:13.5px;'>$($linhasSys -join '')</table>"
+    }
+    return $html
+}
+
 # Texto (ASCII, varias linhas) para log e e-mail: disco fisico de cada pasta, SMART,
 # todos os discos do servidor e os erros de disco que o Windows registrou.
 function Get-StorageHealthReport {
@@ -6045,6 +6832,13 @@ Get-WmiObject -Class Win32_DiskDrive -ErrorAction Stop | Sort-Object Index | For
                 $linhas += "Discos do servidor: $($lista -join ' | ')"
             }
         } catch {}
+        # v2.2.79: leitura do CrystalDiskInfo (o mesmo veredito que o tecnico ve na tela).
+        $cdi = @(Get-CrystalDiskInfoReport | Where-Object { $null -ne $_ })
+        if ($cdi.Count -gt 0) {
+            foreach ($c in $cdi) { $linhas += "CrystalDiskInfo: $(Format-CrystalDiskLine -Disk $c)" }
+        } else {
+            $linhas += "CrystalDiskInfo: sem leitura ($($script:CdiLastError))"
+        }
         $ev = @(Get-DiskErrorEventSummary -Days $Days)
         if ($ev.Count -eq 0) {
             $linhas += "Eventos de disco/NTFS/WHEA nos ultimos $Days dias: nenhum"
@@ -6054,6 +6848,7 @@ Get-WmiObject -Class Win32_DiskDrive -ErrorAction Stop | Sort-Object Index | For
                 $quando = $(try { $e.Last.ToString("dd/MM HH:mm") } catch { "?" })
                 $linhas += "Evento $($e.Provider) $($e.Id) x$($e.Count)$dTxt (ultimo $quando): $(Get-DiskEventMeaning -Provider $e.Provider -Id $e.Id)"
             }
+            $linhas += "(Eventos do Windows sao informativos: o aviso preventivo de disco so dispara com CrystalDiskInfo em ATENCAO/RUIM.)"
         }
         $linhas += "Recomendado: conferir os discos no CrystalDiskInfo e testar a memoria (mdsched) fora do horario de pico."
     } catch {
@@ -6064,54 +6859,109 @@ Get-WmiObject -Class Win32_DiskDrive -ErrorAction Stop | Sort-Object Index | For
 
 # Avaliacao preventiva de saude fisica dos discos envolvidos no banco/backup.
 # Usada na auditoria diaria para alertar (com escada Zero-Spam) antes que um HD falhe de vez.
+# v2.2.79: o CrystalDiskInfo e o juiz. Disco lido por ele:
+#   Bad = alerta (conta como "piorou"); Caution = alerta; Good = eventos do Windows
+#   desse disco NAO alertam (so ficam no log/relatorio).
+# Disco que o CrystalDiskInfo nao leu: SMART do Windows + eventos de disco (regra antiga).
+# Ntfs 55/98/137/140 e sistema de arquivos (chkdsk resolve), nao defeito fisico: nunca alerta sozinho.
+# -CdiDisks: $null = roda o CrystalDiskInfo; @() = sem leitura (testes).
 function Test-ProactiveDiskDanger {
-    param([string[]]$Paths, $SmartMap = $null, $RecentEvents = $null)
+    param([string[]]$Paths, $SmartMap = $null, $RecentEvents = $null, $CdiDisks = $null)
     $reasons = @()
     $smartFail = $false
+    $cdiLinhas = @()
+    $cobertosCdi = @()
+    $cdi = @()
+    $setoresRuins = [long]-1
+    $critico = $false
     try {
         $sm = if ($null -ne $SmartMap) { $SmartMap } else { Get-SmartPredictFailureMap }
+        $cdi = @()
+        if ($null -eq $CdiDisks) { $cdi = @(Get-CrystalDiskInfoReport | Where-Object { $null -ne $_ }) }
+        else { $cdi = @($CdiDisks | Where-Object { $null -ne $_ }) }
         $checkedDisks = @()
         foreach ($p in @($Paths)) {
             if ([string]::IsNullOrWhiteSpace($p) -or $p.StartsWith("\")) { continue }
             $d = Get-PhysicalDiskOfPath -Path $p
             if ($null -eq $d) { continue }
-            if ("$($d.Interface)" -eq "USB" -and $d.Status -eq "OK") { continue }
             if ($checkedDisks -contains "$($d.Index)") { continue }
+            $c = Find-CrystalDiskForLetter -Disks $cdi -Letter "$($d.Letter)"
+            if ($null -ne $c -and "$($c.Health)" -ne "Unknown") {
+                $checkedDisks += "$($d.Index)"
+                $cobertosCdi += "$($d.Index)"
+                $linhaC = Format-CrystalDiskLine -Disk $c
+                $cdiLinhas += "Disco $($d.Index): $linhaC"
+                if ("$($c.Health)" -eq "Bad" -or "$($c.Health)" -eq "Caution") {
+                    $nRuins = Get-CrystalBadSectorCount -Disk $c
+                    if ($nRuins -ge 0) { if ($setoresRuins -lt 0) { $setoresRuins = [long]0 }; $setoresRuins += $nRuins }
+                }
+                if ("$($c.Health)" -eq "Bad") {
+                    $smartFail = $true
+                    $reasons += "CrystalDiskInfo classificou o Disco $($d.Index) como RUIM: $linhaC"
+                } elseif ("$($c.Health)" -eq "Caution") {
+                    # v2.2.79 (dono: "nao avisar por qualquer coisa"): ATENCAO so vira e-mail com
+                    # sinal forte de desgaste. Poucos setores realocados e estaveis = so registro.
+                    if (Test-CrystalCautionIsSerious -Disk $c) {
+                        $reasons += "CrystalDiskInfo classificou o Disco $($d.Index) como ATENCAO: $linhaC"
+                    } else {
+                        $cdiLinhas += "(Disco $($d.Index) em ATENCAO leve: so registrado, sem e-mail)"
+                    }
+                }
+                continue
+            }
+            if ("$($d.Interface)" -eq "USB" -and $d.Status -eq "OK") { continue }
             $checkedDisks += "$($d.Index)"
             if ((Test-SmartPredictFailure -Disk $d -Map $sm) -eq $true) {
                 $smartFail = $true
                 $reasons += "SMART preve falha iminente no Disco $($d.Index) ($($d.Model))"
             }
         }
+        $todosCobertos = ($checkedDisks.Count -gt 0 -and $cobertosCdi.Count -eq $checkedDisks.Count)
         $evs = if ($null -ne $RecentEvents) { @($RecentEvents) } else { @(Get-DiskErrorEventSummary -Days 1) }
         foreach ($ev in $evs) {
             if ($null -eq $ev) { continue }
             $id = [int]$ev.Id
             $cnt = [int]$ev.Count
             $prov = "$($ev.Provider)"
+            # v2.2.79: Ntfs (sistema de arquivos) nunca alerta sozinho.
+            if ($prov -match "Ntfs") { continue }
             # Zero-Spam (v2.2.78): evento so conta se for de um disco do banco/destinos.
             # Evento de pendrive/HD externo ou de disco que nao guarda backup nao alerta.
             # Evento sem disco identificado so conta com volume alto (>= 5 em 24h).
             $evDisks = @($ev.Disks | Where-Object { $null -ne $_ -and "$_" -ne "" })
             $doMeuDisco = $false
-            foreach ($ed in $evDisks) { if ($checkedDisks -contains "$ed") { $doMeuDisco = $true } }
+            $meuSemCdi = $false
+            foreach ($ed in $evDisks) {
+                if ($checkedDisks -contains "$ed") {
+                    $doMeuDisco = $true
+                    if ($cobertosCdi -notcontains "$ed") { $meuSemCdi = $true }
+                }
+            }
             if ($evDisks.Count -gt 0 -and -not $doMeuDisco) { continue }
+            # Disco ja lido pelo CrystalDiskInfo: o veredito dele vale mais que o log do Windows.
+            if ($doMeuDisco -and -not $meuSemCdi) { continue }
+            if ($evDisks.Count -eq 0 -and $todosCobertos) { continue }
             $minimo = if ($doMeuDisco) { 3 } else { 5 }
             if ($prov -eq "disk" -and $id -eq 52 -and $doMeuDisco) {
+                $critico = $true
                 $reasons += "Evento critico disk $id x$cnt nas ultimas 24h ($(Get-DiskEventMeaning -Provider $prov -Id $id))"
             } elseif ($prov -eq "disk" -and ($id -eq 7 -or $id -eq 52 -or $id -eq 154) -and $cnt -ge $minimo) {
                 $reasons += "Evento critico disk $id x$cnt nas ultimas 24h ($(Get-DiskEventMeaning -Provider $prov -Id $id))"
             } elseif ($prov -eq "disk" -and ($id -eq 51 -or $id -eq 153) -and $cnt -ge 5) {
                 $reasons += "Instabilidade severa disk $id x$cnt nas ultimas 24h ($(Get-DiskEventMeaning -Provider $prov -Id $id))"
-            } elseif ($prov -match "Ntfs" -and $id -eq 55 -and $cnt -ge 2) {
-                $reasons += "Corrupcao de sistema de arquivos Ntfs 55 x$cnt nas ultimas 24h"
             }
         }
     } catch {}
+    $cdiTxt = if ($cdiLinhas.Count -gt 0) { $cdiLinhas -join "; " } elseif ($cdi.Count -gt 0) { "CrystalDiskInfo leu $($cdi.Count) disco(s), nenhum do banco/destinos" } else { "CrystalDiskInfo sem leitura ($($script:CdiLastError))" }
     return (New-Object PSObject -Property @{
-        HasDanger = ($reasons.Count -gt 0)
-        SmartFail = $smartFail
-        Summary   = ($reasons -join "; ")
+        HasDanger     = ($reasons.Count -gt 0)
+        SmartFail     = $smartFail
+        Summary       = ($reasons -join "; ")
+        CrystalUsed   = ($cobertosCdi.Count -gt 0)
+        Severity      = $(if ($smartFail -or $critico) { 2 } elseif ($reasons.Count -gt 0) { 1 } else { 0 })
+        BadSectors    = $setoresRuins
+        CrystalDisks  = $cdi
+        CrystalReport = $cdiTxt
     })
 }
 
